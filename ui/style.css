@@ -374,7 +374,19 @@ textarea:focus { outline: none; border-color: var(--accent); }
 #queue-hosts { color: var(--warn); }
 #queue-hosts b { color: var(--fg); font-weight: 600; }
 
-#queue-list { display: flex; flex-direction: column; gap: 4px; }
+/* Bounded, and it scrolls. Unbounded, a browser holding six connections per host
+   across a few hosts pushed the flow table and the editor off the screen entirely
+   -- exactly when you most need to see them. */
+#queue-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 20vh;
+  overflow-y: auto;
+}
+#queue.collapsed .panel-body { display: none; }
+/* Held flows are worth reading in full, but the queue must not become the page. */
+#queue .panel-body { padding-top: 9px; padding-bottom: 10px; }
 .q-item {
   display: flex;
   gap: 8px;
@@ -413,11 +425,32 @@ textarea:focus { outline: none; border-color: var(--accent); }
   flex: 1;            /* all the height the toolbar and panels do not use */
   min-height: 0;      /* so the children's own overflow:auto actually scrolls */
   display: grid;
-  grid-template-columns: 1fr 500px;
+  /* Width lives in a variable so the splitter can move it without touching the
+     template, and so a saved width applies before first paint. */
+  grid-template-columns: 1fr 6px var(--detail-w, 500px);
 }
 @media (max-width: 1150px) {
+  /* Stacked: a vertical splitter has nothing to divide, so it leaves the grid
+     entirely rather than occupying a track. */
   #workspace { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; }
+  #splitter { display: none; }
 }
+
+#splitter {
+  cursor: col-resize;
+  background: var(--line);
+  /* The hit area is the whole 6px track; the visible line is drawn inside it so
+     the handle is grabbable without looking like a 6px border. */
+  border-left: 1px solid var(--line);
+  transition: background .12s;
+  touch-action: none;   /* or a touch drag scrolls the page instead of resizing */
+}
+#splitter:hover,
+#splitter.dragging { background: var(--accent); }
+#splitter:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+/* While dragging, nothing else should take the pointer or show a text caret. */
+body.resizing { cursor: col-resize; user-select: none; }
+body.resizing #detail-body, body.resizing #table-wrap { pointer-events: none; }
 
 #table-wrap { flex: 1; overflow: auto; min-height: 0; padding-bottom: 12px; }
 #detail {
@@ -468,7 +501,7 @@ textarea:focus { outline: none; border-color: var(--accent); }
 
 /* Method needs room for a trailing tag ("replay"), or it clips to "POST…". */
 .c-m { width: 124px; }
-.c-s { width: 74px; }
+.c-s { width: 86px; }   /* "stopped" clipped to "stopp…" at 74px */
 .c-t { width: 168px; }
 .c-n { width: 84px; text-align: right; }
 td.c-n { color: var(--fg-dim); }
@@ -560,6 +593,52 @@ pre {
 textarea.editor { min-height: 300px; border-color: var(--warn); }
 textarea.editor:focus { border-color: var(--accent); }
 textarea.inject-input { min-height: 0; }
+/* A host list is short. Full-width on a wide screen it reads as a void. */
+#decrypt-hosts { max-width: 560px; }
+
+/* Editing a held flow: the editor takes all the height the pane has, and scrolls
+   inside itself. A fixed 300px box inside a scrolling pane meant a raw message
+   was read six lines at a time, with the Forward button somewhere below. */
+#detail-body.editing {
+  display: flex;
+  flex-direction: column;
+  /* auto, never hidden. In a short window the notes and the action row can still
+     out-measure the pane, and `hidden` put Forward and Drop off the bottom edge
+     with no way to reach them -- the two buttons that release held traffic. */
+  overflow: auto;
+}
+#detail-body.editing > .editor-fill {
+  flex: 1;
+  min-height: 120px;
+  display: flex;
+}
+#detail-body.editing textarea.editor {
+  flex: 1;
+  min-height: 0;
+  resize: none;         /* it already fills; the splitter handles width */
+  margin-top: 0;
+}
+/* Headline, notes and the action row keep their natural height so they never get
+   squeezed out by a long message. */
+#detail-body.editing > .headline,
+#detail-body.editing > .section,
+#detail-body.editing > .editor-head,
+#detail-body.editing > .note,
+#detail-body.editing > .actions { flex: 0 0 auto; }
+/* Pinned to the bottom of the pane: whatever the message length or the window
+   height, Forward and Drop stay where the hand already is. */
+#detail-body.editing > .actions {
+  position: sticky;
+  bottom: 0;
+  margin-top: 0;
+  padding: 9px 0 2px;
+  background: var(--bg-elev);
+  border-top: 1px solid var(--line-soft);
+}
+
+.editor-head { display: flex; align-items: baseline; gap: 8px; margin: 0 0 5px; }
+.editor-head .section { margin: 0; }
+.editor-head button { padding: 1px 8px; font-size: 12.5px; }
 .inject-actions { display: flex; gap: 6px; margin: 7px 0 14px; }
 
 .frames { display: flex; flex-direction: column; gap: 7px; }
@@ -772,6 +851,24 @@ pre.anatomy b { color: var(--accent); }
 /* The table pane holds the view filter above the scrolling table, so the filter
    stays put while rows scroll under it. */
 #table-pane { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+
+/* HTTP / WebSocket. Sits above the row filter because it selects what the filter
+   is filtering, and reads as a tab strip rather than one more toolbar button. */
+#traffic-tabs {
+  padding: 9px var(--pad) 0;
+  gap: 0;
+  flex: 0 0 auto;
+}
+#traffic-tabs button { padding: 4px 14px; }
+#traffic-tabs button .count {
+  margin-left: 7px;
+  font-size: 12px;
+  color: var(--fg-dim);
+}
+#traffic-tabs button.on .count { color: var(--on-accent); opacity: .8; }
+/* A socket that is still open is the interesting case, so say so on the tab. */
+#traffic-tabs button.has-live .count { color: var(--ok); }
+#traffic-tabs button.on.has-live .count { color: var(--on-accent); }
 /* --bg-elev was only 8 RGB steps off --bg here, which is invisible in a strip
    this short. It takes its own surface token plus an accent edge -- the same
    inset-stripe idiom as a selected row, which is the one cue in this UI that

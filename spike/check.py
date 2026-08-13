@@ -495,6 +495,85 @@ def units_frames() -> None:
           addon2.bytes - base == frame_bytes,
           f"accounted {addon2.bytes - base}B of {frame_bytes}B in frames")
 
+    # ...and it must count each frame ONCE. Re-summing the whole list per arriving
+    # frame is O(n) per frame and O(n^2) over a connection, and it runs on the
+    # proxy's own event loop: measured 0.72ms/frame at 2.5k frames rising to
+    # 9.9ms at 30k, which slowed every other request through the proxy. Counting
+    # reads of .content is the direct, non-flaky way to assert that -- a timing
+    # assertion on the same thing would be a flake generator.
+    reads = [0]
+
+    class CountedFrame:
+        """A frame that records every read of its payload. Delegates get_state to a
+        real message, because the store serialises a finalised flow."""
+
+        def __init__(self, data: bytes) -> None:
+            self._data = data
+            self._real = WebSocketMessage(1, True, data)
+            self.from_client = True
+            self.injected = False
+            self.dropped = False
+
+        @property
+        def content(self) -> bytes:
+            reads[0] += 1
+            return self._data
+
+        def get_state(self):
+            return self._real.get_state()
+
+    addon3 = I.Interceptor()
+    n_frames = 200
+    with taddons.context(addon3) as tctx:
+        tctx.configure(addon3, hide_noise=False, store_bytes=512 * 1024 * 1024)
+        wf4 = tflow.twebsocketflow()
+        wf4.websocket.messages.clear()
+        addon3._remember(wf4)
+        reads[0] = 0
+        # One _remember per arriving frame, exactly as websocket_message does.
+        for _ in range(n_frames):
+            wf4.websocket.messages.append(CountedFrame(b"Q" * 100))
+            addon3._remember(wf4)
+    quadratic = n_frames * (n_frames + 1) // 2      # what re-summing would cost
+    check("WebSocket byte accounting reads each frame once, not once per frame",
+          reads[0] == n_frames,
+          f"{reads[0]} payload reads for {n_frames} frames "
+          f"(re-summing would be {quadratic}); "
+          f"accounted {addon3.sizes[wf4.id] - len(wf4.request.raw_content or b'')}B")
+
+    # The WebSocket tab marks sockets that are still up. A 101 status cannot say
+    # that -- a closed connection keeps its handshake status forever -- so
+    # summary() reads the socket's own close timestamp instead.
+    wf6 = tflow.twebsocketflow()
+    wf6.websocket.timestamp_end = None
+    open_now = I.summary(wf6)["ws_open"]
+    wf6.websocket.timestamp_end = time.time()
+    closed_now = I.summary(wf6)["ws_open"]
+    plain = I.summary(tflow.tflow(resp=True))["ws_open"]
+    check("ws_open tracks the socket's close timestamp, not its 101 status",
+          open_now is True and closed_now is False and plain is False,
+          f"live={open_now}, closed={closed_now}, plain HTTP flow={plain}")
+
+    # A loaded session replaces the message list wholesale, so the cursor from a
+    # previous life must not make the recount skip frames.
+    addon4 = I.Interceptor()
+    with taddons.context(addon4) as tctx:
+        tctx.configure(addon4, hide_noise=False, store_bytes=512 * 1024 * 1024)
+        wf5 = tflow.twebsocketflow()
+        wf5.websocket.messages.clear()
+        for _ in range(20):
+            wf5.websocket.messages.append(WebSocketMessage(1, True, b"R" * 1_000))
+        addon4._remember(wf5)
+        before = addon4.bytes
+        # Same flow id, shorter list: exactly what FlowReader hands back.
+        wf5.websocket.messages.clear()
+        for _ in range(5):
+            wf5.websocket.messages.append(WebSocketMessage(1, True, b"R" * 1_000))
+        addon4._remember(wf5)
+    check("a stale frame cursor recounts instead of under-counting",
+          addon4.bytes < before and addon4.bytes - len(wf5.request.raw_content or b"") == 5_000,
+          f"{before}B for 20 frames -> {addon4.bytes}B for 5 frames")
+
 
 def units_paused_payload() -> None:
     """A reconnecting UI must get the same payload the live push sent. The
@@ -1240,6 +1319,213 @@ def units_row_filter() -> None:
           not bad, "; ".join(bad) or f"{len(patterns)} patterns correct, bad regex falls back")
 
 
+def units_flow_store() -> None:
+    """The store keeps completed flows on disk and in-flight ones in RAM. Two
+    things must hold or it is worse than the OrderedDict it replaced:
+
+    * a flow read back from SQLite has to be usable -- body, raw editable text
+    * a flow still in flight, or held, or on an open socket, must come back as the
+      *same object*, because resume() and inject.websocket act on identity. A
+      rehydrated copy would look right, release nothing, and strand the client.
+    """
+    import interceptor as I
+    from mitmproxy.test import tflow
+    from mitmproxy.websocket import WebSocketMessage
+
+    store = I.FlowStore()
+    notes = []
+    CAP = 512 * 1024 * 1024
+    try:
+        # Completed flow -> serialised, released, and readable again.
+        done = tflow.tflow(resp=True)
+        done.request.raw_content = b'{"q":1}'
+        done.response.raw_content = b'{"a":2}'
+        store.put(done, 14, I.summary(done), CAP)
+        fid = done.id
+        store.flush()
+        # Drop every RAM reference the store holds, so a hit can only come from disk.
+        store._cache.clear()
+        back = store.get(fid)
+        if back is None:
+            notes.append("completed flow could not be read back from disk")
+        else:
+            if back is done:
+                notes.append("cache was not actually cleared; disk path untested")
+            if (back.response.raw_content or b"") != b'{"a":2}':
+                notes.append(f"body corrupted on round trip: {back.response.raw_content!r}")
+            if I.raw_text(back, "request") is None:
+                notes.append("rehydrated flow has no editable raw text")
+
+        # In flight (no response yet) -> same object, never serialised away.
+        flight = tflow.tflow(resp=False)
+        store.put(flight, 10, I.summary(flight), CAP)
+        store.flush()
+        store._cache.clear()
+        if store.get(flight.id) is not flight:
+            notes.append("an in-flight flow did not come back as the same object")
+
+        # Held -> same object, or resume() would act on a copy.
+        held = tflow.tflow(resp=True)
+        held.intercepted = True
+        store.put(held, 10, I.summary(held), CAP)
+        store.flush()
+        store._cache.clear()
+        if store.get(held.id) is not held:
+            notes.append("a held flow did not come back as the same object")
+
+        # Open socket -> same object, or inject.websocket would hit a copy.
+        ws = tflow.twebsocketflow()
+        ws.websocket.timestamp_end = None
+        store.put(ws, 10, I.summary(ws), CAP)
+        store.flush()
+        store._cache.clear()
+        if store.get(ws.id) is not ws:
+            notes.append("an open WebSocket did not come back as the same object")
+        # ...and once it closes it may be released.
+        ws.websocket.timestamp_end = 1.0
+        ws.websocket.messages.append(WebSocketMessage(1, True, b"last"))
+        store.put(ws, 14, I.summary(ws), CAP)
+        store.flush()
+        store._cache.clear()
+        reread = store.get(ws.id)
+        if reread is None or len(reread.websocket.messages) != len(ws.websocket.messages):
+            notes.append("a closed socket's frames did not survive the round trip")
+
+        # Summaries come back newest-last, which is the order the UI appends in.
+        got = [s["id"] for s in store.summaries()]
+        if got[-1] != ws.id:
+            notes.append(f"summaries are not in last-updated order: {got[-1][:8]}")
+        if len(got) != len(store):
+            notes.append(f"summaries {len(got)} != index {len(store)}")
+    finally:
+        store.close()
+    check("the flow store round-trips through SQLite and keeps live flows by identity",
+          not notes, "; ".join(notes) or "disk read intact; in-flight, held and open "
+                                        "sockets kept by identity")
+
+
+def units_decrypt_scope() -> None:
+    """The decrypt allowlist is mitmproxy's `allow_hosts`, so the part that is ours
+    is validation: a bad pattern must be refused with the working list left in
+    force, exactly like the scope filter. A rejected pattern that still got stored
+    would silently stop decrypting the host under test."""
+    import interceptor as I
+    from mitmproxy.addons import modifybody, modifyheaders
+    from mitmproxy.test import taddons
+
+    class Collect:
+        def __init__(self):
+            self.clients = {"x"}
+            self.sent = []
+
+        def push(self, type_, **payload):
+            self.sent.append({"type": type_, **payload})
+
+    addon = I.Interceptor()
+    notes = []
+    # _push_state reads modify_body/modify_headers, so their owners must be loaded.
+    with taddons.context(addon, modifybody.ModifyBody(),
+                         modifyheaders.ModifyHeaders()) as tctx:
+        tctx.configure(addon, hide_noise=False)
+        addon.bridge = Collect()
+
+        addon._set_decrypt(["app.example.com", " api.example.com "])
+        if list(ctx_opt(tctx, "allow_hosts")) != ["app.example.com", "api.example.com"]:
+            notes.append(f"good patterns not stored/trimmed: {ctx_opt(tctx, 'allow_hosts')}")
+
+        # A bad regex must be refused outright, keeping what already worked.
+        addon.bridge.sent.clear()
+        addon._set_decrypt(["ok.example.com", "*nope(("])
+        errs = [m for m in addon.bridge.sent if m["type"] == "error"]
+        if not errs:
+            notes.append("bad pattern accepted without an error")
+        if list(ctx_opt(tctx, "allow_hosts")) != ["app.example.com", "api.example.com"]:
+            notes.append(f"bad batch clobbered the working list: {ctx_opt(tctx, 'allow_hosts')}")
+
+        # Empty means decrypt everything again -- the documented way back.
+        addon._set_decrypt([])
+        if list(ctx_opt(tctx, "allow_hosts")) != []:
+            notes.append("empty list did not clear the allowlist")
+
+        # And it has to reach the UI, or an active allowlist is invisible.
+        addon._set_decrypt(["only.example.com"])
+        addon.bridge.sent.clear()
+        addon._push_state()
+        state = next((m for m in addon.bridge.sent if m["type"] == "state"), {})
+        if state.get("allow_hosts") != ["only.example.com"]:
+            notes.append(f"state does not carry allow_hosts: {state.get('allow_hosts')}")
+
+    check("the decrypt allowlist validates and never half-applies",
+          not notes, "; ".join(notes) or "trimmed, bad regex refused, clearable, in state")
+
+
+def ctx_opt(tctx, name):
+    return getattr(tctx.options, name)
+
+
+def units_pretty_body() -> None:
+    """The editor indents a JSON body for reading, and what it produces can be
+    forwarded. So the header block must come back byte-identical, a non-JSON body
+    must be left completely alone, and the blank-line split must land on the
+    header separator and not on a blank line inside the body -- anything else
+    silently corrupts an outgoing request."""
+    import json as _json
+
+    harness = r"""
+      import { readFileSync } from "node:fs";
+      const src = readFileSync("ui/app.js", "utf8");
+      const grab = (name) => {
+        const i = src.indexOf(`function ${name}(`);
+        if (i < 0) throw new Error(`missing ${name}`);
+        let depth = 0, j = src.indexOf("{", i);
+        for (let k = j; k < src.length; k++) {
+          if (src[k] === "{") depth++;
+          else if (src[k] === "}" && --depth === 0) return src.slice(i, k + 1);
+        }
+        throw new Error(`unbalanced ${name}`);
+      };
+      const code = [grab("pretty"), grab("splitRaw"), grab("prettyRaw")].join("\n");
+      const fns = new Function(code + "; return {prettyRaw, splitRaw};")();
+      console.log(JSON.stringify(JSON.parse(process.env.CASES).map((raw) => {
+        const out = fns.prettyRaw(raw);
+        const parts = fns.splitRaw(raw);
+        return { out, headKept: parts ? out.startsWith(parts.head) : out === raw };
+      })));
+    """
+
+    head = "POST /pay HTTP/1.1\nHost: h\ncontent-type: application/json\n\n"
+    cases = [
+        head + '{"a":1,"b":[2,3]}',                 # JSON: indented
+        head + "not json at all",                   # left alone
+        head + "",                                  # empty body
+        "GET /x HTTP/1.1\nHost: h\n",               # no blank line at all
+        # A blank line inside a text body must not be mistaken for the separator.
+        "POST /x HTTP/1.1\nHost: h\n\nline1\n\nline3",
+        # multipart: CRLF boundaries must survive untouched
+        "POST /u HTTP/1.1\nHost: h\n\n--B\r\nContent-Disposition: form-data\r\n\r\nv\r\n--B--\r\n",
+    ]
+    out = subprocess.run(
+        ["node", "--input-type=module", "-e", harness], cwd=ROOT,
+        capture_output=True, text=True, timeout=60,
+        env={**os.environ, "CASES": _json.dumps(cases)},
+    )
+    if out.returncode != 0:
+        return check("the editor's pretty-print only touches the body", False,
+                     f"node failed: {out.stderr.strip()[:200]}")
+    got = _json.loads(out.stdout)
+    bad = []
+    if got[0]["out"] != head + '{\n  "a": 1,\n  "b": [\n    2,\n    3\n  ]\n}':
+        bad.append(f"JSON body not indented: {got[0]['out']!r}")
+    for i, label in ((1, "non-JSON body"), (2, "empty body"), (3, "no blank line"),
+                     (4, "blank line inside body"), (5, "multipart CRLF body")):
+        if got[i]["out"] != cases[i]:
+            bad.append(f"{label} was modified: {got[i]['out']!r}")
+    if not all(g["headKept"] for g in got):
+        bad.append("header block did not survive byte-for-byte")
+    check("the editor's pretty-print only touches the body",
+          not bad, "; ".join(bad) or f"{len(cases)} cases correct, headers byte-identical")
+
+
 def units_rule_builder() -> None:
     """The rule form composes and parses mitmproxy specs. A wrong separator or a
     bad round-trip silently rewrites someone's rule, so both directions are checked
@@ -1401,6 +1687,9 @@ async def main() -> int:
     units_chain_flag()
     units_rule_builder()
     units_row_filter()
+    units_pretty_body()
+    units_flow_store()
+    units_decrypt_scope()
     await integration()
     await restart_and_load()
     cleanup_saved_session()

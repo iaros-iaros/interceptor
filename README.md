@@ -25,8 +25,8 @@ interceptor          # proxy on :8080, UI opens on :9000
 - **Repeater**: resend any captured HTTP request, edited if you like.
 - **Rewrite rules**: automatic body and header rewrites that fire without pausing
   anything — for the changes you want on every request.
-- **Sessions**: save the current capture to a file and reopen it later. Explicit only —
-  nothing is ever written to disk on its own.
+- **Sessions**: save the current capture to a file and reopen it later. Explicit only.
+  The working store is a 0600 temp database, wiped on exit — see Storage.
 - **Isolated Chrome** launcher: one click gives a throwaway profile wired to the proxy,
   with TLS interception working and **no CA installed anywhere** on your system.
 - Dark and light themes, pink accent.
@@ -92,6 +92,36 @@ to hover a control to find out.
 | **Capture** | Decrypt and log everything, pause nothing. |
 | **Passthrough** | Tunnel bytes: no TLS termination, no capture. New connections only — existing keep-alives stay intercepted until they close. |
 
+**Decrypt** (in *Tools*) narrows which hosts get TLS-terminated at all — Burp's *TLS
+pass through*, inverted. It is a **speed** control, not a filter, and it is the one lever
+that matters for responsiveness:
+
+Terminating TLS costs two handshakes per connection (one with the browser using a forged
+cert, one with the real server), and mitmproxy runs single-threaded, so all of it lands on
+one core. Measured on loopback: **~170 new HTTPS connections/second with that core
+saturated**, ~47ms each, versus ~10ms tunnelled. Bare `mitmdump` with no addon scores the
+same (171 vs 158 req/s), so this is mitmproxy's cost, not this project's — the only way to
+spend less is to decrypt fewer connections.
+
+A page pulling from twenty hosts spends most of that budget on CDNs, fonts, analytics and
+telemetry nobody is testing. Name the hosts under test, one per line — a plain hostname or
+a regex — and the rest is tunnelled:
+
+```
+app.example.com
+api.example.com          # or one line:  .*\.example\.com
+```
+
+- Empty (the default) decrypts everything.
+- **New connections only**, like passthrough. Anything already open stays decrypted.
+- Plain HTTP is captured either way; this only governs TLS.
+- Passthrough still tunnels everything, allowlist or not.
+- A tunnelled host is **not** blocked — it reaches the browser untouched, it is just
+  invisible here. This is not a security boundary.
+- An active allowlist is never silent: the toolbar counter says
+  `decrypting 2 hosts only` and the line under the mode buttons names them, because
+  "why is my traffic missing?" is otherwise a long hunt.
+
 **Stop flows matching** is the field under the mode buttons — mitmproxy's `flowfilter`
 syntax. It decides which flows **Intercept** stops; it does not decide what gets captured.
 Empty means everything stops.
@@ -119,14 +149,23 @@ Full cheat sheet in the in-app reference (**Rules → Instructions**, or the `?`
 field).
 
 **Second toolbar row**: the filter field, then *Options* (*Stop replies*, off by
-default — see below; *Hide noise*), *Tools* (*Rules*, *Launch Chrome*) and *Session*
+default — see below; *Hide noise*), *Tools* (*Rules*, *Decrypt*, *Launch Chrome*) and *Session*
 (*Save*, *Open*, *Clear*). The top right carries a live count of stored flows, bytes,
 evictions and hidden noise, the bridge connection badge, and the light/dark toggle.
+
+**HTTP / WebSocket** tabs sit at the top of the table pane and split the capture by
+protocol, the way Burp does. Each carries a count, so "is anything using a socket?" is
+answered without switching views, and the WebSocket count turns green while a socket is
+still open. A socket is one row that lives for minutes while frames stream under it —
+mixed into several hundred request rows it was effectively invisible. Selecting one lands
+on **Frames** directly, and its frame count now ticks up live rather than sitting at
+`ws (0)` until the connection closes.
 
 **Filter rows** sits above the table and is **view-only**: it hides rows that don't
 match what you type, and changes nothing about capture, stopping, rewriting, or what a
 saved session holds. It searches method, status, host, path and type, and shows
-`3 of 6 shown` while active. Plain text works, and so does a regular expression —
+`3 of 6 shown` while active — counted within the current protocol tab. Plain text works,
+and so does a regular expression —
 `\.(png|jpg)`, `^POST`, `/api/v\d+/` — matched case-insensitively against the whole row;
 a half-finished one like `(png` falls back to a substring match instead of blanking the
 table. It is **not** the `~q ~u` filter syntax: this is the box to reach for when you
@@ -136,13 +175,21 @@ different thing entirely.
 **Flow table** streams in as traffic arrives, batched on a 50ms tick — a single page
 load is easily 300–500 flows. Only the newest 500 rows are rendered, with a line under the
 table counting the rest, and the tab drops flows past 2000 to keep a long session from
-growing without bound. The engine keeps its own, much larger store (see `store_bytes`).
+growing without bound. The engine keeps its own, much larger store on disk (see
+Storage and `store_bytes`).
 Click a row for the detail pane: **Request**, **Response**, **Frames** (WebSocket only)
 and **Repeat**.
 
+**The detail pane is resizable.** Drag the divider between the table and the pane, or
+focus it and use the arrow keys (`Shift` for bigger steps, `Home` to reset); double-click
+resets it too. The width is clamped so neither side can be squeezed out, and it is
+remembered across restarts.
+
 **Queue panel** appears whenever something is held. It shows per-host depth, because
 browsers open ~6 connections per host — holding 6 requests stalls that entire host, not
-just those requests. **Forward all** and **Drop all** are the panic buttons.
+just those requests. **Forward all** and **Drop all** are the panic buttons. The list is
+height-capped and scrolls, so a deep queue can never push the flow table and the editor
+off the screen, and **Hide list** collapses it to just the counts and those two buttons.
 
 ### Three ways to change traffic
 
@@ -163,7 +210,22 @@ Intercept or a rule to change what the app itself receives.
 ### Editing a held flow
 
 The editor gives you the whole message as raw text. Change the method, the path, the
-status, any header, the body. On forward:
+status, any header, the body. It fills the height of the detail pane and scrolls inside
+itself, and **Forward** / **Drop** stay pinned to the bottom of the pane whatever the
+message length — so a long request never puts them out of reach.
+
+A JSON body is **indented for reading** by default; `Raw` switches to the exact bytes off
+the wire and back. Two things worth knowing about that:
+
+- Forwarding a flow you have not typed into sends the **original bytes**, indentation or
+  not — so viewing a signed or hashed body cannot break its signature.
+- Once you edit anything, what is in the box is what goes on the wire, indentation
+  included. Press `Raw` first if the payload's exact bytes matter.
+
+Only the body is ever reformatted; the header block is untouched byte-for-byte, and a
+CRLF body (multipart) is left alone entirely. The choice is remembered.
+
+On forward:
 
 - Bodies are `decode()`d first, so a gzipped body is editable as text.
 - `Content-Length` is recomputed for you — never edit it by hand.
@@ -229,22 +291,54 @@ The same content is a standalone page at [ui/rules.html](ui/rules.html) — both
 the rows on screen — to `sessions/<timestamp>.mitm`. **Open session** lists that folder and
 loads one back, replacing what is on screen.
 
-Nothing autosaves. The `sessions/` folder isn't created until your first save, and
-closing Interceptor mid-session discards it — a fresh instance always starts empty. This
-is deliberate: a `.mitm` file is every captured request in plaintext, cookies and bearer
-tokens included, so writing one has to be a decision rather than a default.
+No session is ever written for you. The `sessions/` folder isn't created until your first
+save, and closing Interceptor mid-session discards the capture — a fresh instance always
+starts empty. This is deliberate: a `.mitm` file is every captured request in plaintext,
+cookies and bearer tokens included, so keeping one has to be a decision rather than a
+default.
 
 Files are created `0600` and the folder `0700` — from the first byte, not after the
 write finishes. Both `sessions/` and `*.mitm` are gitignored. **Treat a
 saved session like a credentials file.**
+
+### Storage
+
+The working capture lives in a SQLite file, not in memory: completed flows are serialised
+to disk and only an index — ids, sizes, arrival order, roughly a hundred bytes a flow —
+stays in RAM. Measured over 23,000 flows and 200MB of traffic, resident memory grew 12MB,
+about **0.5KB per flow**, against the ~8KB per flow it used to cost to keep every body
+resident. That is what stops a morning of testing being evicted to make room for the
+current page.
+
+**This file is decrypted traffic, so it is treated like one.** It is created `0600` in
+your temp directory (`interceptor-store-*/flows.db`), and it is deleted when Interceptor
+shuts down — so an ordinary quit leaves nothing behind, and only a `SIGKILL` or a crash
+can leave it, in the same way the Chrome profile can. It is never in the project
+directory, and `sessions/` remains the only place anything is kept on purpose.
+
+Some flows cannot go to disk while they are in use, and are held in memory by reference
+instead: anything still in flight, anything **held** in the queue, and any **open
+WebSocket**. That is not an optimisation — `resume()` and frame injection act on the
+exact object the proxy is awaiting, so handing back a copy rehydrated from the database
+would look correct, release nothing, and strand the client.
+
+The cost is about **15% of peak store throughput** (1330 → 1132 flows/second on the same
+loopback workload), because each finalised flow is serialised and written once. That
+ceiling sits roughly 6× above the ~170 new HTTPS connections/second that TLS termination
+itself allows, so it is not the binding constraint on anything you will actually do. It
+could be recovered by moving serialisation to a worker thread; that has not been done,
+because it would trade a measured non-problem for concurrent access to flow objects.
 
 Loaded flows can be edited and re-sent through the Repeater, so yesterday's request can
 be replayed today.
 
 ### WebSockets
 
-Frames appear under the **Frames** tab and can be edited or dropped individually while
-held. Ordering is safe: while one frame is held, mitmproxy processes no further data for
+Sockets live under the **WebSocket** tab of the flow table, separate from HTTP. Select one
+and its frames appear under the **Frames** tab; they can be edited or dropped individually
+while held, and a held JSON frame is indented like any other body.
+
+Ordering is safe: while one frame is held, mitmproxy processes no further data for
 that connection, in either direction — so a held frame cannot be overtaken by a later one.
 This is guaranteed by the proxy's own structure, not by anything in this addon.
 
@@ -277,7 +371,7 @@ Everything else is a `--set` flag after `interceptor`:
 | Option | Default | Meaning |
 |---|---|---|
 | `ui_host` | `127.0.0.1` | UI bind host. |
-| `store_bytes` | `512MB` | Flow store cap **in bytes**. Bodies dominate memory, so the cap is bytes, not flow count; oldest flows are evicted and the count is shown in the UI. |
+| `store_bytes` | `2GB` | Flow store cap **in bytes of captured traffic**. Bodies dominate, so the cap is bytes, not flow count; oldest flows are evicted and the count is shown in the UI. This caps the **store file**, not memory — see Storage. The file runs about half again larger than the cap (serialisation, index and WAL). |
 | `hide_noise` | `true` | Hide browser background chatter (Google telemetry, safebrowsing, gstatic). Counted and reported, never silently dropped. |
 | `intercept_responses` | `false` | Also stop replies. Same as the *Stop replies* toggle. |
 | `expose` | `false` | Permit binding off loopback. Without it, that is refused outright — see Security. |
@@ -372,7 +466,7 @@ Also:
 
 ```bash
 .venv/bin/python spike/spike.py --chrome --net    # browser + network reality   4/4
-.venv/bin/python spike/check.py                   # units + end-to-end        52/52
+.venv/bin/python spike/check.py                   # units + end-to-end        58/58
 ```
 
 Both are safe to run while a real instance is up — separate ports (`18xxx`/`19000`), their
@@ -391,16 +485,21 @@ mitmproxy or Chrome upgrade breaks silently. It also holds the shared test harne
 **Covered:** both bridge auth gates, static serving and path-traversal refusal, capture,
 pause → forward / drop, request and response editing, `Content-Length` recompute,
 multipart bodies surviving the editor byte-for-byte, malformed-edit rejection,
-force-forward on UI disconnect, flow-store byte accounting and eviction (WebSocket frames
-included), the streaming cutoff, WebSocket frame editing, truncation refusal and
-injection, body and header rewrite rules, the repeater, session save/open including a
+force-forward on UI disconnect, the flow store's SQLite round trip and its refusal to
+hand back a copy of a live flow, byte accounting and eviction (WebSocket frames
+included, each counted exactly once so a long-lived socket stays O(1) per frame rather
+than O(n²)), the streaming cutoff, WebSocket frame editing, truncation refusal and
+injection, body and header rewrite rules, the decrypt allowlist's validation, the repeater,
+session save/open including a
 full-restart round trip, file modes at creation time under a permissive umask, and the
 loopback guard — every entry path including `--mode` specs, without ever opening a public
 socket to prove it.
 
-Two units also run shipped frontend functions under `node`: the rule form's compose/parse
-pair (every spec it generates is fed to mitmproxy's real `parse_modify_spec`) and the row
-filter (text, regex, case-insensitivity, invalid-regex fallback).
+Three units also run shipped frontend functions under `node`: the rule form's compose/parse
+pair (every spec it generates is fed to mitmproxy's real `parse_modify_spec`), the row
+filter (text, regex, case-insensitivity, invalid-regex fallback), and the editor's
+pretty-printer (headers byte-identical, non-JSON and CRLF bodies untouched, and a blank
+line inside a body never mistaken for the header separator).
 
 **Not covered:** anything needing a DOM — `index.html`, `style.css` and every rendering
 path in `app.js`; `node --check` is syntax-only. Also passthrough mode, the `error`-hook

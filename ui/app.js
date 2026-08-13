@@ -33,6 +33,12 @@ let sessions = [];
 let retryMs = 1000;
 let rowFilter = "";
 let rowFilterRe = null;
+// "http" | "ws". A socket is one row that lives for minutes while frames stream
+// under it; mixed into hundreds of request rows it was invisible.
+let traffic = "http";
+// Pretty-print JSON bodies in the held-flow editor. Sticky, because it is a
+// reading preference, not a per-flow decision.
+let prettyBody = localStorage.getItem("ic.prettyBody") !== "0";
 // Rule forms, not raw specs. {where:"both"|"req"|"resp", url, find, repl, raw}
 // `raw` is set only for a spec the form cannot represent, so nothing is ever
 // silently dropped just because it is more complex than the form.
@@ -140,6 +146,12 @@ function handle(m) {
       arr.push(m);
       if (arr.length > MAX_ROWS) arr.shift();
       frames.set(m.id, arr);
+      // Keep the row's frame count honest. The server only re-sends a flow
+      // summary when the socket closes, so the table sat at "ws (0)" for the
+      // whole life of a busy connection. seq is the server's own monotonic
+      // index, so this counts frames the local buffer has already dropped.
+      const f = flows.get(m.id);
+      if (f && m.seq + 1 > (f.ws_frames || 0)) f.ws_frames = m.seq + 1;
       break;
     }
     case "frames":
@@ -216,6 +228,7 @@ function render() {
 function renderModeHint() {
   const scoped = (state.scope || "").trim();
   const which = scoped ? `each request matching ${scoped}` : "every request";
+  const allow = state.allow_hosts || [];
   let text;
   if (state.mode === "passthrough") {
     text = "Passthrough — bytes are tunnelled straight through. Nothing is decrypted, " +
@@ -227,8 +240,18 @@ function renderModeHint() {
     text = `Intercept — ${which} stops so you can read or edit it before it goes on. ` +
            "Replies come back untouched (turn on “Stop replies” to catch those as well).";
   } else {
-    text = "Capture — everything is decrypted and logged, nothing stops. " +
+    // "everything is decrypted" would contradict the allowlist clause appended
+    // below, so drop the claim when one is in force rather than say both.
+    text = (allow.length
+             ? "Capture — decrypted traffic is logged, nothing stops. "
+             : "Capture — everything is decrypted and logged, nothing stops. ") +
            "Switch to Intercept to stop flows for editing.";
+  }
+  // An allowlist changes what the sentence above is even true of, so it is said
+  // in the same breath rather than left to be discovered in a panel.
+  if (allow.length && state.mode !== "passthrough") {
+    text += ` Only ${allow.join(", ")} ${allow.length === 1 ? "is" : "are"} decrypted;`
+          + " every other host is tunnelled and will not appear at all.";
   }
   $("#mode-hint").textContent = text;
 }
@@ -285,6 +308,10 @@ function renderStats() {
   if (state.auto_forwarded) bits.push(`${state.auto_forwarded} auto-forwarded`);
   const n = (state.rules_body || []).length + (state.rules_headers || []).length;
   if (n) bits.push(`${n} rule${n === 1 ? "" : "s"} active`);
+  // A forgotten allowlist reads as "the tool stopped capturing", so it is never
+  // silent -- it says so here and again in the mode hint below the toolbar.
+  const allow = (state.allow_hosts || []).length;
+  if (allow) bits.push(`decrypting ${allow} host${allow === 1 ? "" : "s"} only`);
   if (state.proxy) {
     // Where traffic actually goes. Chaining is the default now, so the interesting
     // fact is which upstream got adopted -- silence would leave that invisible.
@@ -302,11 +329,16 @@ function renderQueue() {
   $("#queue-count").textContent = `${q.length} stopped — waiting for you`;
   const hosts = $("#queue-hosts");
   hosts.textContent = "";
+  let stalled = false;
   for (const [h, n] of Object.entries(state.per_host || {})) {
+    if (n > 1) stalled = true;
     const b = document.createElement("b");
     b.textContent = `${h}×${n}`;
     hosts.append(b, " ");
   }
+  // Only when it is actually happening. Shown permanently it was 40px of advice
+  // pushing the flow table down every time a single request stopped.
+  $("#stall-note").hidden = !stalled;
   const list = $("#queue-list");
   list.textContent = "";
   for (const item of q) {
@@ -336,16 +368,31 @@ function matchesRow(f) {
 
 function renderTable() {
   const everything = [...flows.values()];
-  const all = everything.filter(matchesRow);
+  // Two independent narrowings, kept separate so the counts mean what they say:
+  // the tab picks the protocol, the filter box searches within it.
+  const inView = everything.filter((f) => !!f.ws === (traffic === "ws"));
+  const all = inView.filter(matchesRow);
   const shown = all.slice(-MAX_ROWS).reverse();
   const hiddenCount = all.length - shown.length;
 
+  renderTrafficTabs(everything);
+
   $("#row-filter-clear").hidden = !rowFilter;
   $("#row-filter-count").textContent = rowFilter
-    ? `${all.length} of ${everything.length} shown`
+    ? `${all.length} of ${inView.length} shown`
     : "";
 
-  $("#empty").hidden = everything.length > 0;
+  $("#empty").hidden = inView.length > 0;
+  if (!inView.length) {
+    const ws = traffic === "ws";
+    $("#empty-title").textContent = ws
+      ? "No WebSocket connections yet."
+      : "No traffic yet.";
+    $("#empty-hint").textContent = ws
+      ? "A socket shows up here once its handshake completes. Frames appear under the "
+        + "Frames tab when you select it."
+      : "Hit Launch Chrome above, or point any client at the proxy.";
+  }
   $("#truncated").hidden = hiddenCount === 0;
   if (hiddenCount) {
     $("#truncated").textContent = `${hiddenCount} older matching flow(s) not rendered (newest ${MAX_ROWS} shown).`;
@@ -354,6 +401,31 @@ function renderTable() {
   const body = document.createElement("tbody");
   for (const f of shown) body.append(row(f));
   $("#flows").tBodies[0].replaceWith(body);
+}
+
+// The count on each tab is the point of the split: "I don't see any WebSocket
+// traffic" is answered by a number without having to switch views to check.
+function renderTrafficTabs(everything) {
+  let ws = 0, live = 0;
+  for (const f of everything) {
+    if (!f.ws) continue;
+    ws++;
+    // ws_open comes from the socket's own close timestamp. A 101 status cannot
+    // stand in for it -- a long-closed connection still reports 101.
+    if (f.ws_open) live++;
+  }
+  const counts = { http: everything.length - ws, ws };
+  for (const b of document.querySelectorAll("#traffic-tabs button")) {
+    const kind = b.dataset.traffic;
+    b.classList.toggle("on", kind === traffic);
+    b.classList.toggle("has-live", kind === "ws" && live > 0);
+    let badge = b.querySelector(".count");
+    if (!badge) {
+      badge = el("span", "count");
+      b.append(badge);
+    }
+    badge.textContent = counts[kind] ? String(counts[kind]) : "";
+  }
 }
 
 function row(f) {
@@ -408,6 +480,9 @@ function renderDetail() {
   box.dataset.key = key;
   box.dataset.lastSeq = "-1";
   box.textContent = "";
+  // The editing layout makes the pane a flex column that does not scroll; every
+  // other view needs it back off, or a long response body has nowhere to go.
+  box.classList.remove("editing");
   if (h) return renderEditor(box, h);
   if (!f) return box.append(el("p", "hint", "Select a flow."));
   if (which === "frames") return renderFrames(box, f);
@@ -463,25 +538,123 @@ function editorArea(key, initial) {
   return ta;
 }
 
+// One line. The full explanation lives in the tooltip: three lines of standing
+// advice above the action row is how Forward and Drop got pushed off the pane.
+const REFORMAT_NOTE = "Body indented for reading — forwarding unedited still sends the original bytes.";
+const REFORMAT_WHY =
+  "The indentation is for display. An edited body is only sent if you actually typed "
+  + "something, so forwarding this flow untouched puts the original bytes on the wire "
+  + "byte-for-byte. Edit anything and the indented body is what is sent — press Raw "
+  + "first if the payload is signed or hashed.";
+
+function reformatNote() {
+  const p = el("p", "note", REFORMAT_NOTE);
+  p.title = REFORMAT_WHY;
+  return p;
+}
+
+// Pretty/Raw for the box in hand. `served` is what actually came off the wire and
+// `prettify` its indented form, so "Raw" can mean the original bytes rather than
+// "whatever minifying the box produces" -- an API that already indents its JSON
+// would otherwise be silently re-encoded by a button labelled Raw.
+function prettyToggle(ta, key, served, prettify) {
+  const b = btn(prettyBody ? "Raw" : "Pretty", null);
+  b.title = prettyBody
+    ? "Show the body exactly as it came off the wire"
+    : "Indent the JSON body so it can be read";
+  b.onclick = () => {
+    prettyBody = !prettyBody;
+    localStorage.setItem("ic.prettyBody", prettyBody ? "1" : "0");
+    // Nothing typed yet: re-derive from the wire bytes, which is exact both ways.
+    // Otherwise keep the edit and reformat just its body -- switching views must
+    // never be a way to lose a hand-written payload.
+    if (ta.value === served || ta.value === prettify(served)) drafts.delete(key);
+    else reformatBody(ta, key, prettyBody);
+    // Rebuild so the button label and the reformat note match the new state.
+    $("#detail-body").dataset.key = "";
+    render();
+  };
+  return b;
+}
+
+// A raw message is `start line\nheaders\n\nbody`. Only the body is reformatted --
+// rewriting a header would change what is sent in a way the user did not ask for,
+// and the blank-line split is what the engine's own parser looks for.
+function splitRaw(raw) {
+  const i = raw.indexOf("\n\n");
+  return i < 0 ? null : { head: raw.slice(0, i + 2), body: raw.slice(i + 2) };
+}
+
+function prettyRaw(raw) {
+  const parts = splitRaw(raw);
+  if (!parts || !parts.body.trim()) return raw;
+  const out = pretty(parts.body);
+  return out === parts.body ? raw : parts.head + out;
+}
+
+// Reformats what is in the box right now rather than re-deriving from the served
+// message, so a half-typed edit is never thrown away by toggling the view.
+function reformatBody(ta, key, toPretty) {
+  const parts = splitRaw(ta.value);
+  if (!parts) return note("No body to reformat — this message is headers only.");
+  let out;
+  try {
+    const v = JSON.parse(parts.body);
+    out = toPretty ? JSON.stringify(v, null, 2) : JSON.stringify(v);
+  } catch {
+    return note("Body is not JSON, so there is nothing to reformat.");
+  }
+  ta.value = parts.head + out;
+  drafts.set(key, ta.value);
+}
+
 function renderEditor(box, h) {
+  box.classList.add("editing");
   box.append(el("p", "headline", `STOPPED · ${h.direction}`));
   const key = `${h.id}:${h.direction}`;
   let ta = null;
+
+  // The textarea needs a flex parent to fill the pane; wrapping it keeps the
+  // notes and the action row at their natural height.
+  const fill = (node) => {
+    const wrap = el("div", "editor-fill");
+    wrap.append(node);
+    return wrap;
+  };
 
   if (h.direction === "websocket" && h.frame?.truncated) {
     box.append(el("p", "note",
       `Frame is ${fmtBytes(h.frame.size ?? 0)} — above the editable limit. Forward or drop it.`));
   } else if (h.direction === "websocket") {
-    ta = editorArea(key, h.frame?.body ?? "");
+    const raw = h.frame?.body ?? "";
+    // A JSON frame is the common case on an app socket, and unformatted it is one
+    // long line. Binary frames are spaced hex already -- never touch those.
+    const shown = prettyBody && !h.frame?.binary ? pretty(raw) : raw;
+    ta = editorArea(key, shown);
     const dir = h.frame?.from_client ? "client → server" : "server → client";
-    box.append(el("p", "section",
-      `frame #${h.frame?.seq ?? "?"} · ${dir} · ${fmtBytes(h.frame?.size ?? 0)}`), ta);
+    const head = el("div", "editor-head");
+    head.append(el("p", "section",
+      `frame #${h.frame?.seq ?? "?"} · ${dir} · ${fmtBytes(h.frame?.size ?? 0)}`));
+    if (!h.frame?.binary) head.append(prettyToggle(ta, key, raw, pretty));
+    box.append(head, fill(ta));
+    if (shown !== raw) box.append(reformatNote());
   } else if (h.detail && h.detail.raw != null) {
-    ta = editorArea(key, h.detail.raw);
-    box.append(
-      el("p", "section", "edit, then forward — Content-Length is recomputed"),
-      ta,
-    );
+    // Never reformat a CRLF body: its line endings are what make multipart
+    // boundaries valid, and JSON.parse would not accept one anyway.
+    const usePretty = prettyBody && !h.detail.body_crlf;
+    const shown = usePretty ? prettyRaw(h.detail.raw) : h.detail.raw;
+    ta = editorArea(key, shown);
+    const head = el("div", "editor-head");
+    // Short: beside the Raw button in a narrow pane, the old wording wrapped to
+    // two lines and ate height the editor needed. The detail is in the tooltip.
+    const label = el("p", "section", "edit, then forward");
+    label.title = "Content-Length is recomputed on forward — never edit it by hand.";
+    head.append(label);
+    if (!h.detail.body_crlf) head.append(prettyToggle(ta, key, h.detail.raw, prettyRaw));
+    box.append(head, fill(ta));
+    // Say it plainly: reformatting changes the bytes the server receives, which
+    // matters for a signed or hashed payload.
+    if (shown !== h.detail.raw) box.append(reformatNote());
     if (h.detail.body_crlf) {
       // A textarea silently converts CRLF to LF, so this box cannot round-trip
       // one. Header-only edits are safe: the engine restores the original body.
@@ -509,7 +682,14 @@ function renderEditor(box, h) {
     }));
   }
   box.append(actions);
-  if (ta) ta.focus();
+  if (ta) {
+    ta.focus();
+    // Assigning .value leaves the caret at the end, and focus() then scrolls
+    // there -- so the editor opened showing the tail of the body instead of the
+    // request line. Start at the top, where the method, path and headers are.
+    ta.setSelectionRange(0, 0);
+    ta.scrollTop = 0;
+  }
 }
 
 function forwardId(id, drop) {
@@ -697,10 +877,15 @@ function note(msg, ok) {
 }
 
 function select(id) {
+  const prev = sel ? flows.get(sel) : null;
   sel = id;
   // Keep the open tab when the new flow can show it: clicking down a list while
   // reading responses used to throw you back to Request on every row.
   const f = flows.get(id);
+  // Frames are the reason you opened a socket, so land there -- but only when
+  // arriving from a non-socket row, so choosing Request on a socket sticks while
+  // you click down the list.
+  if (f?.ws && !prev?.ws) which = "frames";
   if (which === "frames" && !f?.ws) which = "request";
   if (which === "repeat" && f?.ws) which = "request";
   for (const w of ["request", "response"]) {
@@ -772,16 +957,46 @@ $("#rules-raw-toggle").onclick = () => {
   renderRawPreview();
 };
 
+// Only one panel at a time. Three panels stacked above the workspace is the
+// clutter this UI cannot afford -- and it is the same complaint the queue caused.
+// Pass null to close everything. Returns whether `id` ended up open.
+function openPanel(id) {
+  let opened = false;
+  for (const [panel, toggle] of [["#decrypt", "#decrypt-toggle"],
+                                 ["#rules", "#rules-toggle"],
+                                 ["#sessions", "#open-session"]]) {
+    const want = panel === id && $(panel).hidden;
+    $(panel).hidden = !want;
+    $(toggle).classList.toggle("on", want);
+    if (want) opened = true;
+  }
+  return opened;
+}
+
+$("#decrypt-toggle").onclick = () => {
+  if (!openPanel("#decrypt")) return;
+  // Show what is actually in force, not what was last typed here.
+  $("#decrypt-hosts").value = (state.allow_hosts || []).join("\n");
+  $("#decrypt-hosts").focus();
+};
+$("#decrypt-close").onclick = () => openPanel(null);
+$("#decrypt-apply").onclick = () => {
+  const hosts = $("#decrypt-hosts").value.split("\n").map((s) => s.trim()).filter(Boolean);
+  send({ type: "decrypt.set", hosts });
+  $("#decrypt-status").textContent = hosts.length
+    ? `decrypting ${hosts.length} host(s), tunnelling the rest — new connections only`
+    : "decrypting every host again";
+  setTimeout(() => ($("#decrypt-status").textContent = ""), 6000);
+};
+$("#decrypt-clear").onclick = () => {
+  $("#decrypt-hosts").value = "";
+  send({ type: "decrypt.set", hosts: [] });
+};
+
 $("#rules-toggle").onclick = () => {
-  const panel = $("#rules");
-  panel.hidden = !panel.hidden;
-  $("#rules-toggle").classList.toggle("on", !panel.hidden);
-  if (!panel.hidden) loadRulesFromState();
+  if (openPanel("#rules")) loadRulesFromState();
 };
-$("#rules-close").onclick = () => {
-  $("#rules").hidden = true;
-  $("#rules-toggle").classList.remove("on");
-};
+$("#rules-close").onclick = () => openPanel(null);
 $("#rules-apply").onclick = () => {
   const specs = (rules) => rules.map(composeRule).filter(Boolean);
   const body = specs(bodyRules), headers = specs(headerRules);
@@ -799,16 +1014,10 @@ $("#resp").onclick = () =>
 $("#noise").onclick = () => send({ type: "opt.set", hide_noise: !state.hide_noise });
 $("#save-session").onclick = () => send({ type: "session.save" });
 $("#open-session").onclick = () => {
-  const panel = $("#sessions");
-  panel.hidden = !panel.hidden;
-  $("#open-session").classList.toggle("on", !panel.hidden);
-  if (!panel.hidden) send({ type: "sessions.list" });
+  if (openPanel("#sessions")) send({ type: "sessions.list" });
 };
 $("#sessions-refresh").onclick = () => send({ type: "sessions.list" });
-$("#sessions-close").onclick = () => {
-  $("#sessions").hidden = true;
-  $("#open-session").classList.remove("on");
-};
+$("#sessions-close").onclick = () => openPanel(null);
 function setRowFilter(v) {
   rowFilter = (v || "").trim();
   // Regex when it compiles, so /api/v\d+ works; plain text is a valid regex
@@ -826,6 +1035,103 @@ $("#row-filter-clear").onclick = () => {
   $("#row-filter").value = "";
   setRowFilter("");
   $("#row-filter").focus();
+};
+
+// ---------------------------------------------------------------- splitter
+
+// Both panes stay usable at any width: below these the table loses its columns
+// and the editor stops being an editor.
+const DETAIL_MIN = 300;
+const TABLE_MIN = 340;
+const DETAIL_DEFAULT = 500;
+
+function setDetailWidth(px) {
+  const rect = $("#workspace").getBoundingClientRect();
+  // Clamp against the actual workspace, not the window: the max depends on how
+  // much room the table needs, and on a narrow window DETAIL_MIN has to win.
+  const max = Math.max(DETAIL_MIN, rect.width - TABLE_MIN);
+  const w = Math.round(Math.min(max, Math.max(DETAIL_MIN, px)));
+  document.documentElement.style.setProperty("--detail-w", `${w}px`);
+  return w;
+}
+
+const savedWidth = Number(localStorage.getItem("ic.detailWidth"));
+if (savedWidth > 0) setDetailWidth(savedWidth);
+
+function saveDetailWidth() {
+  const cur = getComputedStyle(document.documentElement).getPropertyValue("--detail-w");
+  localStorage.setItem("ic.detailWidth", String(parseInt(cur, 10) || DETAIL_DEFAULT));
+}
+
+$("#splitter").addEventListener("pointerdown", (e) => {
+  e.preventDefault();
+  const sp = $("#splitter");
+  // Pointer capture, so the drag survives the cursor crossing the textarea or
+  // leaving the window -- without it a fast drag simply stopped tracking.
+  sp.setPointerCapture(e.pointerId);
+  sp.classList.add("dragging");
+  document.body.classList.add("resizing");
+
+  const move = (ev) => setDetailWidth($("#workspace").getBoundingClientRect().right - ev.clientX);
+  const up = () => {
+    sp.removeEventListener("pointermove", move);
+    sp.removeEventListener("pointerup", up);
+    sp.removeEventListener("pointercancel", up);
+    sp.classList.remove("dragging");
+    document.body.classList.remove("resizing");
+    saveDetailWidth();
+  };
+  sp.addEventListener("pointermove", move);
+  sp.addEventListener("pointerup", up);
+  sp.addEventListener("pointercancel", up);
+});
+
+// Keyboard: a separator that only responds to a drag is unreachable without a
+// mouse, and this one decides how much of the tool you can see.
+$("#splitter").addEventListener("keydown", (e) => {
+  const step = e.shiftKey ? 64 : 16;
+  const cur = parseInt(
+    getComputedStyle(document.documentElement).getPropertyValue("--detail-w"), 10,
+  ) || DETAIL_DEFAULT;
+  if (e.key === "ArrowLeft") setDetailWidth(cur + step);
+  else if (e.key === "ArrowRight") setDetailWidth(cur - step);
+  else if (e.key === "Home") setDetailWidth(DETAIL_DEFAULT);
+  else return;
+  e.preventDefault();
+  saveDetailWidth();
+});
+
+$("#splitter").ondblclick = () => {
+  setDetailWidth(DETAIL_DEFAULT);
+  saveDetailWidth();
+};
+
+// A window that shrank can leave the pane wider than the clamp allows.
+addEventListener("resize", () => {
+  const cur = parseInt(
+    getComputedStyle(document.documentElement).getPropertyValue("--detail-w"), 10,
+  );
+  if (cur) setDetailWidth(cur);
+});
+
+// ---------------------------------------------------------------- traffic tabs
+
+for (const b of document.querySelectorAll("#traffic-tabs button")) {
+  b.onclick = () => {
+    if (traffic === b.dataset.traffic) return;
+    traffic = b.dataset.traffic;
+    // A selection from the other view would highlight nothing and read as a bug.
+    if (sel && !!flows.get(sel)?.ws !== (traffic === "ws")) sel = null;
+    render();
+  };
+}
+
+$("#queue-collapse").onclick = () => {
+  const q = $("#queue");
+  q.classList.toggle("collapsed");
+  const hidden = q.classList.contains("collapsed");
+  $("#queue-collapse").textContent = hidden ? "Show list" : "Hide list";
+  $("#queue-collapse").classList.toggle("on", hidden);
 };
 
 $("#launch").onclick = () => send({ type: "browser.launch" });

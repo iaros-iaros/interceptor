@@ -11,11 +11,13 @@ show, and how to resume with edits.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import ipaddress
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -33,6 +35,7 @@ from mitmproxy.proxy.mode_specs import ProxyMode
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from bridge import Bridge  # noqa: E402
+from store import FlowStore  # noqa: E402
 
 MODES = ("intercept", "capture", "passthrough")
 
@@ -127,6 +130,9 @@ def summary(flow: http.HTTPFlow) -> dict:
         "ms": ms,
         "ws": flow.websocket is not None,
         "ws_frames": len(flow.websocket.messages) if flow.websocket else 0,
+        # Whether the socket is still up, which a 101 status cannot tell you --
+        # a closed connection keeps its handshake status forever.
+        "ws_open": flow.websocket is not None and flow.websocket.timestamp_end is None,
         "streamed": bool(getattr(r, "stream", False))
         or bool(resp and getattr(resp, "stream", False)),
         "intercepted": flow.intercepted,
@@ -240,10 +246,14 @@ def detail(flow: http.HTTPFlow, which: str) -> dict | None:
 class Interceptor:
     def __init__(self) -> None:
         self.bridge: Bridge | None = None
-        self.store: OrderedDict[str, http.HTTPFlow] = OrderedDict()
-        self.sizes: dict[str, int] = {}
-        self.bytes = 0
-        self.evicted = 0
+        # Completed flows on disk, in-flight ones in RAM -- see store.py. Bodies
+        # dominated memory, so the cap used to evict a morning's capture to make
+        # room for the current page; now only the index is in RAM.
+        self.store = FlowStore()
+        # id -> (frames already counted, their total bytes). Frame bytes are
+        # accumulated incrementally; re-summing the whole list per frame made
+        # frame handling O(n^2) -- see _remember.
+        self.ws_seen: dict[str, tuple[int, int]] = {}
         self.noise_hidden = 0
         self.auto_forwarded = 0
         self.paused: OrderedDict[str, tuple[str, http.HTTPFlow]] = OrderedDict()
@@ -254,13 +264,19 @@ class Interceptor:
         self.tmpdirs: list[tempfile.TemporaryDirectory] = []
         self._noise = flowfilter.parse(NOISE_FILTER)
         self._state_pushed_at = 0.0  # throttles counter-only state pushes
+        self._writer: asyncio.Task | None = None
 
     def load(self, loader) -> None:
         loader.add_option("ui_host", str, "127.0.0.1",
                           "UI bind host. Loopback only -- binding publicly exposes an open MITM proxy.")
         loader.add_option("ui_port", int, 9000, "UI port (static files and WebSocket share it).")
-        loader.add_option("store_bytes", int, 512 * 1024 * 1024,
-                          "Flow store cap in BYTES. Bodies dominate memory, so cap bytes, not flow count.")
+        loader.add_option("store_bytes", int, 2 * 1024 * 1024 * 1024,
+                          "Flow store cap in BYTES of captured traffic. Bodies dominate, so the "
+                          "cap is bytes rather than flow count. This is a cap on the store file, "
+                          "not on memory -- only the index lives in RAM now -- so it is far more "
+                          "generous than the 512MB it had to be when every body was resident. "
+                          "The file itself runs larger than the cap by roughly half again "
+                          "(serialisation, index and WAL overhead).")
         loader.add_option("hide_noise", bool, True,
                           "Hide browser background chatter from the flow table (counted, not silent).")
         loader.add_option("open_ui", bool, True,
@@ -340,6 +356,7 @@ class Interceptor:
             max_message_bytes=4 * MAX_EDITABLE_BODY,
         )
         await self.bridge.start()
+        self._writer = asyncio.create_task(self._flush_loop())
         self._set_mode("capture")
         # mitmproxy's log stream is buffered when stdout is not a tty, so the URL
         # can vanish entirely when run.sh is redirected. Print unbuffered, and
@@ -353,6 +370,14 @@ class Interceptor:
         if ctx.options.open_ui:
             # Non-blocking, and it carries the token so there is nothing to copy.
             webbrowser.open(self.bridge.url)
+
+    async def _flush_loop(self) -> None:
+        """Batch flow writes off the hot path. One transaction per tick beats one
+        per flow by three orders of magnitude at page-load rates, and the store's
+        readers flush on demand so nothing is ever stale."""
+        while True:
+            await asyncio.sleep(0.1)
+            self.store.flush()
 
     @staticmethod
     def _detected_proxy() -> str:
@@ -392,6 +417,11 @@ class Interceptor:
         # The token dies with the process, so leaving the file behind is both
         # useless and a credential-shaped thing lying around.
         try:
+            if self._writer:
+                self._writer.cancel()
+            # The store file is decrypted traffic, so closing it is also deleting
+            # it. In the finally block, because a leftover must not depend on the
+            # browser cleanup below succeeding.
             if self.url_file:
                 self.url_file.unlink(missing_ok=True)
             for proc in self.browsers:
@@ -408,7 +438,9 @@ class Interceptor:
                 except OSError as e:
                     logging.warning(f"interceptor: could not wipe {tdir.name}: {e}")
         finally:
-            # Whatever went wrong above, the port has to be released.
+            # Whatever went wrong above, the port has to be released and the
+            # decrypted-traffic file has to go.
+            self.store.close()
             if self.bridge:
                 await self.bridge.stop()
 
@@ -418,12 +450,23 @@ class Interceptor:
         # NOISE_FILTER is a negation, so a flow that does NOT match it is noise.
         return bool(ctx.options.hide_noise) and not self._noise(flow)
 
+    # The store owns the byte accounting now. These stay so the rest of the addon,
+    # the UI payload and the checks read the same names they always did.
+    @property
+    def bytes(self) -> int:
+        return self.store.bytes
+
+    @property
+    def evicted(self) -> int:
+        return self.store.evicted
+
+    @property
+    def sizes(self):
+        return self.store.sizes
+
     def _remember(self, flow) -> bool:
         if not isinstance(flow, http.HTTPFlow) or self._is_noise(flow):
             return False
-        self.bytes -= self.sizes.pop(flow.id, 0)
-        self.store[flow.id] = flow
-        self.store.move_to_end(flow.id)
         size = len(flow.request.raw_content or b"")
         if flow.response:
             size += len(flow.response.raw_content or b"")
@@ -432,13 +475,30 @@ class Interceptor:
             # stop arriving. Counting only the handshake froze a chat or telemetry
             # flow at a few hundred bytes, so the cap could never evict it and the
             # frames piled up in RAM for as long as the connection lasted.
-            size += sum(len(m.content) for m in flow.websocket.messages)
-        self.sizes[flow.id] = size
-        self.bytes += size
-        while self.bytes > ctx.options.store_bytes and len(self.store) > 1:
-            fid, _ = self.store.popitem(last=False)
-            self.bytes -= self.sizes.pop(fid, 0)
-            self.evicted += 1
+            #
+            # Count only frames not counted before. Re-summing the whole list ran
+            # once per arriving frame, which is O(n) per frame and O(n^2) over a
+            # connection: measured 0.72ms/frame at 2.5k frames rising to 9.9ms at
+            # 30k. That cost lands on the proxy's own event loop, so one chatty
+            # socket slowed every other request through the proxy -- HTTP p50
+            # doubled at 25k frames and got worse from there.
+            msgs = flow.websocket.messages
+            counted, total = self.ws_seen.get(flow.id, (0, 0))
+            if counted > len(msgs):
+                # A session load replaces the list wholesale, so a stale cursor
+                # would silently under-count. Recount from scratch.
+                counted, total = 0, 0
+            if counted < len(msgs):
+                total += sum(len(m.content) for m in msgs[counted:])
+                self.ws_seen[flow.id] = (len(msgs), total)
+            size += total
+        before = set(self.store) if self.ws_seen else None
+        self.store.put(flow, size, summary(flow), ctx.options.store_bytes)
+        # Frame cursors for flows the store just evicted would otherwise leak for
+        # the life of the process, and a recycled id would resume mid-count.
+        if before is not None:
+            for gone in before - set(self.store):
+                self.ws_seen.pop(gone, None)
         return True
 
     def _push_flow(self, flow) -> None:
@@ -527,6 +587,9 @@ class Interceptor:
     def error(self, flow) -> None:
         # A killed or timed-out flow must not linger in the queue as a phantom.
         self.paused.pop(flow.id, None)
+        # Re-store it: the error is part of the flow, and this is also the point at
+        # which a flow that never got a response becomes safe to persist and drop.
+        self._remember(flow)
         self._push_flow(flow)
         self._push_state()
 
@@ -709,6 +772,11 @@ class Interceptor:
                 # verified in spike/spike.py.) Re-arm the public flag, then resume.
                 flow.intercepted = True
             flow.resume()
+        # An edited flow has to be re-stored, or a read after forwarding would hand
+        # back the bytes as they arrived rather than as they were sent -- and this
+        # is where a held flow stops being intercepted, so it is also where it
+        # becomes safe to persist and release.
+        self._remember(flow)
         self._push_flow(flow)
         self._push_state()
 
@@ -799,6 +867,7 @@ class Interceptor:
             sessions_dir=str(SESSIONS),
             rules_body=list(ctx.options.modify_body),
             rules_headers=list(ctx.options.modify_headers),
+            allow_hosts=list(ctx.options.allow_hosts),
             proxy=f"{ctx.options.listen_host or '127.0.0.1'}:{ctx.options.listen_port}",
             # So the UI can explain a 502 before the user has to ask anyone.
             env_proxy=self._detected_proxy(),
@@ -806,9 +875,10 @@ class Interceptor:
         )
 
     def _snapshot(self) -> None:
-        self.bridge.push("snapshot",
-                         flows=[summary(f) for f in self.store.values()
-                                if isinstance(f, http.HTTPFlow)])
+        # Summaries come off disk already built, and only the newest page of them:
+        # the store is no longer bounded by memory, but a snapshot still has to fit
+        # in one message and the browser caps its own table anyway.
+        self.bridge.push("snapshot", flows=self.store.summaries())
         for direction, flow in self.paused.values():
             self.bridge.push("flow.paused", **self._paused_payload(direction, flow))
         self._push_state()
@@ -850,8 +920,8 @@ class Interceptor:
                 self.bridge.push("frames", id=flow.id, frames=out)
         elif kind == "clear":
             self.store.clear()
-            self.sizes.clear()
-            self.bytes = self.evicted = self.noise_hidden = 0
+            self.ws_seen.clear()
+            self.noise_hidden = 0
             self.bridge.push("cleared")
             self._push_state()
         elif kind == "opt.set":
@@ -872,6 +942,8 @@ class Interceptor:
             self.repeat(msg.get("id"), msg.get("raw") or "")
         elif kind == "rules.set":
             self._set_rules(list(msg.get("body") or []), list(msg.get("headers") or []))
+        elif kind == "decrypt.set":
+            self._set_decrypt(list(msg.get("hosts") or []))
         elif kind == "ws.inject":
             self.inject_frame(msg.get("id"), bool(msg.get("to_client")),
                               msg.get("text", ""), bool(msg.get("is_text", True)))
@@ -918,7 +990,8 @@ class Interceptor:
         # left the whole dump readable by any local user while it was being written.
         with os.fdopen(_open_private(path), "wb") as fh:
             writer = mitm_io.FlowWriter(fh)
-            for flow in self.store.values():
+            # Streamed one at a time: the store can hold far more than fits in RAM.
+            for flow in self.store.iter_flows():
                 writer.add(flow)
         logging.log(ALERT, f"saved {len(self.store)} flow(s) -> sessions/{name}")
         self.bridge.push("saved", name=name, flows=len(self.store))
@@ -934,8 +1007,8 @@ class Interceptor:
         # Opening a session replaces what is on screen rather than merging, so a
         # historical capture is never mixed up with live traffic.
         self.store.clear()
-        self.sizes.clear()
-        self.bytes = self.evicted = self.noise_hidden = 0
+        self.ws_seen.clear()
+        self.noise_hidden = 0
         self.bridge.push("cleared")
 
         count = 0
@@ -1008,6 +1081,46 @@ class Interceptor:
         # A streamed body is never buffered, so no rule can touch it.
         streamed_note = " (rules cannot touch streamed bodies)" if body else ""
         logging.log(ALERT, f"{len(body)} body + {len(headers)} header rule(s) active{streamed_note}")
+        self._push_state()
+
+    # ------------------------------------------------------------ decrypt scope
+
+    def _set_decrypt(self, hosts: list[str]) -> None:
+        """Limit TLS termination to these hosts; tunnel the rest.
+
+        This is mitmproxy's own `allow_hosts`. It matters for speed rather than
+        for filtering: terminating TLS costs two handshakes per connection on a
+        single-threaded event loop -- measured ~170 new HTTPS connections/second,
+        one core saturated, with this addon accounting for ~5% of it. A page
+        pulling from twenty hosts spends most of that budget on CDNs, fonts and
+        telemetry nobody is testing. Naming the hosts under test takes them out
+        of the crypto path entirely.
+
+        Not a security control. An allowed host is decrypted, a tunnelled one is
+        merely invisible to us -- it still reaches the client untouched.
+        """
+        cleaned = [h.strip() for h in hosts if h.strip()]
+        for pattern in cleaned:
+            try:
+                re.compile(pattern)
+            except re.error as e:
+                self.bridge.push(
+                    "error",
+                    message=f"bad host pattern {pattern!r}: {e}. This box takes a "
+                            f"hostname such as  app.example.com  or a regular "
+                            f"expression such as  .*\\.example\\.com  -- one per line.")
+                return
+        try:
+            ctx.options.update(allow_hosts=cleaned)
+        except Exception as e:
+            self.bridge.push("error", message=f"decrypt scope rejected: {e}")
+            return
+        # New connections only, exactly like passthrough: ignore/allow are consulted
+        # when a connection's next layer is chosen, so anything already established
+        # keeps being decrypted until it closes.
+        logging.log(ALERT,
+                    f"decrypting {cleaned} only, tunnelling the rest (new connections)"
+                    if cleaned else "decrypting every host again")
         self._push_state()
 
     # ------------------------------------------------------------ ws injection

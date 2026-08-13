@@ -51,6 +51,8 @@
       <div class="group" role="group" aria-label="Tools">
         <span class="group-label">Tools</span>
         <button id="rules-toggle" title="Rewrite matching traffic automatically, with nothing stopping">Rules</button>
+        <button id="decrypt-toggle"
+                title="Terminate TLS only for the hosts you name and tunnel the rest. Decrypting costs two TLS handshakes per connection on one core, and most of a page's connections are CDNs and telemetry nobody is testing.">Decrypt</button>
         <button id="launch" class="go" title="Open a throwaway Chrome already wired to this proxy">Launch Chrome</button>
       </div>
 
@@ -82,6 +84,35 @@
     <div class="panel-body">
       <p class="hint">Opening a session replaces what is on screen. Nothing is ever saved automatically.</p>
       <div id="sessions-list"></div>
+    </div>
+  </section>
+
+  <section id="decrypt" class="panel" hidden>
+    <div class="panel-head">
+      <b>Decrypt only these hosts</b>
+      <span class="dim">everything else is tunnelled — reachable by the browser, invisible here</span>
+      <span class="grow"></span>
+      <button id="decrypt-clear">Decrypt everything</button>
+      <button id="decrypt-close">Close</button>
+    </div>
+    <div class="panel-body">
+      <p class="hint">
+        One host per line. A plain hostname works, and so does a regular expression —
+        <code>app.example.com</code>, <code>.*\.example\.com</code>. Leave it empty to
+        decrypt everything, which is the default.
+      </p>
+      <textarea id="decrypt-hosts" rows="4" spellcheck="false" autocomplete="off"
+                placeholder="app.example.com&#10;api.example.com"></textarea>
+      <div class="actions">
+        <button id="decrypt-apply" class="primary">Apply</button>
+        <span id="decrypt-status" class="hint"></span>
+      </div>
+      <p class="hint">
+        This is a speed control, not a filter: terminating TLS costs two handshakes per
+        connection on a single core, so naming the hosts under test keeps CDNs, fonts and
+        telemetry out of the crypto path. It applies to <b>new connections only</b>, and
+        plain HTTP is captured either way. Passthrough mode still tunnels everything.
+      </p>
     </div>
   </section>
 
@@ -134,6 +165,7 @@
       <b id="queue-count"></b>
       <span id="queue-hosts"></span>
       <span class="grow"></span>
+      <button id="queue-collapse" title="Collapse the queue list — the counts stay">Hide list</button>
       <button id="fwd-all" class="ok">Forward all</button>
       <button id="drop-all" class="danger">Drop all</button>
     </div>
@@ -148,6 +180,13 @@
 
   <main id="workspace">
     <div id="table-pane">
+      <!-- HTTP and WebSocket are different enough to read separately: a socket is
+           one row that lives for minutes while frames stream under it, and it was
+           impossible to spot among hundreds of request rows. -->
+      <div id="traffic-tabs" class="seg" role="group" aria-label="Traffic type">
+        <button data-traffic="http" class="on">HTTP</button>
+        <button data-traffic="ws">WebSocket</button>
+      </div>
       <!-- View-only. Distinct from "Stop flows matching" in the toolbar, which
            halts traffic; this only decides which captured rows are drawn. -->
       <div id="table-tools">
@@ -171,11 +210,17 @@
       </table>
       <p id="truncated" class="hint" hidden></p>
       <p id="empty" class="empty">
-        <b>No traffic yet.</b>
-        <span>Hit <em>Launch Chrome</em> above, or point any client at the proxy.</span>
+        <b id="empty-title">No traffic yet.</b>
+        <span id="empty-hint">Hit <em>Launch Chrome</em> above, or point any client at the proxy.</span>
       </p>
       </div>
     </div>
+
+    <!-- Drag to rebalance table against detail. A fixed 500px pane was too narrow
+         for a raw message and too wide for a glance at the table. -->
+    <div id="splitter" role="separator" aria-orientation="vertical" tabindex="0"
+         aria-label="Resize detail panel (arrow keys)"
+         title="Drag to resize — double-click to reset"></div>
 
     <aside id="detail">
       <div id="detail-tabs" class="seg">
