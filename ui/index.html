@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Interceptor</title>
+  <link rel="icon" type="image/png" href="icon.png">
+  <link rel="apple-touch-icon" href="icon.png">
+  <link rel="stylesheet" href="style.css">
+  <script type="module" src="theme.js"></script>
+</head>
+<body>
+
+  <header id="bar">
+    <div class="bar-row">
+      <span class="brand" title="Interceptor">
+        <img src="icon.png" alt="Interceptor" width="20" height="20">
+      </span>
+
+      <div class="seg modes" role="group" aria-label="Interception mode">
+        <button data-mode="intercept" title="Stop matching requests so you can read or edit them before they go on">Intercept</button>
+        <button data-mode="capture" title="Decrypt and log everything, stop nothing">Capture</button>
+        <button data-mode="passthrough" title="Tunnel bytes: no TLS termination, no capture. New connections only.">Passthrough</button>
+      </div>
+
+      <span class="grow"></span>
+      <span id="stats"></span>
+      <span id="conn" class="off" title="Bridge connection">offline</span>
+      <button id="theme" class="icon" title="Switch between light and dark" aria-label="Switch theme">◐</button>
+    </div>
+
+    <div class="bar-row secondary">
+      <div class="group scope-group">
+        <label class="group-label" for="scope">Stop flows matching</label>
+        <input id="scope" spellcheck="false" autocomplete="off"
+               placeholder="leave empty to stop everything — or narrow it, e.g.  ~u /api/ &amp; ~m POST">
+        <button id="scope-help" class="icon" title="What can I type here?" aria-label="Filter syntax help">?</button>
+        <!-- A filter with nothing to stop is the one way this box looks broken, so
+             say so and offer the one click that makes it do something. -->
+        <button id="scope-arm" class="go" hidden>Switch to Intercept</button>
+      </div>
+
+      <div class="group" role="group" aria-label="Capture options">
+        <span class="group-label">Options</span>
+        <button id="resp" class="toggle"
+                title="Off: only the request stops, and the reply comes back untouched. On: the reply stops too, on its way to the browser, so you can edit what the app receives. A matching flow then stops twice — once each way.">Stop replies</button>
+        <button id="noise" class="toggle"
+                title="Hide the browser's own background chatter from the table. Hidden flows are counted, never dropped.">Hide noise</button>
+      </div>
+
+      <div class="group" role="group" aria-label="Tools">
+        <span class="group-label">Tools</span>
+        <button id="rules-toggle" title="Rewrite matching traffic automatically, with nothing stopping">Rules</button>
+        <button id="launch" class="go" title="Open a throwaway Chrome already wired to this proxy">Launch Chrome</button>
+      </div>
+
+      <div class="group" role="group" aria-label="Session">
+        <span class="group-label">Session</span>
+        <button id="save-session" title="Write the captured flows to sessions/ — nothing is ever saved on its own">Save</button>
+        <button id="open-session" title="Reopen a saved session, replacing what is on screen">Open</button>
+        <button id="clear" class="danger" title="Empty the table. Does not touch saved sessions.">Clear</button>
+      </div>
+    </div>
+
+    <!-- Plain-English restatement of what the current mode and toggles do. A
+         tooltip only helps someone who already suspects what to hover. -->
+    <p id="mode-hint"></p>
+    <!-- Notes live here, not in #stats: renderStats() rewrites that strip on every
+         100ms tick, which wiped every message before it could be read. -->
+    <p id="note" hidden></p>
+    <p id="proxy-warn" hidden></p>
+  </header>
+
+  <section id="sessions" class="panel" hidden>
+    <div class="panel-head">
+      <b>Saved sessions</b>
+      <span class="dim" id="sessions-dir"></span>
+      <span class="grow"></span>
+      <button id="sessions-refresh">Refresh</button>
+      <button id="sessions-close">Close</button>
+    </div>
+    <div class="panel-body">
+      <p class="hint">Opening a session replaces what is on screen. Nothing is ever saved automatically.</p>
+      <div id="sessions-list"></div>
+    </div>
+  </section>
+
+  <section id="rules" class="panel" hidden>
+    <div class="panel-head">
+      <b>Rewrite rules</b>
+      <span class="dim">applied automatically to matching traffic — nothing stops for you</span>
+      <span class="grow"></span>
+      <button id="rules-doc-open">Instructions</button>
+      <button id="rules-close">Close</button>
+    </div>
+
+    <div class="panel-body">
+      <div class="rule-block">
+        <div class="rule-block-head">
+          <b>Change text in bodies</b>
+          <span class="hint">Find something in the request or reply body and put something else there.</span>
+        </div>
+        <div id="body-rules" class="rule-list"></div>
+        <button id="add-body-rule">+ Add a body rule</button>
+      </div>
+
+      <div class="rule-block">
+        <div class="rule-block-head">
+          <b>Change headers</b>
+          <span class="hint">Set a header to a value, or leave the value empty to remove it.</span>
+        </div>
+        <div id="header-rules" class="rule-list"></div>
+        <button id="add-header-rule">+ Add a header rule</button>
+      </div>
+
+      <div class="actions">
+        <button id="rules-apply" class="primary">Apply</button>
+        <button id="rules-raw-toggle" title="See the text these forms generate">Show generated syntax</button>
+        <span class="grow"></span>
+        <span class="dim">start from an example:</span>
+        <div id="rules-examples" class="chips">
+          <button data-kind="body" data-where="req" data-url="/api/" data-find='"amount":100' data-repl='"amount":1'>change a value</button>
+          <button data-kind="body" data-where="resp" data-url="" data-find='"enabled":false' data-repl='"enabled":true'>flip a reply flag</button>
+          <button data-kind="header" data-where="req" data-url="" data-find="Authorization" data-repl="">strip a header</button>
+        </div>
+      </div>
+      <pre id="rules-raw" hidden></pre>
+      <p id="rules-status" class="hint"></p>
+    </div>
+  </section>
+
+  <section id="queue" class="panel hold" hidden>
+    <div class="panel-head">
+      <b id="queue-count"></b>
+      <span id="queue-hosts"></span>
+      <span class="grow"></span>
+      <button id="fwd-all" class="ok">Forward all</button>
+      <button id="drop-all" class="danger">Drop all</button>
+    </div>
+    <div class="panel-body">
+      <div id="queue-list"></div>
+      <p id="stall-note" class="hint">
+        Browsers open ~6 connections per host — a stopped request stalls that whole host,
+        not just itself.
+      </p>
+    </div>
+  </section>
+
+  <main id="workspace">
+    <div id="table-pane">
+      <!-- View-only. Distinct from "Stop flows matching" in the toolbar, which
+           halts traffic; this only decides which captured rows are drawn. -->
+      <div id="table-tools">
+        <label for="row-filter">Filter rows</label>
+        <input id="row-filter" spellcheck="false" autocomplete="off"
+               title="Hides rows from this table only. Nothing is stopped, and no traffic is changed. Plain text, or a regular expression if it is one."
+               placeholder="text or regex, e.g. /api/ or \.(png|jpg) — hides rows only">
+        <button id="row-filter-clear" class="icon" title="Clear the filter" hidden>✕</button>
+        <span id="row-filter-count" class="dim"></span>
+      </div>
+      <div id="table-wrap">
+      <table id="flows">
+        <thead>
+          <tr>
+            <th class="c-m">Method</th><th class="c-s">Status</th><th>Host</th>
+            <th>Path</th><th class="c-t">Type</th><th class="c-n">Size</th>
+            <th class="c-n">Time</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <p id="truncated" class="hint" hidden></p>
+      <p id="empty" class="empty">
+        <b>No traffic yet.</b>
+        <span>Hit <em>Launch Chrome</em> above, or point any client at the proxy.</span>
+      </p>
+      </div>
+    </div>
+
+    <aside id="detail">
+      <div id="detail-tabs" class="seg">
+        <button data-which="request" class="on">Request</button>
+        <button data-which="response">Response</button>
+        <button data-which="frames" hidden>Frames</button>
+        <button data-which="repeat" title="Resend this request, edited if you like">Repeat</button>
+      </div>
+      <div id="detail-body"><p class="hint">Select a flow.</p></div>
+    </aside>
+  </main>
+
+  <!-- Rule documentation. Content comes from rules-doc.js so this modal and
+       rules.html cannot drift apart. -->
+  <div id="doc-backdrop" hidden></div>
+  <div id="doc-modal" role="dialog" aria-modal="true" aria-labelledby="doc-title" hidden>
+    <div class="doc-head">
+      <b id="doc-title">How to write rules</b>
+      <span class="grow"></span>
+      <button id="doc-close" title="Close (Esc)">Close ✕</button>
+    </div>
+    <nav id="doc-nav" aria-label="Sections"></nav>
+    <div id="doc-body"></div>
+  </div>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>

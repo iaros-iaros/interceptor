@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Interceptor — writing rewrite rules</title>
+  <link rel="icon" type="image/png" href="icon.png">
+  <link rel="stylesheet" href="style.css">
+  <script type="module" src="theme.js"></script>
+</head>
+<body class="doc-page">
+<main class="doc">
+
+  <header class="doc-head">
+    <h1>Writing rewrite rules</h1>
+    <p class="lede">
+      The same reference the app shows under <b>Rules → Instructions</b>. It lives in
+      one file, <code>rules-doc.js</code>, so this page and the in-app modal cannot
+      drift apart.
+    </p>
+    <p><a href="./" class="back">← back to Interceptor</a></p>
+  </header>
+
+  <div id="doc-body"></div>
+
+  <footer class="doc-foot">
+    <p><a href="./" class="back">← back to Interceptor</a></p>
+  </footer>
+
+</main>
+<script type="module">
+  import { RULES_DOC_HTML } from "./rules-doc.js";
+  document.querySelector("#doc-body").innerHTML = RULES_DOC_HTML;
+</script>
+</body>
+</html>

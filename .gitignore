@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+.DS_Store
+# Contains the per-run bridge token: a credential for reading and rewriting
+# all captured traffic. Never commit.
+.ui-url*
+sessions/
+*.mitm
+# Local design record: decisions, protocol notes, phase log. Not part of the product.
+PLAN.md
+# Byte-identical duplicate of ui/icon.png, which is the copy the bridge serves.
+# Drop this line if you'd rather keep the original at the root under version control.
+/icon.png

@@ -1,0 +1,8 @@
+# Python 3.13 — mitmproxy has no wheels for 3.14 yet (system default here is 3.14).
+#   uv venv --python 3.13 .venv
+#   uv pip install --python .venv/bin/python -r requirements.txt
+#
+# Pinned: the addon API changed materially at mitmproxy 7 (WebSocket flow model)
+# and again across 10/11. Do not float this.
+mitmproxy==12.2.3
+websockets==17.0.1
