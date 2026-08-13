@@ -706,7 +706,7 @@ class Interceptor:
                 # kill() clears .intercepted, which makes resume() a no-op and
                 # strands the coroutine awaiting wait_for_resume() -- the client
                 # then hangs forever. (mitmweb's own kill path has this bug;
-                # verified in P0.) Re-arm the public flag, then resume.
+                # verified in spike/spike.py.) Re-arm the public flag, then resume.
                 flow.intercepted = True
             flow.resume()
         self._push_flow(flow)
@@ -1051,7 +1051,8 @@ class Interceptor:
         """base64(sha256(SubjectPublicKeyInfo)) of mitmproxy's CA.
 
         Lets Chrome trust the proxy without installing anything into the system
-        store, the login keychain, or the profile's NSS DB. Verified in P0.
+        store, the login keychain, or the profile's NSS DB. Verified by
+        spike/spike.py --chrome.
         """
         pem = Path(ctx.options.confdir).expanduser() / "mitmproxy-ca-cert.pem"
         if not pem.exists():

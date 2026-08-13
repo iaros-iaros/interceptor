@@ -371,13 +371,22 @@ Also:
 ## Tests
 
 ```bash
-.venv/bin/python spike/spike.py --chrome --net    # P0 protocol primitives   4/4
-.venv/bin/python spike/check.py                   # units + end-to-end      52/52
+.venv/bin/python spike/spike.py --chrome --net    # browser + network reality   4/4
+.venv/bin/python spike/check.py                   # units + end-to-end        52/52
 ```
 
 Both are safe to run while a real instance is up — separate ports (`18xxx`/`19000`), their
 own URL file, and neither kills stray processes. `check.py` deletes the session it saves,
 so it leaves your `sessions/` folder as it found it.
+
+They test different things, which is why they are separate commands. `check.py` runs
+offline against a loopback target and proves this project's own logic. `spike.py` needs a
+real browser and real internet, and proves the four assumptions underneath it that no
+amount of local testing can: an HTTP flow can be held and resumed out-of-band, WebSocket
+frame order survives a held frame, Chrome decrypts HTTPS through an SPKI pin with **no CA
+installed anywhere**, and an HTTP/2 request body round-trips edited. Those are the things a
+mitmproxy or Chrome upgrade breaks silently. It also holds the shared test harness
+(`start_http`, `ws_echo`) that `check.py` imports.
 
 **Covered:** both bridge auth gates, static serving and path-traversal refusal, capture,
 pause → forward / drop, request and response editing, `Content-Length` recompute,
@@ -413,7 +422,7 @@ ui/
   icon.png         # app icon and favicon
 sessions/          # created on first save; gitignored, dir 0700, files 0600
 spike/
-  spike.py         # P0 primitives, kept as a regression check
+  spike.py         # browser/network assumptions + the shared test harness
   check.py         # units + end-to-end
 run.sh             # entry point, symlink-safe
 ```
