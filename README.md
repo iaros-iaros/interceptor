@@ -1,6 +1,8 @@
+<img width="1665" height="992" alt="UI" src="https://github.com/user-attachments/assets/854601cc-6d1f-493f-8528-49edcbd3cecf" />
+
 # Interceptor
 
-A local, Burp-style network interception tool for QA testing. Capture HTTP/1.1, HTTP/2
+A local, Burp-style network interception tool for testing. Capture HTTP/1.1, HTTP/2
 and WebSocket traffic, pause it mid-flight, edit the request or the response by hand,
 then forward or drop it.
 
