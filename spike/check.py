@@ -1259,7 +1259,9 @@ def units_row_filter() -> None:
 
     harness = r"""
       import { readFileSync } from "node:fs";
-      const src = readFileSync("ui/app.js", "utf8");
+      // table.js since the UI was split into modules; `grab` starts at the
+      // `function` keyword, so an `export function` is picked up unchanged.
+      const src = readFileSync("ui/table.js", "utf8");
       const grab = (name) => {
         const i = src.indexOf(`function ${name}(`);
         if (i < 0) throw new Error(`missing ${name}`);
@@ -1270,7 +1272,7 @@ def units_row_filter() -> None:
         }
         throw new Error(`unbalanced ${name}`);
       };
-      const code = ['let rowFilter = ""; let rowFilterRe = null;',
+      const code = ['const ui = { rowFilter: "", rowFilterRe: null };',
                     "function renderTable() {}",      // matchesRow's caller needs a DOM
                     grab("setRowFilter"), grab("matchesRow")].join("\n");
       const fns = new Function(code + "; return {setRowFilter, matchesRow};")();
@@ -1584,8 +1586,11 @@ def units_pretty_body() -> None:
 
     harness = r"""
       import { readFileSync } from "node:fs";
-      const src = readFileSync("ui/app.js", "utf8");
-      const grab = (name) => {
+      // Two files since the UI split: `pretty` is a shared helper, the raw-message
+      // splitting belongs to the detail pane.
+      const util = readFileSync("ui/util.js", "utf8");
+      const detail = readFileSync("ui/detail.js", "utf8");
+      const grab = (src, name) => {
         const i = src.indexOf(`function ${name}(`);
         if (i < 0) throw new Error(`missing ${name}`);
         let depth = 0, j = src.indexOf("{", i);
@@ -1595,7 +1600,8 @@ def units_pretty_body() -> None:
         }
         throw new Error(`unbalanced ${name}`);
       };
-      const code = [grab("pretty"), grab("splitRaw"), grab("prettyRaw")].join("\n");
+      const code = [grab(util, "pretty"), grab(detail, "splitRaw"),
+                    grab(detail, "prettyRaw")].join("\n");
       const fns = new Function(code + "; return {prettyRaw, splitRaw};")();
       console.log(JSON.stringify(JSON.parse(process.env.CASES).map((raw) => {
         const out = fns.prettyRaw(raw);
@@ -1648,8 +1654,8 @@ def units_rule_builder() -> None:
     # the shipped functions rather than a Python restatement of them.
     harness = r"""
       import { readFileSync } from "node:fs";
-      const src = readFileSync("ui/app.js", "utf8");
-      // Pull just the pure helpers; the rest of app.js needs a DOM.
+      const src = readFileSync("ui/rules.js", "utf8");
+      // Pull just the pure helpers; the rest of the module needs a DOM.
       const grab = (name) => {
         const i = src.indexOf(`function ${name}(`);
         if (i < 0) throw new Error(`missing ${name}`);
@@ -1661,6 +1667,7 @@ def units_rule_builder() -> None:
         throw new Error(`unbalanced ${name}`);
       };
       const seps = src.match(/const SEP_CANDIDATES = \[[\s\S]*?\];/)[0];
+      // (rules.js since the UI split; see the readFileSync above.)
       const code = [seps, grab("pickSep"), grab("filterFor"), grab("composeRule"),
                     grab("splitSpec"), grab("ruleFromSpec")].join("\n");
       const fns = new Function(code + "; return {composeRule, ruleFromSpec};")();
@@ -1779,6 +1786,249 @@ is_self "http://127.0.0.1:7897" && printf 'self' || printf 'notself'
           got == "self self notself", f"got {got!r} (want 'self self notself')")
 
 
+async def units_faults() -> None:
+    """Fault rules: validation, first-match-wins, and the three effects.
+
+    The delay is asserted to be *awaited* rather than slept through on the loop:
+    a sync sleep here would stop the whole proxy, which is the one way this
+    feature could be worse than not having it.
+    """
+    import time as _time
+
+    import faults as F
+    from mitmproxy.test import tflow
+
+    notes = []
+
+    # Validation refuses the shapes that would arm something nobody asked for.
+    for spec, why in (
+        ({}, "does nothing"),
+        ({"status": 999}, "status out of range"),
+        ({"delay_ms": 10_000_000}, "delay out of range"),
+        ({"drop": True, "status": 503}, "drop and reply together"),
+        ({"url": "*bad(", "status": 503}, "unparseable URL pattern"),
+    ):
+        try:
+            F.Fault(spec)
+            notes.append(f"accepted {why}: {spec}")
+        except ValueError:
+            pass
+    check("a fault rule that would do nothing or contradict itself is refused",
+          not notes, "; ".join(notes) or "5 malformed rules refused")
+
+    # parse_all is all-or-nothing: one bad row must not leave earlier rows armed.
+    try:
+        F.parse_all([{"status": 503}, {"status": 12}])
+        allornothing = False
+    except ValueError as e:
+        allornothing = "2" in str(e)
+    check("a bad row rejects the whole fault list, never half of it", allornothing,
+          "rule 2 named in the error; nothing is armed")
+
+    # A synthesized reply short-circuits: the flow gets a response without ever
+    # having gone upstream.
+    f = tflow.tflow(resp=False)
+    f.request.path = "/api/pay"
+    got = await F.apply(F.parse_all([{"url": "/api/", "status": 503}]), f)
+    if f.response is None or f.response.status_code != 503:
+        notes.append(f"status rule did not answer: {f.response}")
+    if not got or "503" not in got:
+        notes.append(f"description missing the status: {got!r}")
+    # A rule whose URL does not match must leave the flow completely alone.
+    other = tflow.tflow(resp=False)
+    other.request.path = "/health"
+    if await F.apply(F.parse_all([{"url": "/api/", "status": 503}]), other):
+        notes.append("rule fired on a non-matching URL")
+    if other.response is not None:
+        notes.append("non-matching flow got a response")
+    # First match wins, top to bottom -- two rules must not compound.
+    first = await F.apply(
+        F.parse_all([{"url": "", "status": 418}, {"url": "", "status": 500}]),
+        tflow.tflow(resp=False))
+    if "418" not in (first or ""):
+        notes.append(f"second rule won: {first!r}")
+
+    check("a fault rule answers the request itself and leaves others alone",
+          not notes, "; ".join(notes) or "503 synthesized, /health untouched, first rule wins")
+
+    # The delay must yield to the event loop rather than block it. Three faulted
+    # flows run concurrently: serialised, this takes 3x as long as one.
+    rules = F.parse_all([{"delay_ms": 250}])
+    flows = [tflow.tflow(resp=False) for _ in range(3)]
+    t0 = _time.monotonic()
+    await asyncio.gather(*(F.apply(rules, f) for f in flows))
+    elapsed = _time.monotonic() - t0
+    check("a fault delay suspends its own flow, not the proxy",
+          elapsed < 0.5,
+          f"3 x 250ms concurrently took {elapsed * 1000:.0f}ms "
+          f"(~250 means awaited, ~750 means the loop was blocked)")
+
+
+def units_search() -> None:
+    """Body search has to see what the row never showed: headers and bodies."""
+    import interceptor as I
+    from mitmproxy.test import taddons, tflow
+    from store import FlowStore
+
+    addon = I.Interceptor()
+    with taddons.context(addon):
+        store = FlowStore(":memory:")
+        made = []
+        for path, body, header in (
+            ("/api/users", '{"token":"sekrit-abc123"}', "x-trace: aaa"),
+            ("/api/orders", '{"total":42}', "set-cookie: sid=zzz"),
+            ("/health", "ok", "x-trace: bbb"),
+        ):
+            f = tflow.tflow(resp=True)
+            f.request.path = path
+            f.response.content = body.encode()
+            name, _, value = header.partition(": ")
+            f.response.headers[name] = value
+            store.put(f, len(body), I.summary(f), 10 * 1024 * 1024)
+            made.append(f)
+
+        found = lambda q: sorted(s["path"] for s in store.search(q))  # noqa: E731
+        notes = []
+        if found("sekrit-abc123") != ["/api/users"]:
+            notes.append(f"body match: {found('sekrit-abc123')}")
+        if found("sid=zzz") != ["/api/orders"]:
+            notes.append(f"header match: {found('sid=zzz')}")
+        if found("/api/") != ["/api/orders", "/api/users"]:
+            notes.append(f"url match: {found('/api/')}")
+        if found("nothing-here") != []:
+            notes.append("a miss returned rows")
+        # LIKE's own wildcards must be literals, or "%" matches the whole store.
+        if found("%") != []:
+            notes.append("a bare % matched everything -- wildcards are not escaped")
+        store.close()
+    check("body search finds text in bodies, headers and URLs", not notes,
+          "; ".join(notes) or "body, header, URL, miss and a literal % all correct")
+
+
+def units_contentview() -> None:
+    """detail() must carry a prettified rendering *beside* the exact bytes, never
+    instead of them: `raw` is what the editor writes back onto the wire."""
+    import interceptor as I
+    from mitmproxy.test import taddons, tflow
+
+    addon = I.Interceptor()
+    notes = []
+    with taddons.context(addon):
+        f = tflow.tflow(resp=True)
+        f.response.headers["content-type"] = "application/x-www-form-urlencoded"
+        f.response.content = b"user=alice&role=admin&role=owner"
+        d = I.detail(f, "response")
+        if not d.get("pretty"):
+            notes.append("no prettified rendering for a form body")
+        elif "alice" not in d["pretty"]:
+            notes.append(f"prettified text lost the content: {d['pretty'][:60]!r}")
+        if not d.get("pretty_view"):
+            notes.append("prettified body did not say which view produced it")
+        # The exact bytes must be untouched, or every edit path is now a lie.
+        if d["body"] != "user=alice&role=admin&role=owner":
+            notes.append(f"body was rewritten: {d['body']!r}")
+        if d["raw"] is None or "user=alice&role=admin&role=owner" not in d["raw"]:
+            notes.append("raw no longer holds the wire bytes")
+
+        # Plain text has nothing to add, and a redundant copy of the body is pure
+        # bandwidth on every body.get.
+        g = tflow.tflow(resp=True)
+        g.response.headers["content-type"] = "text/plain"
+        g.response.content = b"just some text"
+        if I.detail(g, "response").get("pretty"):
+            notes.append("plain text got a redundant prettified copy")
+    check("bodies get a contentview rendering beside the exact bytes, not instead",
+          not notes, "; ".join(notes) or "form body prettified, raw and body untouched")
+
+
+def units_export() -> None:
+    """Copy-as-curl has to produce something that actually runs."""
+    import interceptor as I
+    from exporters import export_text
+    from mitmproxy.addons import default_addons, export
+    from mitmproxy.test import taddons, tflow
+
+    addon = I.Interceptor()
+    notes = []
+    # The `export` command is not ours -- it belongs to mitmproxy's Export addon,
+    # which mitmdump loads via default_addons() but taddons does not. Assert that
+    # is still true rather than assume it, then load it so the adapter is tested.
+    if not any(isinstance(a, export.Export) for a in default_addons()):
+        notes.append("mitmproxy no longer loads the Export addon by default")
+    with taddons.context(addon, export.Export()):
+        f = tflow.tflow(resp=True)
+        f.request.method = "POST"
+        f.request.host = "api.example.com"
+        f.request.path = "/v1/pay"
+        f.request.headers["x-token"] = "abc"
+        f.request.content = b'{"amount":100}'
+        try:
+            cmd = export_text(f, "curl")
+        except Exception as e:
+            cmd = ""
+            notes.append(f"curl export raised {e!r}")
+        # Host and path asserted separately: a test flow carries whatever port
+        # tflow picked, and curl_command spells it out in the URL.
+        for want in ("curl", "-X POST", "api.example.com", "/v1/pay",
+                     "x-token: abc", '{"amount":100}'):
+            if want not in cmd:
+                notes.append(f"curl command missing {want!r}")
+        try:
+            export_text(f, "nope")
+            notes.append("an unknown format was accepted")
+        except ValueError:
+            pass
+    check("copy as curl produces a runnable command", not notes,
+          "; ".join(notes) or f"{len(cmd)}B command with method, url, header and body")
+
+
+def units_stop_reply() -> None:
+    """The per-request reply hold: one reply, then disarmed.
+
+    The global toggle stops every matching flow twice, which is why it is off by
+    default -- so this path is the one people will actually use, and it has to
+    arm and disarm exactly once.
+    """
+    import interceptor as I
+    from mitmproxy.test import taddons, tflow
+
+    addon = I.Interceptor()
+    notes = []
+    with taddons.context(addon) as tctx:
+        tctx.options.intercept_responses = False
+
+        class FakeBridge:
+            clients = {"one"}
+
+            def push(self, *a, **k):
+                pass
+
+        addon.bridge = FakeBridge()
+        # taddons loads our addon alone, so options owned by mitmproxy's own
+        # addons (modify_body, modify_headers) do not exist here. This test is
+        # about the hold decision, not the state payload, so the payload is out.
+        addon._push_state = lambda: None
+
+        f = tflow.tflow(resp=True)
+        f.intercepted = True
+        addon.stop_reply.add(f.id)
+        addon._maybe_pause(f, "response")
+        if f.id not in addon.paused:
+            notes.append("an armed reply was not held")
+        if f.id in addon.stop_reply:
+            notes.append("the arm survived its own reply -- it is not one-shot")
+
+        # Not armed, global toggle off: the reply must sail through.
+        addon.paused.clear()
+        g = tflow.tflow(resp=True)
+        g.intercepted = True
+        addon._maybe_pause(g, "response")
+        if g.id in addon.paused:
+            notes.append("an unarmed reply was held with the global toggle off")
+    check("stopping one reply holds exactly that reply, once", not notes,
+          "; ".join(notes) or "armed reply held, arm consumed, unarmed reply passed")
+
+
 def cleanup_saved_session() -> None:
     """The suite writes a real file into the user's sessions/ folder to prove the
     save path. Leaving it there would clutter the picker a little more every run."""
@@ -1803,6 +2053,11 @@ async def main() -> int:
     units_flow_store()
     units_host_uniform()
     units_host_scope()
+    await units_faults()
+    units_search()
+    units_contentview()
+    units_export()
+    units_stop_reply()
     await integration()
     await restart_and_load()
     cleanup_saved_session()

@@ -34,7 +34,10 @@ from mitmproxy.log import ALERT
 from mitmproxy.proxy.mode_specs import ProxyMode
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import faults as faultlib  # noqa: E402
+import views  # noqa: E402
 from bridge import Bridge  # noqa: E402
+from exporters import FORMATS as EXPORT_FORMATS, export_text, write_har  # noqa: E402
 from store import FlowStore  # noqa: E402
 
 # Two modes, because a mode only answers one question: does a matching flow stop?
@@ -159,6 +162,10 @@ def summary(flow: http.HTTPFlow) -> dict:
         "killed": bool(flow.error),
         "replay_of": flow.metadata.get("replay_of"),
         "is_replay": flow.is_replay,
+        # A 503 you injected is indistinguishable from a real one without this.
+        # Never omit it: an unlabelled fault is an hour spent debugging your own
+        # rule, which is the one way this feature can cost more than it gives.
+        "faulted": flow.metadata.get("faulted"),
     }
 
 
@@ -256,6 +263,14 @@ def detail(flow: http.HTTPFlow, which: str) -> dict | None:
         "body_crlf": "\r\n" in body,
     }
     out["raw"] = raw_text(flow, which)
+    # Display only, and strictly additive: `body` and `raw` above are still the
+    # exact bytes, because those are what the editor writes back onto the wire.
+    # A protobuf rendering is not round-trippable and must never be mistaken for
+    # one, so it travels in its own field and the UI never edits it.
+    if encoding == "text":
+        pretty = views.prettify(flow, msg)
+        if pretty:
+            out["pretty"], out["pretty_view"] = pretty
     if which == "request":
         out |= {"method": msg.method, "url": msg.url, "http_version": msg.http_version}
     else:
@@ -277,6 +292,10 @@ class Interceptor:
         self.noise_hidden = 0
         self.auto_forwarded = 0
         self.paused: OrderedDict[str, tuple[str, http.HTTPFlow]] = OrderedDict()
+        # Armed from the held-request editor: hold *this* flow's reply too, without
+        # turning on the global toggle that makes every matching flow stop twice.
+        self.stop_reply: set[str] = set()
+        self.faults: list[faultlib.Fault] = []
         self.mode = "capture"
         self.scope = ""
         self.url_file: Path | None = None
@@ -582,7 +601,11 @@ class Interceptor:
             self._state_pushed_at = now
             self._push_state()
 
-    def request(self, flow: http.HTTPFlow) -> None:
+    async def request(self, flow: http.HTTPFlow) -> None:
+        # Async because a fault may delay this flow. mitmproxy awaits coroutine
+        # hooks, so the sleep suspends this one flow and nothing else -- the same
+        # shape the pause queue relies on. A sync `time.sleep` here would stop the
+        # whole proxy, which is the trap this comment exists to prevent.
         if self._is_noise(flow):
             self.noise_hidden += 1
             self._push_state_soon()
@@ -590,7 +613,37 @@ class Interceptor:
         if self._remember(flow):
             self._push_flow(flow)
             self._push_state_soon()
+        await self._maybe_fault(flow)
         self._maybe_pause(flow, "request")
+
+    async def _maybe_fault(self, flow: http.HTTPFlow) -> None:
+        """Break this flow on purpose, if a rule says so.
+
+        Skipped when the flow is already held for hand editing: a human with the
+        flow stopped in front of them *is* the fault injector, and the hook returns
+        before `wait_for_resume` runs, so a delay here would land before the row
+        ever reached the queue -- five seconds of nothing, then the editor.
+
+        Skipped for replays too. Repeating a request to compare it against the
+        original is not the moment to have it broken underneath you.
+        """
+        if not self.faults or flow.intercepted or flow.is_replay:
+            return
+        if self._off_list(flow):
+            return
+        try:
+            what = await faultlib.apply(self.faults, flow)
+        except Exception as e:  # a bad rule costs its flow, never the proxy
+            logging.warning(f"interceptor: fault failed: {e!r}")
+            return
+        if not what:
+            return
+        flow.metadata["faulted"] = what
+        # Re-store and re-push explicitly rather than leaving it to the response
+        # hook: a short-circuited flow never goes upstream, so the table has to be
+        # corrected from here or the row sits at "···" forever.
+        self._remember(flow)
+        self._push_flow(flow)
 
     def response(self, flow: http.HTTPFlow) -> None:
         if self._remember(flow):
@@ -628,6 +681,8 @@ class Interceptor:
     def error(self, flow) -> None:
         # A killed or timed-out flow must not linger in the queue as a phantom.
         self.paused.pop(flow.id, None)
+        # Its reply is never coming, so a pending arm would outlive the flow.
+        self.stop_reply.discard(flow.id)
         # Re-store it: the error is part of the flow, and this is also the point at
         # which a flow that never got a response becomes safe to persist and drop.
         self._remember(flow)
@@ -658,7 +713,15 @@ class Interceptor:
             flow.resume()
             return
         listening = self.bridge is not None and bool(self.bridge.clients)
-        wanted = direction != "response" or bool(ctx.options.intercept_responses)
+        # `stop_reply` is the per-request opt-in armed from the held-request
+        # editor. The global toggle stops every matching flow twice, which is why
+        # it defaults off and stays off -- this holds one reply, the one you asked
+        # for, and disarms itself immediately after.
+        wanted = (direction != "response"
+                  or bool(ctx.options.intercept_responses)
+                  or flow.id in self.stop_reply)
+        if direction == "response":
+            self.stop_reply.discard(flow.id)
         if not listening or not wanted:
             if not listening:
                 self.auto_forwarded += 1
@@ -779,11 +842,16 @@ class Interceptor:
         msg.text = body
 
     def _resume(self, fid: str | None, drop: bool = False, seq: int | None = None,
-                raw: str | None = None) -> None:
+                raw: str | None = None, stop_reply: bool = False) -> None:
         entry = self.paused.get(fid)
         if entry is None:
             return
         direction, flow = entry
+        # Armed before the flow goes back on the wire, so the reply is already
+        # spoken for by the time it comes back. Only meaningful on a request --
+        # asking to hold the reply to a reply is not a thing.
+        if stop_reply and direction == "request":
+            self.stop_reply.add(fid)
         # Resolve the frame once, here, and hand it to both the edit and the drop.
         idx = None
         if direction == "websocket":
@@ -907,6 +975,20 @@ class Interceptor:
 
     # ------------------------------------------------------------ UI protocol
 
+    def _report(self, message: str) -> bool:
+        """Surface a problem to the UI, or to the log when there is no UI.
+
+        The `@command.command` methods below are reachable from mitmproxy's own
+        command interface, which can call them before `running()` has built the
+        bridge -- an unguarded `self.bridge.push` there is an AttributeError, not
+        an error message. Returns False so callers can `return self._report(...)`.
+        """
+        if self.bridge is not None:
+            self.bridge.push("error", message=message)
+        else:
+            logging.warning(f"interceptor: {message}")
+        return False
+
     def _push_state(self) -> None:
         if not self.bridge:
             return
@@ -926,6 +1008,7 @@ class Interceptor:
             sessions_dir=str(SESSIONS),
             rules_body=list(ctx.options.modify_body),
             rules_headers=list(ctx.options.modify_headers),
+            faults=[f.to_spec() for f in self.faults],
             allow_hosts=list(ctx.options.allow_hosts),
             proxy=f"{ctx.options.listen_host or '127.0.0.1'}:{ctx.options.listen_port}",
             # So the UI can explain a 502 before the user has to ask anyone.
@@ -950,7 +1033,8 @@ class Interceptor:
             self._set_mode(msg.get("mode", "capture"), msg.get("scope"))
         elif kind == "resume":
             self._resume(msg.get("id"), drop=bool(msg.get("drop")),
-                         seq=msg.get("seq"), raw=msg.get("raw"))
+                         seq=msg.get("seq"), raw=msg.get("raw"),
+                         stop_reply=bool(msg.get("stop_reply")))
         elif kind == "resume.all":
             drop = bool(msg.get("drop"))
             for fid in list(self.paused):
@@ -977,10 +1061,25 @@ class Interceptor:
                         "injected": fm.injected, "dropped": fm.dropped,
                     })
                 self.bridge.push("frames", id=flow.id, frames=out)
+        elif kind == "search":
+            # Server-side, because the browser only ever held summaries -- the
+            # bodies live in the store and were until now unqueryable.
+            self.bridge.push("results", q=msg.get("q", ""),
+                             flows=self.store.search(msg.get("q", "")))
+        elif kind == "export":
+            self._export(msg.get("id"), msg.get("format", "curl"))
+        elif kind == "har.save":
+            self._save_har()
+        elif kind == "faults.set":
+            self._set_faults(list(msg.get("faults") or []))
         elif kind == "clear":
             self.store.clear()
             self.ws_seen.clear()
             self.noise_hidden = 0
+            # Counters describe what is in the table, so they go with it. Leaving
+            # this behind showed "12 auto-forwarded" above an empty capture.
+            self.auto_forwarded = 0
+            self.stop_reply.clear()
             self.bridge.push("cleared")
             self._push_state()
         elif kind == "opt.set":
@@ -1085,6 +1184,59 @@ class Interceptor:
         self.bridge.push("loaded", name=name, flows=count)
         self._push_state()
 
+    # ------------------------------------------------------------ export
+
+    def _export(self, fid: str | None, fmt: str) -> None:
+        """One flow as a runnable command. The UI puts it on the clipboard.
+
+        Sent over the bridge rather than written to a file: the whole point is
+        pasting it into a terminal or a ticket, and a path to open first would be
+        one step more than the thing is worth.
+        """
+        flow = self.store.get(fid)
+        if flow is None:
+            self.bridge.push("error", message="that flow is no longer in the store")
+            return
+        try:
+            text = export_text(flow, fmt)
+        except Exception as e:
+            self.bridge.push("error", message=f"export failed: {e}")
+            return
+        self.bridge.push("export", id=fid, format=fmt, text=text)
+
+    def _save_har(self) -> None:
+        """Every captured flow as a HAR file in sessions/.
+
+        A file rather than a download: a HAR of a real session is tens of
+        megabytes of decrypted traffic, and the bridge's static route is not
+        token-gated -- serving it there would publish the capture to any page the
+        user has open. Same destination and same 0600 treatment as a session dump.
+        """
+        try:
+            name, size = write_har(self.store.iter_flows(), SESSIONS, _open_private)
+        except Exception as e:
+            self.bridge.push("error", message=f"HAR export failed: {e}")
+            return
+        logging.log(ALERT, f"exported HAR -> sessions/{name}")
+        self.bridge.push("har", name=name, bytes=size, dir=str(SESSIONS))
+
+    # ------------------------------------------------------------ faults
+
+    def _set_faults(self, specs: list[dict]) -> None:
+        """Rules that break traffic on purpose. See faults.py for why neither
+        Intercept nor the rewrite rules can express this."""
+        try:
+            parsed = faultlib.parse_all(specs)
+        except ValueError as e:
+            # Nothing is armed on a bad rule: a half-applied fault list is worse
+            # than none, because you would be testing against rules you cannot see.
+            self.bridge.push("error", message=str(e))
+            return
+        self.faults = parsed
+        logging.log(ALERT, f"{len(parsed)} fault rule(s) active"
+                           + (f": {'; '.join(f.describe() for f in parsed)}" if parsed else ""))
+        self._push_state()
+
     # ------------------------------------------------------------ repeater
 
     @command.command("interceptor.repeat")
@@ -1095,9 +1247,12 @@ class Interceptor:
         (clears response and error, sets is_replay), so replaying the original
         would blank the row you were comparing against.
         """
+        # These are `@command.command`s: mitmproxy asserts the return value against
+        # the annotation (command.py), so a `-> None` command must return nothing
+        # at all -- `return self._report(...)` would hand it False and blow up.
         flow = self.store.get(fid)
         if not isinstance(flow, http.HTTPFlow):
-            self.bridge.push("error", message="not an HTTP flow")
+            self._report("not an HTTP flow")
             return
         clone = flow.copy()
         clone.metadata["replay_of"] = fid
@@ -1105,12 +1260,12 @@ class Interceptor:
             try:
                 self._apply_edits(clone, "request", raw)
             except (ValueError, UnicodeEncodeError) as e:
-                self.bridge.push("error", message=f"repeat rejected: {e}")
+                self._report(f"repeat rejected: {e}")
                 return
         try:
             ctx.master.commands.call("replay.client", [clone])
         except Exception as e:  # command errors are surfaced, not swallowed
-            self.bridge.push("error", message=f"replay failed: {e}")
+            self._report(f"replay failed: {e}")
 
     # ------------------------------------------------------------ rewrite rules
 
@@ -1211,10 +1366,10 @@ class Interceptor:
         command, we only have to validate and route."""
         flow = self.store.get(fid)
         if not isinstance(flow, http.HTTPFlow) or not flow.websocket:
-            self.bridge.push("error", message="not a WebSocket flow")
+            self._report("not a WebSocket flow")
             return
         if not flow.live:
-            self.bridge.push("error", message="WebSocket already closed — cannot inject")
+            self._report("WebSocket already closed — cannot inject")
             return
         if is_text:
             data = text.encode()
@@ -1222,7 +1377,7 @@ class Interceptor:
             try:
                 data = bytes.fromhex(text.replace(" ", "").replace("\n", ""))
             except ValueError as e:
-                self.bridge.push("error", message=f"invalid hex payload: {e}")
+                self._report(f"invalid hex payload: {e}")
                 return
         ctx.master.commands.call("inject.websocket", flow, to_client, data, is_text)
         logging.info(f"injected {len(data)}B frame -> {'client' if to_client else 'server'}")

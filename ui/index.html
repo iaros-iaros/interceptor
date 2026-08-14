@@ -151,6 +151,28 @@
         <button id="add-header-rule">+ Add a header rule</button>
       </div>
 
+      <!-- Same axis as the rules above — change matching traffic automatically,
+           stop nothing — so it shares this panel and its Apply rather than
+           costing another toolbar button. -->
+      <div class="rule-block">
+        <div class="rule-block-head">
+          <b>Break things on purpose</b>
+          <span class="hint">
+            Make matching requests slow, fail, or die — then use the app and watch how it
+            copes. Affected rows are tagged <span class="tag tag-fault">fault</span> so an
+            injected failure is never mistaken for a real one.
+          </span>
+        </div>
+        <div id="fault-rules" class="rule-list"></div>
+        <button id="add-fault-rule">+ Add a fault rule</button>
+        <p class="hint">
+          First matching rule wins, top to bottom. Requests you have stopped by hand in
+          Intercept are left alone — you are already in control of those. A delay holds a
+          real connection open, and browsers only open about six per host, so a long delay
+          on a busy path will stall that whole host.
+        </p>
+      </div>
+
       <div class="actions">
         <button id="rules-apply" class="primary">Apply</button>
         <button id="rules-raw-toggle" title="See the text these forms generate">Show generated syntax</button>
@@ -160,6 +182,8 @@
           <button data-kind="body" data-where="req" data-url="/api/" data-find='"amount":100' data-repl='"amount":1'>change a value</button>
           <button data-kind="body" data-where="resp" data-url="" data-find='"enabled":false' data-repl='"enabled":true'>flip a reply flag</button>
           <button data-kind="header" data-where="req" data-url="" data-find="Authorization" data-repl="">strip a header</button>
+          <button data-kind="fault" data-url="/api/" data-status="503">fail an endpoint</button>
+          <button data-kind="fault" data-url="/api/" data-delay="8000">make it slow</button>
         </div>
       </div>
       <pre id="rules-raw" hidden></pre>
@@ -197,11 +221,17 @@
       <!-- View-only. Distinct from "Stop flows matching" in the toolbar, which
            halts traffic; this only decides which captured rows are drawn. -->
       <div id="table-tools">
-        <label for="row-filter">Filter rows</label>
+        <label id="row-filter-label" for="row-filter">Filter rows</label>
         <input id="row-filter" spellcheck="false" autocomplete="off"
                title="Hides rows from this table only. Nothing is stopped, and no traffic is changed. Plain text, or a regular expression if it is one."
                placeholder="text or regex, e.g. /api/ or \.(png|jpg) — hides rows only">
         <button id="row-filter-clear" class="icon" title="Clear the filter" hidden>✕</button>
+        <!-- Same box, two jobs. Off it hides rows already on screen; on it asks
+             the server to search every stored URL, header and body, which is a
+             different question and a different cost — hence a switch, not silent
+             behaviour. One small button beats a second input. -->
+        <button id="search-bodies" class="toggle"
+                title="Search inside every captured URL, header and body — not just what the table shows. Answers “which response contained this token”. Press Enter to run it.">in bodies</button>
         <span id="row-filter-count" class="dim"></span>
       </div>
       <div id="table-wrap">

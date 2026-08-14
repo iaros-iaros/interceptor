@@ -19,15 +19,25 @@ interceptor          # proxy on :8080, UI opens on :9000
 - **Captures everything** the proxy sees — HTTP/1.1, HTTP/2, WebSocket frames — with
   HTTP and WebSocket split into their own tabs, and a **Hosts** list to narrow the
   capture to the app under test when a page's CDNs are drowning it.
-- **Pauses** any flow matching a scope filter, and holds it until you decide.
+- **Pauses** any flow matching a scope filter, and holds it until you decide — with
+  **Forward + stop reply** to catch a single response without stopping every flow twice.
 - **Full edit** of a held request or response: request line, status line, every header,
   and the body — as raw text, the way Burp does it, with JSON indented for reading and
   a `Raw` toggle back to the exact bytes.
+- **Reads any body**: JSON, form-encoded, multipart, XML, protobuf, gRPC, msgpack,
+  GraphQL and a dozen more render as structured text instead of a wall of bytes.
 - **WebSocket frames** can be edited, dropped, or **injected** in either direction on a
   live connection.
-- **Repeater**: resend any captured HTTP request, edited if you like.
+- **Repeater**: resend any captured HTTP request, edited if you like, with a tab per
+  request you are iterating on and every send listed so you can compare them.
 - **Rewrite rules**: automatic body and header rewrites that fire without pausing
   anything — for the changes you want on every request.
+- **Fault rules**: make matching requests slow, fail, or die on purpose, then use the app
+  and watch how it copes. Nothing stops; affected rows are tagged.
+- **Search inside bodies**: find a token, a stack trace or a stray header anywhere in the
+  capture, not just in what the table happens to show.
+- **Gets things out**: copy any request as a runnable `curl` command, or export the whole
+  capture as HAR for devtools and everyone else's tooling.
 - **Sessions**: save the current capture to a file and reopen it later. Explicit only.
   The working store is a 0600 temp database, wiped on exit — see Storage.
 - **Isolated Chrome** launcher: one click gives a throwaway profile wired to the proxy,
@@ -193,8 +203,13 @@ field).
 **Second toolbar row**: the filter field, then *Options* (*Stop replies*, off by
 default — see below; *Hide noise*), *Tools* (*Rules*, *Hosts*, *Launch Chrome*) and *Session*
 (*Save*, *Open*, *Clear*). The top right carries a live count of stored flows, bytes,
-evictions, hidden noise and any active host list, the bridge connection badge, and the
-light/dark toggle.
+evictions, hidden noise, active rewrite and fault rules and any active host list, the
+bridge connection badge, and the light/dark toggle.
+
+The toolbar deliberately has no button for repeat, export, copy-as-curl or the reply hold.
+Anything that acts on **one flow** lives in the row's right-click menu, and anything that
+acts on **all matching traffic** lives in the *Rules* panel — so those two grew instead of
+this row, which was already four labelled groups wide.
 
 Only one panel is open at a time — *Rules*, *Hosts* and *Open session* replace each
 other rather than stacking above the workspace.
@@ -224,6 +239,22 @@ table. It is **not** the `~q ~u` filter syntax: this is the box to reach for whe
 just want to find something in the list, and *Stop flows matching* in the toolbar is a
 different thing entirely.
 
+**in bodies** — the toggle beside that box — turns it into a search of the whole stored
+capture rather than of the rows on screen. It looks inside every URL, every header and
+every body the engine still holds, which is the question the row filter structurally
+could not answer: *which response carried this token?* Headers are included deliberately —
+"what still sends an `Authorization` header" and "which reply set this cookie" are the
+same kind of hunt.
+
+- **Press Enter, or click away, to run it.** It is a scan of the entire store, so it does
+  not fire per keystroke.
+- Results replace the table and are counted (`3 matches in the store`), including flows
+  far older than the 500 rows the table renders. Toggle it off to go back to hiding rows.
+- **Streamed bodies are never buffered**, so they are not searchable — the same limit that
+  makes them uneditable.
+- Text is matched literally, `%` and `_` included. This box is a substring search, not a
+  regex; the row filter is the one that takes a regex.
+
 **Flow table** streams in as traffic arrives, batched on a 50ms tick — a single page
 load is easily 300–500 flows. Only the newest 500 rows are rendered, with a line under the
 table counting the rest, and the tab drops flows past 2000 to keep a long session from
@@ -243,7 +274,30 @@ just those requests. **Forward all** and **Drop all** are the panic buttons. The
 height-capped and scrolls, so a deep queue can never push the flow table and the editor
 off the screen, and **Hide list** collapses it to just the counts and those two buttons.
 
-### Three ways to change traffic
+### The row menu
+
+**Right-click any row.** Everything that acts on a single flow lives there, which is why
+the toolbar has not grown a button for any of it:
+
+| Item | What it does |
+|---|---|
+| **Repeat this request** | Opens it in the Repeater — a copy, never the original |
+| **Copy as curl** | A runnable command, straight to the clipboard |
+| **Copy as raw request** | The request as raw text |
+| **Copy URL** | Just the URL |
+| **Capture only this host** | Replaces the Hosts list with this one host |
+| **Export everything as HAR…** | Writes the whole capture to `sessions/<timestamp>.har` |
+
+**Copy as curl** is the handoff: a captured request becomes something a developer can run,
+without retyping it. **HAR** is the same handoff for the whole session — devtools, most
+performance tooling and most other proxies read it, so a capture outlives this tool.
+
+A HAR is written to a file rather than downloaded, and for the same reason a session dump
+is: it is full request and response bodies in plaintext, and the UI's static-file route
+carries no token. It lands in `sessions/` at mode `0600`, alongside saved sessions, and
+the UI tells you the path. **Treat it like a credentials file.**
+
+### Four ways to change traffic
 
 Easy to conflate, so: they are not interchangeable.
 
@@ -251,6 +305,7 @@ Easy to conflate, so: they are not interchangeable.
 |---|---|---|---|
 | **Intercept** + edit | Anything: method, URL, status, headers, body | One flow, by hand | Yes — the client waits for your version |
 | **Rewrite rules** | Body text, headers | Every matching flow, automatic | Yes |
+| **Fault rules** | Timing, status, the connection itself | Every matching flow, automatic | Yes |
 | **Repeat** | A copy of a request | One flow, by hand | No — the reply lands in a new row |
 
 Selecting a finished row shows **Request** and **Response** read-only: those bytes were
@@ -258,6 +313,38 @@ delivered already, so there is nothing left to change. **Repeat** is the tab tha
 you an editor, and it says so — *edits apply to the copy, not the original*. Use it to
 probe the server (change a field, resend, compare `replay · status 200 → 403`); use
 Intercept or a rule to change what the app itself receives.
+
+### Reading a body
+
+Bodies are rendered through mitmproxy's own content views, so what you get is structured
+text rather than bytes: JSON, form-encoded, multipart, XML and HTML, protobuf, gRPC,
+msgpack, GraphQL, Socket.IO, MQTT, zip listings, images and more. The section header names
+the one that was used —
+
+```
+body · 412B · shown as protobuf
+```
+
+— and stays silent for plain text, where there is nothing to add.
+
+**This is display only, and that distinction matters.** The editor, the Repeater and the
+raw view all still hold the exact bytes off the wire. A protobuf rendering cannot be
+turned back into bytes, so it is never what gets forwarded, and every guarantee in
+*Editing a held flow* below is unaffected by it.
+
+### The Repeater
+
+**Repeat** resends a copy of a captured request. Reach it from the detail tabs or from
+the row menu.
+
+- **A tab per request.** Open a second request in the Repeater and a strip appears above
+  the editor; switch between them and each keeps its own draft. Closing a tab discards its
+  draft, and eight is the cap — beyond that it stops being readable.
+- **Every send is listed** under the editor with its status, size and time, so iterating
+  is a list you can compare rather than one result the next send overwrites. Click any
+  send to open it in Request/Response.
+- Edits apply to the copy. The original row keeps its own response, so the comparison you
+  are making stays intact.
 
 ### Editing a held flow
 
@@ -300,6 +387,17 @@ matching flow stops twice — once out, once in. That reads as the tool being br
 were not expecting it, which is why it is off, as it is in Burp. The option is
 `intercept_responses`.
 
+**To catch one reply, use the button instead of the toggle.** A held request has a third
+action, **Forward + stop reply**: the request goes on its way and only *that* reply comes
+back to you. The global toggle stays off, nothing else stops twice, and the arm is
+one-shot — it is spent on the reply it was set for and does not carry to the next request.
+This is the version worth reaching for, because "hold the reply to *this*" is almost
+always the actual intent; the toggle exists for when you genuinely want every reply.
+
+It only offers itself on a held request, and deliberately not from the row menu: holding a
+reply works by way of the flow already matching the stop filter, so an entry on an
+arbitrary row would do nothing on most of them.
+
 ### Rewrite rules
 
 For changes you want applied automatically to every matching flow, with nothing stopping.
@@ -337,6 +435,66 @@ fire" checklist.
 The same content is a standalone page at [ui/rules.html](ui/rules.html) — both render
 [ui/rules-doc.js](ui/rules-doc.js), so they cannot disagree.
 
+### Fault rules — break things on purpose
+
+The third block in the **Rules** panel. Make matching requests slow, fail, or die, then
+use the app normally and watch how it copes.
+
+```
+when URL has [/api/checkout]   delay [5000] ms   reply [503]   ○ drop connection
+```
+
+Add rows with **+ Add a fault rule**, press **Apply** — the same Apply as the rewrite
+rules above, since they are the same kind of thing: change matching traffic automatically,
+stop nothing.
+
+**What it is for.** *Does the app show an error or spin forever when checkout fails? Does
+it time out cleanly, or does the user press the button five more times and create five
+orders? Does token refresh actually fire on a 401? Does the retry logic exist?* Every one
+of those is an ordinary test case, and none of them could be produced on demand before.
+
+**Why the other two paths could not do it.** Intercept *can* type a 500 into a held
+reply, but it catches one flow at a time by hand, and cannot produce a timeout at all —
+you would be the stopwatch while the held flow stalls that host's other connections. And
+it is not repeatable: "I did it with my mouse last sprint" is not a test you can run
+again. Rewrite rules run automatically, which is the right shape, but
+`modify_body`/`modify_headers` only substitute text inside a body or a header — no status
+code, no delay, no dropped connection. One path is unrepeatable, the other structurally
+cannot express failure.
+
+**A faulted flow is never quiet.** It carries a red `fault` tag and a red edge in the
+table, the detail pane says *"Interceptor produced this on purpose"* and names the rule,
+the toolbar counts active rules, and the line under the mode buttons spells out that
+traffic is being broken. An injected 503 is indistinguishable from a real one, and an
+unlabelled one is a morning lost to debugging your own rule — so this is the part of the
+feature that is not optional.
+
+Rules worth knowing:
+
+- **First match wins**, top to bottom. Two rules never compound into a delay nobody
+  predicted.
+- **A request you stopped by hand is skipped.** With it held in front of you, you are
+  already the fault injector — and a hook returns before the flow reaches the queue, so a
+  delay would land *before* the row appeared rather than after.
+- **Replays are skipped.** Repeating a request to compare it against the original is not
+  the moment to have it broken underneath you.
+- **A rule that would do nothing is refused**, as is one asking to both drop the
+  connection and send a reply. One bad row rejects the whole list rather than arming part
+  of it, so what you see applied is what is applied.
+- **Delay is capped at two minutes**, which is past every client timeout worth testing,
+  and holds a real connection open for its duration.
+- **A delay suspends only its own flow.** Measured: three 250ms faults running together
+  take 252ms, not 750ms. It never blocks the proxy.
+- **Browsers open ~6 connections per host**, so a long delay on a busy path stalls that
+  whole host, not only the requests you targeted — the same arithmetic as the hold queue.
+
+`drop connection` kills the connection instead of answering, so the client sees a network
+error rather than an HTTP status. A synthesized reply is JSON with an
+`x-interceptor-fault: 1` header, so an automated client can tell too.
+
+Deliberately not built: truncated bodies and probabilistic firing. Both are real, neither
+has been asked for, and each costs a column in a row that currently reads as a sentence.
+
 ### Sessions
 
 **Save session** writes every flow the engine still has stored — which can be more than
@@ -352,6 +510,11 @@ default.
 Files are created `0600` and the folder `0700` — from the first byte, not after the
 write finishes. Both `sessions/` and `*.mitm` are gitignored. **Treat a
 saved session like a credentials file.**
+
+**HAR export** (row menu → *Export everything as HAR…*) writes to the same folder with the
+same permissions, and carries the same warning. The difference is who reads it: a `.mitm`
+file is for reopening here, a `.har` is for handing to devtools, a colleague, or another
+tool entirely.
 
 ### Storage
 
@@ -383,9 +546,22 @@ into a saved session; they simply aren't re-listed in the table after a reload.
 The cost is about **15% of peak store throughput** (1330 → 1132 flows/second on the same
 loopback workload), because each finalised flow is serialised and written once. That
 ceiling sits roughly 6× above the ~170 new HTTPS connections/second that TLS termination
-itself allows, so it is not the binding constraint on anything you will actually do. It
-could be recovered by moving serialisation to a worker thread; that has not been done,
-because it would trade a measured non-problem for concurrent access to flow objects.
+itself allows, so it is not the binding constraint on anything you will actually do.
+
+**Serialisation happens on the flush tick, not in the hook.** `get_state()` deep-copies a
+whole flow, bodies included, and extracting its searchable text decodes both bodies again
+— doing either per flow inside the `response` hook would put that work on the same event
+loop that is terminating TLS. `_pending` therefore holds the flow itself and the row is
+built once per 100ms batch instead. A worker thread would buy little on top of that and
+would trade a measured non-problem for concurrent access to flow objects.
+
+Each stored flow also keeps up to **256KB of searchable text** — its URL, headers and both
+bodies — which is what **in bodies** searches. That duplicates part of what the serialised
+blob already holds, and it is a deliberate disk-for-answers trade: the store held every
+body from the start and nothing could query them. The search is a `LIKE` scan with no
+index, because `LIKE '%x%'` cannot use one and a tokenising index would break the
+substring matches that make it useful for hunting a token. At a few thousand rows that
+scan is milliseconds.
 
 Loaded flows can be edited and re-sent through the Repeater, so yesterday's request can
 be replayed today.
@@ -533,7 +709,7 @@ Also:
 
 ```bash
 .venv/bin/python spike/spike.py --chrome --net    # browser + network reality   4/4
-.venv/bin/python spike/check.py                   # units + end-to-end        60/60
+.venv/bin/python spike/check.py                   # units + end-to-end        68/68
 ```
 
 Both are safe to run while a real instance is up — separate ports (`18xxx`/`19000`), their
@@ -564,15 +740,25 @@ full-restart round trip, file modes at creation time under a permissive umask, a
 loopback guard — every entry path including `--mode` specs, without ever opening a public
 socket to prove it.
 
+Also: **fault rules** (malformed rules refused, one bad row rejecting the whole list, a
+synthesized reply answering the request while a non-matching URL is left untouched, first
+match winning, and a timing assertion that three concurrent 250ms delays finish in ~250ms
+rather than ~750ms — i.e. that the delay is awaited rather than blocking the loop);
+**body search** across bodies, headers and URLs, including a literal `%` not matching
+everything; **content views** producing a rendering *beside* the exact bytes with `body`
+and `raw` untouched; **copy as curl** producing a command carrying method, URL, header and
+body; and the **one-shot reply hold** arming, holding exactly one reply, and disarming.
+
 Three units also run shipped frontend functions under `node`: the rule form's compose/parse
-pair (every spec it generates is fed to mitmproxy's real `parse_modify_spec`), the row
-filter (text, regex, case-insensitivity, invalid-regex fallback), and the editor's
-pretty-printer (headers byte-identical, non-JSON and CRLF bodies untouched, and a blank
+pair from `ui/rules.js` (every spec it generates is fed to mitmproxy's real
+`parse_modify_spec`), the row filter from `ui/table.js` (text, regex, case-insensitivity,
+invalid-regex fallback), and the editor's pretty-printer from `ui/util.js` and
+`ui/detail.js` (headers byte-identical, non-JSON and CRLF bodies untouched, and a blank
 line inside a body never mistaken for the header separator).
 
 **Not covered:** anything needing a DOM — `index.html`, `style.css` and every rendering
-path in `app.js`; `node --check` is syntax-only. Also the `error`-hook queue cleanup, the
-noise counter, `launch_chrome`'s flags, and concurrent held flows.
+path across the `ui/` modules; `node --check` is syntax-only. Also the `error`-hook queue
+cleanup, the noise counter, `launch_chrome`'s flags, and concurrent held flows.
 
 Neither suite talks to the internet through a real browser, and that gap has cost real
 bugs: a WebSocket handshake showing under HTTP until it upgraded, and Chrome's own cache
@@ -587,15 +773,26 @@ addon/
   interceptor.py   # hooks, mode switch, host list, pause queue, sessions, launcher
   store.py         # flows in SQLite; live and held ones held in RAM by identity
   bridge.py        # WebSocket + static files on one port, token + Origin gates
+  faults.py        # delay / fail / drop rules, and why neither other path can do it
+  views.py         # body rendering via mitmproxy's content views — display only
+  exporters.py     # curl / httpie / raw and HAR, plus their file permissions
 ui/
   index.html
-  app.js           # vanilla ES modules, no bundler
+  app.js           # toolbar, panels, splitter, wiring, the top-level render
+  bus.js           # "draw again" — what keeps the modules below acyclic
+  state.js         # every piece of mutable UI state, in one place
+  transport.js     # the bridge socket and message handling
+  table.js         # flow table, row filter, body search
+  detail.js        # detail pane, held-flow editor, frames, repeater
+  rules.js         # rewrite-rule and fault-rule forms
+  menu.js          # the row context menu
+  util.js          # DOM and formatting helpers
   style.css        # every colour a CSS custom property, defined for both themes
   theme.js         # light/dark, shared by app and docs
   rules-doc.js     # rule reference — one source for the modal and the page
   rules.html       # renders rules-doc.js standalone
   icon.png         # app icon and favicon
-sessions/          # created on first save; gitignored, dir 0700, files 0600
+sessions/          # created on first save or HAR export; gitignored, dir 0700, files 0600
 spike/
   spike.py         # browser/network assumptions + the shared test harness
   check.py         # units + end-to-end
@@ -646,7 +843,18 @@ press *Launch Chrome* and hit the 502. It never adopts that proxy on its own: si
 worse than a clear error. The proxy log names the real cause — look for
 `Server TLS handshake failed` next to the host.
 
-**Every flow stops twice.** *Stop replies* is on. Turn it off, or expect one stop each way.
+**Every flow stops twice.** *Stop replies* is on. Turn it off, and use **Forward + stop
+reply** on a held request when you want one particular reply.
+
+**A request failed, or was slow, and the server is fine.** Check for a fault rule you left
+armed: the toolbar shows `1 fault active`, the line under the mode buttons says traffic is
+being broken on purpose, and the row carries a red `fault` tag. Open **Rules** and remove
+it. This is exactly the confusion the tagging exists to prevent, so if a failure is *not*
+tagged, it is real.
+
+**A body shows as `shown as raw`, or not structured at all.** Nothing recognised it, which
+is normal for plain text and for formats without a view. It changes nothing about editing:
+the exact bytes are always what the editor and the Repeater hold.
 
 **A body won't edit.** It's over 5MB and streamed, or its bytes contradict the encoding it
 declares (`application/json` holding binary, a wrong `charset=`, corrupt gzip). Binary
