@@ -1,4 +1,4 @@
-<img width="1668" height="998" alt="ui" src="https://github.com/user-attachments/assets/d6af6bc9-e60d-4e32-835c-59639ccc3c1b" />
+<img width="1667" height="996" alt="ui" src="https://github.com/user-attachments/assets/772a8bf7-8ee2-478a-ad7e-989595bb623a" />
 
 # Interceptor
 
