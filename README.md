@@ -28,8 +28,9 @@ interceptor          # proxy on :8080, UI opens on :9000
   GraphQL and a dozen more render as structured text instead of a wall of bytes.
 - **WebSocket frames** can be edited, dropped, or **injected** in either direction on a
   live connection.
-- **Repeater**: resend any captured HTTP request, edited if you like, with a tab per
-  request you are iterating on and every send listed so you can compare them.
+- **Repeater**: resend any captured HTTP request, edited if you like — once, or N times
+  with a delay between them — with a tab per request you are iterating on and every send
+  listed so you can compare them.
 - **Rewrite rules**: automatic body and header rewrites that fire without pausing
   anything — for the changes you want on every request.
 - **Fault rules**: make matching requests slow, fail, or die on purpose, then use the app
@@ -345,6 +346,42 @@ the row menu.
   send to open it in Request/Response.
 - Edits apply to the copy. The original row keeps its own response, so the comparison you
   are making stays intact.
+
+**Repeating it N times.** The action row reads as a sentence:
+
+```
+[Send]  ×  [10]  delay  [250]  ms     [Reset]
+```
+
+Leave the count at `1` and it behaves exactly as it always did — one send, nothing else
+changes. Above that it repeats.
+
+**Sends never overlap.** Each one waits for its own reply, *then* waits the delay, then the
+next goes out. That is what makes it a repeat with a delay rather than a fixed-rate burst:
+firing on a timer without waiting lets sends pile up whenever the server is slower than the
+delay, which puts the send list out of order and quietly turns "10 requests, 250ms apart"
+into load. A delay of `0` therefore means back-to-back, one at a time — not all at once.
+
+- **Send turns into Stop** for the duration. The counter beside it tracks both halves of
+  each step — `3 / 10 · waiting for reply`, then `3 / 10 done` — so a slow endpoint looks
+  slow rather than looking stuck.
+- **Stop takes effect between sends**, not mid-flight: a request already on the wire runs
+  to completion. You get `4 of 10 sent — stopped` rather than a silent halt.
+- **The run survives switching tabs.** Move to another flow and back and the Stop button
+  and counter are still there; it is a real run, not a property of the view.
+- **One run at a time.** Two runs interleaving into the same send list would make that
+  list unreadable, which is the thing it exists to prevent.
+- **A reply that never comes stops the run** after 60 seconds, saying which send stalled,
+  rather than hanging on Stop forever.
+- **If the bridge drops mid-run it stops and says so**, rather than counting sends that
+  never left the browser.
+- Count is capped at **1000** and the delay at **60,000ms**, both far above any hand-driven
+  use. These are foot-gun guards, not policy: a mistyped `1000` in a field meant for `10`
+  is a thousand real requests at a real service.
+
+One caveat that is the browser's and not this tool's: a **backgrounded tab** has its timers
+clamped to roughly one second, so a run left in a hidden tab paces itself at about 1s per
+step regardless of the delay you set. Keep the tab visible if the interval matters.
 
 ### Editing a held flow
 
@@ -709,7 +746,7 @@ Also:
 
 ```bash
 .venv/bin/python spike/spike.py --chrome --net    # browser + network reality   4/4
-.venv/bin/python spike/check.py                   # units + end-to-end        68/68
+.venv/bin/python spike/check.py                   # units + end-to-end        69/69
 ```
 
 Both are safe to run while a real instance is up — separate ports (`18xxx`/`19000`), their
@@ -749,12 +786,14 @@ everything; **content views** producing a rendering *beside* the exact bytes wit
 and `raw` untouched; **copy as curl** producing a command carrying method, URL, header and
 body; and the **one-shot reply hold** arming, holding exactly one reply, and disarming.
 
-Three units also run shipped frontend functions under `node`: the rule form's compose/parse
+Four units also run shipped frontend functions under `node`: the rule form's compose/parse
 pair from `ui/rules.js` (every spec it generates is fed to mitmproxy's real
 `parse_modify_spec`), the row filter from `ui/table.js` (text, regex, case-insensitivity,
-invalid-regex fallback), and the editor's pretty-printer from `ui/util.js` and
-`ui/detail.js` (headers byte-identical, non-JSON and CRLF bodies untouched, and a blank
-line inside a body never mistaken for the header separator).
+invalid-regex fallback), the editor's pretty-printer from `ui/util.js` and `ui/detail.js`
+(headers byte-identical, non-JSON and CRLF bodies untouched, and a blank line inside a
+body never mistaken for the header separator), and the repeater's burst clamp from
+`ui/detail.js` (negatives, blanks, junk and absurd numbers all landing somewhere sane, and
+a count that can never clamp to zero — a Send that sends nothing reads as broken).
 
 **Not covered:** anything needing a DOM — `index.html`, `style.css` and every rendering
 path across the `ui/` modules; `node --check` is syntax-only. Also the `error`-hook queue

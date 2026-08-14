@@ -19,6 +19,13 @@ export function send(msg) {
   if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
 }
 
+// `send` drops silently when the bridge is down, which is right for a stray click
+// and wrong for a loop: a repeat run would otherwise report "50 sent" having put
+// nothing on the wire.
+export function isOpen() {
+  return !!ws && ws.readyState === WebSocket.OPEN;
+}
+
 export function connect() {
   if (!token) {
     setConn(false, "no token");

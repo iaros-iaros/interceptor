@@ -43,6 +43,11 @@ export const ui = {
   searchQuery: "",
   // Flow ids open in the repeater strip, most recent last.
   repeatTabs: [],
+  // Repeater burst settings. Global rather than per-flow: sending the same
+  // request ten times is a habit you carry from one request to the next, so
+  // retyping the numbers per tab would be the annoying half of the feature.
+  repeatCount: 1,
+  repeatDelay: 0,
   // Pretty-print JSON bodies in the held-flow editor. Sticky, because it is a
   // reading preference, not a per-flow decision.
   prettyBody: localStorage.getItem("ic.prettyBody") !== "0",

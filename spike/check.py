@@ -1786,6 +1786,61 @@ is_self "http://127.0.0.1:7897" && printf 'self' || printf 'notself'
           got == "self self notself", f"got {got!r} (want 'self self notself')")
 
 
+def units_repeat_burst() -> None:
+    """The repeater can fire N sends with a gap between them. The only logic in
+    that is the clamping, and it guards real requests hitting a real service --
+    a typo in a number field must not become a thousand-fold one."""
+    import json as _json
+
+    harness = r"""
+      import { readFileSync } from "node:fs";
+      const src = readFileSync("ui/detail.js", "utf8");
+      const grab = (name) => {
+        const i = src.indexOf(`function ${name}(`);
+        if (i < 0) throw new Error(`missing ${name}`);
+        let depth = 0, j = src.indexOf("{", i);
+        for (let k = j; k < src.length; k++) {
+          if (src[k] === "{") depth++;
+          else if (src[k] === "}" && --depth === 0) return src.slice(i, k + 1);
+        }
+        throw new Error(`unbalanced ${name}`);
+      };
+      const caps = src.match(/export const MAX_REPEAT_SENDS = [\s\S]*?;/)[0]
+                 + src.match(/export const MAX_REPEAT_DELAY = [\s\S]*?;/)[0];
+      const code = caps.replace(/export /g, "") + grab("clampRepeat");
+      const fns = new Function(code + "; return {clampRepeat, MAX_REPEAT_SENDS, MAX_REPEAT_DELAY};")();
+      const out = JSON.parse(process.env.CASES).map(([c, d]) => fns.clampRepeat(c, d));
+      console.log(JSON.stringify({out, caps: [fns.MAX_REPEAT_SENDS, fns.MAX_REPEAT_DELAY]}));
+    """
+
+    # [count, delay] -> expected [count, delay, capped?]
+    cases = [[1, 0], [10, 250], [0, 0], [-5, -5], [1e9, 1e9],
+             ["", ""], ["abc", "abc"], [2.7, 100.9]]
+    want = [(1, 0, False), (10, 250, False), (1, 0, False), (1, 0, False),
+            (1000, 60000, True), (1, 0, False), (1, 0, False), (2, 100, False)]
+
+    out = subprocess.run(["node", "--input-type=module", "-e", harness],
+                         cwd=ROOT, capture_output=True, text=True, timeout=60,
+                         env={**os.environ, "CASES": _json.dumps(cases)})
+    if out.returncode != 0:
+        return check("the repeater's burst count and delay are clamped", False,
+                     f"node failed: {out.stderr.strip()[:200]}")
+    got = _json.loads(out.stdout)
+
+    notes = []
+    for (c, d), g, (wc, wd, wcap) in zip(cases, got["out"], want):
+        if g["count"] != wc or g["delay"] != wd:
+            notes.append(f"({c},{d}) -> ({g['count']},{g['delay']}) want ({wc},{wd})")
+        elif bool(g["notes"]) is not wcap:
+            notes.append(f"({c},{d}) capped-note={bool(g['notes'])}, want {wcap}")
+    # A count below 1 must never become 0: a Send that sends nothing reads as broken.
+    if any(g["count"] < 1 for g in got["out"]):
+        notes.append("a clamped count reached 0")
+    check("the repeater's burst count and delay are clamped", not notes,
+          "; ".join(notes) or
+          f"8 inputs clamped correctly; caps {got['caps'][0]} sends / {got['caps'][1]}ms")
+
+
 async def units_faults() -> None:
     """Fault rules: validation, first-match-wins, and the three effects.
 
@@ -2053,6 +2108,7 @@ async def main() -> int:
     units_flow_store()
     units_host_uniform()
     units_host_scope()
+    units_repeat_burst()
     await units_faults()
     units_search()
     units_contentview()

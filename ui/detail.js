@@ -6,7 +6,7 @@ import {
   closeRepeatTab, details, drafts, frames, framesLoaded, getFlow,
   held, openRepeatTab, sendHistory, ui,
 } from "./state.js";
-import { select, send } from "./transport.js";
+import { isOpen, select, send } from "./transport.js";
 import { refresh } from "./bus.js";
 
 export function renderDetail() {
@@ -300,6 +300,12 @@ function renderRepeat(box, f) {
   const d = details.get(`${f.id}:request`);
   if (d === undefined) {
     send({ type: "body.get", id: f.id, which: "request" });
+    // Clear the cache key, or this "Loading…" is permanent: renderDetail sets the
+    // key before calling us, so the next tick would match it, short-circuit, and
+    // never rebuild once the body actually arrives. Normally masked because
+    // select() prefetches the body — visible when Repeat is opened fast, or when
+    // the bridge is slow.
+    box.dataset.key = "";
     return box.append(el("p", "hint", "Loading…"));
   }
   if (!d || d.raw == null) {
@@ -313,18 +319,173 @@ function renderRepeat(box, f) {
     el("p", "section", "resend this request — edits apply to the copy, not the original"),
     ta,
   );
+
   const actions = el("div", "actions");
+  const sendBtn = btn("Send", null, "primary");
+  const countIn = numField(ui.repeatCount, "1", 62,
+    "How many times to send it. 1 is a single send.");
+  const delayIn = numField(ui.repeatDelay, "0", 76,
+    "How long to wait after each reply before sending the next. Sends never overlap: "
+    + "each one waits for its own reply first, so 0 means back-to-back, not all at once.");
+  const progress = el("span", "hint repeat-progress");
+
+  sendBtn.onclick = () => {
+    if (running && running.id === f.id) return stopRepeat();
+    ui.repeatCount = Number(countIn.value) || 1;
+    ui.repeatDelay = Number(delayIn.value) || 0;
+    runRepeat(f, ta.value, sendBtn, progress);
+  };
+
   actions.append(
-    btn("Send", () => send({ type: "replay", id: f.id, raw: ta.value }), "primary"),
+    sendBtn,
+    el("span", "rule-label", "×"), countIn,
+    el("span", "rule-label", "delay"), delayIn,
+    el("span", "rule-label", "ms"),
     btn("Reset", () => {
       drafts.delete(key);
       box.dataset.key = "";
       refresh();
     }),
+    progress,
   );
   box.append(actions);
-  box.append(el("p", "section", "sends"), el("div", "sends"));
+  // A run started here survives switching to another flow and back, so the view
+  // has to be able to rejoin one in progress rather than offering to start a second.
+  if (running && running.id === f.id) markRunning(sendBtn, progress);
+  // `.section` is margin-free at the top by design, so under the action row it sat
+  // flush against the Send button and read as a caption for it.
+  box.append(el("p", "section sends-head", "sends"), el("div", "sends"));
   refreshRepeatHistory(box, f);
+}
+
+function numField(value, placeholder, width, title) {
+  const inp = document.createElement("input");
+  inp.className = "rule-input rule-num";
+  inp.type = "number";
+  inp.min = "0";
+  inp.placeholder = placeholder;
+  inp.value = String(value ?? "");
+  inp.style.width = `${width}px`;
+  if (title) inp.title = title;
+  return inp;
+}
+
+// Caps, not policy: this fires real requests at a real service, and a typo in a
+// number field should not become a thousand-fold one. Both are far above any
+// hand-driven use.
+export const MAX_REPEAT_SENDS = 1000;
+export const MAX_REPEAT_DELAY = 60_000;
+
+// Pure, so it can be checked without a DOM -- the clamping is the only part of
+// this feature with logic in it.
+export function clampRepeat(count, delay) {
+  const notes = [];
+  let n = Math.floor(Number(count));
+  let ms = Math.floor(Number(delay));
+  if (!Number.isFinite(n) || n < 1) n = 1;
+  if (!Number.isFinite(ms) || ms < 0) ms = 0;
+  if (n > MAX_REPEAT_SENDS) {
+    n = MAX_REPEAT_SENDS;
+    notes.push(`count capped at ${MAX_REPEAT_SENDS}`);
+  }
+  if (ms > MAX_REPEAT_DELAY) {
+    ms = MAX_REPEAT_DELAY;
+    notes.push(`delay capped at ${MAX_REPEAT_DELAY}ms`);
+  }
+  return { count: n, delay: ms, notes };
+}
+
+// One run at a time. Two bursts interleaving into the same send list would make
+// the history unreadable, which is the thing the history exists to prevent.
+let running = null;   // {id, stop}
+
+function markRunning(sendBtn, progress) {
+  sendBtn.textContent = "Stop";
+  sendBtn.classList.remove("primary");
+  sendBtn.classList.add("danger");
+  if (running) progress.textContent = `${running.sent} / ${running.total} sent`;
+}
+
+function stopRepeat() {
+  if (running) running.stop = true;
+}
+
+async function runRepeat(f, raw, sendBtn, progress) {
+  if (running) return note("A repeat run is already going — stop it first.");
+  const { count, delay, notes } = clampRepeat(ui.repeatCount, ui.repeatDelay);
+  if (notes.length) note(notes.join("; "));
+
+  // A single send keeps the old behaviour exactly: fire and forget, no Stop
+  // button appearing and vanishing for something that is already over.
+  if (count === 1) return send({ type: "replay", id: f.id, raw });
+
+  running = { id: f.id, stop: false, sent: 0, total: count };
+  markRunning(sendBtn, progress);
+  let failure = "";
+  try {
+    for (let i = 0; i < count; i++) {
+      if (running.stop) break;
+      if (!isOpen()) {
+        failure = "the bridge disconnected";
+        break;
+      }
+      // Count the sends already on record, so the wait below can tell *this*
+      // reply from one that was already there.
+      const before = sendHistory(f.id).length;
+      send({ type: "replay", id: f.id, raw });
+      running.sent = i + 1;
+      progress.textContent = `${running.sent} / ${count} · waiting for reply`;
+
+      // Sequential, deliberately: this is a repeat with a delay, not a fixed-rate
+      // burst. Firing on a timer without waiting lets sends overlap whenever the
+      // server is slower than the delay, which makes the send list arrive out of
+      // order and quietly turns "10 requests, 250ms apart" into load.
+      if (!(await waitForReply(f.id, before))) {
+        failure = running.stop ? "" : `send ${i + 1} got no reply within 60s`;
+        break;
+      }
+      if (running.stop) break;
+      progress.textContent = `${running.sent} / ${count} done`;
+      // Skipped after the last one: a trailing wait leaves the button saying Stop
+      // for a run that has already finished.
+      if (delay && i < count - 1) await sleep(delay);
+    }
+    const stopped = running.stop || running.sent < count || failure;
+    const why = failure ? ` — ${failure}` : running.stop ? " — stopped" : "";
+    note(`${running.sent} of ${count} sent${why}`, !stopped);
+  } finally {
+    running = null;
+    sendBtn.textContent = "Send";
+    sendBtn.classList.remove("danger");
+    sendBtn.classList.add("primary");
+    progress.textContent = "";
+  }
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// A replay's reply is not acknowledged over the bridge -- it simply arrives as a
+// new flow tagged `replay_of`. So the wait watches the send list this view is
+// already reading, rather than inventing a protocol for it.
+//
+// Generous timeout: an endpoint under test is allowed to be slow, and this is the
+// difference between "your server is taking a while" and a run that gave up.
+const REPLY_TIMEOUT_MS = 60_000;
+
+async function waitForReply(id, before) {
+  const deadline = Date.now() + REPLY_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    if (!running || running.stop) return false;   // Stop must not wait out the timeout
+    const sends = sendHistory(id);
+    if (sends.length > before) {
+      const last = sends[sends.length - 1];
+      // A killed flow counts as finished: an error is an answer, and waiting for a
+      // status that is never coming would stall the run for a full minute.
+      if (last.status != null || last.killed) return true;
+    }
+    await sleep(50);
+  }
+  return false;
 }
 
 // A strip of the requests you are iterating on. Without it the repeater held one

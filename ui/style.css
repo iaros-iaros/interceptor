@@ -90,6 +90,53 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
+/* ------------------------------------------------------------- scrollbars */
+
+/* The default chrome is a wide light-grey slab that reads as part of the page in
+   dark mode and fights the accent everywhere. Thin, themed, and quiet until you
+   reach for it.
+
+   Not hidden. `scrollbar-width: none` would take the position cue with it -- in a
+   table that streams 300-500 rows a page load, the thumb is the only thing saying
+   how much is above and below you -- and it removes the drag target for anyone
+   not using a wheel or a trackpad.
+
+   Two traps here, both verified in the browser rather than assumed:
+
+   1. `scrollbar-color` is inherited but **`scrollbar-width` is not**, so setting
+      both on `:root` themed the thumb and left the width at `auto` -- measured, the
+      table pane still reserved 15px. Hence the universal selector.
+   2. Chrome ignores every `::-webkit-scrollbar` pseudo-element on any scroller
+      that sets `scrollbar-width`. So the two cannot both be live: the legacy
+      block is fenced behind `@supports not`, where it serves the older Chromium
+      and Safari builds that predate `scrollbar-color` (Chrome 121, Safari 18.2). */
+*,
+*::before,
+*::after {
+  scrollbar-width: thin;
+  scrollbar-color: var(--line) transparent;   /* thumb, track */
+}
+
+@supports not (scrollbar-width: thin) {
+  *::-webkit-scrollbar { width: 9px; height: 9px; }
+  *::-webkit-scrollbar-track { background: transparent; }
+  *::-webkit-scrollbar-thumb {
+    background: var(--line);
+    border-radius: 999px;
+    /* A transparent border inset by background-clip leaves the thumb visually
+       narrower than its hit area: a hair to look at, still easy to grab. */
+    border: 2px solid transparent;
+    background-clip: content-box;
+  }
+  *::-webkit-scrollbar-thumb:hover {
+    background: var(--fg-faint);
+    background-clip: content-box;
+  }
+  /* Where the two bars meet: the default is a grey square, and it only appears on
+     a pane scrolling both ways -- which is exactly the pane you are reading. */
+  *::-webkit-scrollbar-corner { background: transparent; }
+}
+
 .grow { flex: 1; }
 .dim { color: var(--fg-dim); }
 .mono { font-family: inherit; }
@@ -1001,3 +1048,12 @@ pre.anatomy b { color: var(--accent); }
 /* A number field wants to be narrow: at the shared min-width it left a fault row
    wrapping onto two lines for the sake of four digits. */
 .rule-input.rule-num { min-width: 0; width: 84px; text-align: right; }
+
+/* The repeat controls read as a sentence -- Send × 10 delay 250 ms -- so the labels
+   between them sit tight rather than at the action row's own gap. */
+#detail-body .actions .rule-label { margin: 0 -2px; }
+.repeat-progress { margin-left: auto; white-space: nowrap; }
+/* The action row is a horizontal band; anything following it needs air or it reads
+   as a caption hanging off the Send button. */
+.sends-head { margin-top: 20px; }
+.repeat-tabs + .section { margin-top: 0; }
