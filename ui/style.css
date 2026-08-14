@@ -292,8 +292,10 @@ button.toggle.on::before { background: var(--accent); border-color: var(--accent
 .bar-row .group > .group-label { grid-row: 1; grid-column: 1 / -1; padding-left: 1px; }
 .bar-row .group > *:not(.group-label) { grid-row: 2; }
 
+/* Two columns now that "Switch to Intercept" is gone: the field only appears in
+   Intercept mode, so there is nothing left to switch to. */
 .scope-group { flex: 1; min-width: 260px; }
-.scope-group { grid-template-columns: 1fr auto auto; }
+.scope-group { grid-template-columns: 1fr auto; }
 
 #scope {
   width: 100%;
@@ -307,15 +309,6 @@ button.toggle.on::before { background: var(--accent); border-color: var(--accent
 #scope::placeholder { color: var(--fg-faint); }
 #scope:focus { outline: none; border-color: var(--accent); }
 #scope.bad { border-color: var(--bad); }
-/* Outside Intercept nothing is held, so the field has no effect: say so rather
-   than leaving the user to wonder what it is for. */
-.scope-group.idle #scope { opacity: .55; }
-.scope-group.idle .group-label::after {
-  content: " · applies in Intercept mode";
-  color: var(--warn);
-  letter-spacing: 0;
-  text-transform: none;
-}
 
 #stats { color: var(--fg-dim); padding-bottom: 3px; }
 #conn {
@@ -594,7 +587,12 @@ textarea.editor { min-height: 300px; border-color: var(--warn); }
 textarea.editor:focus { border-color: var(--accent); }
 textarea.inject-input { min-height: 0; }
 /* A host list is short. Full-width on a wide screen it reads as a void. */
-#decrypt-hosts { max-width: 560px; }
+#hosts-list { max-width: 560px; }
+/* The Apply row sat flush against the notes below it, so the button read as part
+   of the paragraph. `.hint` is margin-free by design, so the space is added here
+   rather than globally, where it would push every other hint around. */
+#hosts-panel .actions { margin-bottom: 16px; }
+#hosts-panel .panel-body > .hint + .hint { margin-top: 10px; }
 
 /* Editing a held flow: the editor takes all the height the pane has, and scrolls
    inside itself. A fixed 300px box inside a scrolling pane meant a raw message

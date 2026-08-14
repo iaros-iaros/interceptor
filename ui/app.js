@@ -207,13 +207,16 @@ function render() {
   }
   $("#resp").classList.toggle("on", !!state.intercept_responses);
   $("#noise").classList.toggle("on", !!state.hide_noise);
-  // The filter only decides what Intercept stops; in the other modes it does
-  // nothing, and saying so beats leaving the user to guess what the box is for.
-  const idle = state.mode !== "intercept";
-  $(".scope-group").classList.toggle("idle", idle);
-  // A filter typed outside Intercept mode cannot stop anything. Rather than a dim
-  // note the eye slides over, offer the switch right next to the box.
-  $("#scope-arm").hidden = !(idle && ($("#scope").value || "").trim());
+  // The filter only decides what Intercept stops, so in Capture it is a control
+  // that cannot do anything. Dimming it and captioning it "applies in Intercept
+  // mode" was still a box asking to be typed into. Hide it instead; a stored
+  // filter is not lost, it is named in the mode line below and comes back the
+  // moment Intercept is armed.
+  const intercepting = state.mode === "intercept";
+  $(".scope-group").hidden = !intercepting;
+  // The group's flex:1 is what pushes the other groups right, so something has to
+  // take its place or they jump left every time the mode changes.
+  $("#scope-spacer").hidden = intercepting;
   renderModeHint();
   renderProxyWarning();
   renderStats();
@@ -225,33 +228,49 @@ function render() {
 // One line, in plain words, for whatever is currently armed. "Stop replies"
 // is not self-explanatory on a button, and a title attribute is only found by
 // someone who already guessed there was something to find.
+// The documented idiom for "open no host at all" -- the replacement for the
+// Passthrough mode. Named rather than matched loosely: a pattern that happens to
+// match nothing today (a typo) should still read as a narrow list, because that
+// is what it is. Only the deliberate spelling gets the friendlier wording.
+const PASS_EVERYTHING = new Set(["^$", "(?!)"]);
+
+function passEverything(allow) {
+  return allow.length > 0 && allow.every((p) => PASS_EVERYTHING.has(p.trim()));
+}
+
 function renderModeHint() {
   const scoped = (state.scope || "").trim();
   const which = scoped ? `each request matching ${scoped}` : "every request";
   const allow = state.allow_hosts || [];
   let text;
-  if (state.mode === "passthrough") {
-    text = "Passthrough — bytes are tunnelled straight through. Nothing is decrypted, " +
-           "logged or stopped. Connections already open keep being captured until they close.";
-  } else if (state.mode === "intercept" && state.intercept_responses) {
+  if (state.mode === "intercept" && state.intercept_responses) {
     text = `Intercept — ${which} stops so you can read or edit it, and its reply stops ` +
            "again on the way back. Each flow stops twice: once out, once in.";
   } else if (state.mode === "intercept") {
     text = `Intercept — ${which} stops so you can read or edit it before it goes on. ` +
            "Replies come back untouched (turn on “Stop replies” to catch those as well).";
   } else {
-    // "everything is decrypted" would contradict the allowlist clause appended
-    // below, so drop the claim when one is in force rather than say both.
+    // The "everything" claim would contradict the allowlist clause below, so drop
+    // it when one is in force rather than assert both.
     text = (allow.length
-             ? "Capture — decrypted traffic is logged, nothing stops. "
-             : "Capture — everything is decrypted and logged, nothing stops. ") +
+             ? "Capture — matching traffic is logged, nothing stops. "
+             : "Capture — every request is logged, nothing stops. ") +
            "Switch to Intercept to stop flows for editing.";
+    // The filter box is hidden here, so a filter set earlier would otherwise be
+    // invisible until it suddenly started stopping things.
+    if (scoped) {
+      text += ` A stop filter is saved (${scoped}) and takes effect the moment you do.`;
+    }
   }
   // An allowlist changes what the sentence above is even true of, so it is said
   // in the same breath rather than left to be discovered in a panel.
-  if (allow.length && state.mode !== "passthrough") {
-    text += ` Only ${allow.join(", ")} ${allow.length === 1 ? "is" : "are"} decrypted;`
-          + " every other host is tunnelled and will not appear at all.";
+  if (passEverything(allow)) {
+    text += " Nothing is being captured: the host list matches nothing, so all traffic"
+          + " passes straight through. Sites load normally and none of it appears here."
+          + " This is what the old Passthrough mode did.";
+  } else if (allow.length) {
+    text += ` Only ${allow.join(", ")} ${allow.length === 1 ? "is" : "are"} captured;`
+          + " every other host still loads but never appears here.";
   }
   $("#mode-hint").textContent = text;
 }
@@ -301,7 +320,6 @@ function when(ts) {
 
 function renderStats() {
   const bits = [];
-  if (state.mode === "passthrough") bits.push("passthrough applies to new connections only");
   bits.push(`${state.stored || 0} flows`, fmtBytes(state.bytes || 0));
   if (state.evicted) bits.push(`${state.evicted} evicted`);
   if (state.noise_hidden) bits.push(`${state.noise_hidden} noise hidden`);
@@ -311,7 +329,7 @@ function renderStats() {
   // A forgotten allowlist reads as "the tool stopped capturing", so it is never
   // silent -- it says so here and again in the mode hint below the toolbar.
   const allow = (state.allow_hosts || []).length;
-  if (allow) bits.push(`decrypting ${allow} host${allow === 1 ? "" : "s"} only`);
+  if (allow) bits.push(`${allow} host${allow === 1 ? "" : "s"} only`);
   if (state.proxy) {
     // Where traffic actually goes. Chaining is the default now, so the interesting
     // fact is which upstream got adopted -- silence would leave that invisible.
@@ -385,13 +403,32 @@ function renderTable() {
   $("#empty").hidden = inView.length > 0;
   if (!inView.length) {
     const ws = traffic === "ws";
-    $("#empty-title").textContent = ws
-      ? "No WebSocket connections yet."
-      : "No traffic yet.";
-    $("#empty-hint").textContent = ws
-      ? "A socket shows up here once its handshake completes. Frames appear under the "
-        + "Frames tab when you select it."
-      : "Hit Launch Chrome above, or point any client at the proxy.";
+    const allow = state.allow_hosts || [];
+    // An allowlist narrow enough to match nothing leaves an empty table that
+    // looks like a broken tool. Passthrough used to cause exactly this and got
+    // reported as such, so the explanation stays -- it just belongs to the list
+    // now that the list is the only thing that can cause it.
+    if (passEverything(allow)) {
+      $("#empty-title").textContent = "Nothing is being captured — this is deliberate.";
+      $("#empty-hint").textContent =
+        "Your host list matches nothing, so all traffic passes straight through: sites "
+        + "load normally and none of it is shown. Clear the list in Tools → Hosts to "
+        + "capture everything again.";
+    } else if (allow.length) {
+      $("#empty-title").textContent = "Nothing captured — a host list is in force.";
+      $("#empty-hint").textContent =
+        `Only ${allow.join(", ")} would appear here. Every other host still loads `
+        + "normally in the browser, it is simply not captured. Clear the list in "
+        + "Tools → Hosts to capture everything again.";
+    } else {
+      $("#empty-title").textContent = ws
+        ? "No WebSocket connections yet."
+        : "No traffic yet.";
+      $("#empty-hint").textContent = ws
+        ? "A socket shows up here from its handshake onwards. Frames appear under the "
+          + "Frames tab when you select it."
+        : "Hit Launch Chrome above, or point any client at the proxy.";
+    }
   }
   $("#truncated").hidden = hiddenCount === 0;
   if (hiddenCount) {
@@ -919,9 +956,6 @@ $("#scope").addEventListener("keydown", (e) => {
 // change fires on blur when the value differs, so clicking away applies it too --
 // pressing Enter was the only way to submit, and nothing said so.
 $("#scope").addEventListener("change", applyScope);
-$("#scope-arm").onclick = () => {
-  send({ type: "mode.set", mode: "intercept", scope: $("#scope").value });
-};
 $("#theme").onclick = () => {
   toggleTheme();
   $("#theme").title = `Switch to ${currentTheme() === "light" ? "dark" : "light"}`;
@@ -962,7 +996,7 @@ $("#rules-raw-toggle").onclick = () => {
 // Pass null to close everything. Returns whether `id` ended up open.
 function openPanel(id) {
   let opened = false;
-  for (const [panel, toggle] of [["#decrypt", "#decrypt-toggle"],
+  for (const [panel, toggle] of [["#hosts-panel", "#hosts-toggle"],
                                  ["#rules", "#rules-toggle"],
                                  ["#sessions", "#open-session"]]) {
     const want = panel === id && $(panel).hidden;
@@ -973,24 +1007,24 @@ function openPanel(id) {
   return opened;
 }
 
-$("#decrypt-toggle").onclick = () => {
-  if (!openPanel("#decrypt")) return;
+$("#hosts-toggle").onclick = () => {
+  if (!openPanel("#hosts-panel")) return;
   // Show what is actually in force, not what was last typed here.
-  $("#decrypt-hosts").value = (state.allow_hosts || []).join("\n");
-  $("#decrypt-hosts").focus();
+  $("#hosts-list").value = (state.allow_hosts || []).join("\n");
+  $("#hosts-list").focus();
 };
-$("#decrypt-close").onclick = () => openPanel(null);
-$("#decrypt-apply").onclick = () => {
-  const hosts = $("#decrypt-hosts").value.split("\n").map((s) => s.trim()).filter(Boolean);
-  send({ type: "decrypt.set", hosts });
-  $("#decrypt-status").textContent = hosts.length
-    ? `decrypting ${hosts.length} host(s), tunnelling the rest — new connections only`
-    : "decrypting every host again";
-  setTimeout(() => ($("#decrypt-status").textContent = ""), 6000);
+$("#hosts-close").onclick = () => openPanel(null);
+$("#hosts-apply").onclick = () => {
+  const hosts = $("#hosts-list").value.split("\n").map((s) => s.trim()).filter(Boolean);
+  send({ type: "hosts.set", hosts });
+  $("#hosts-status").textContent = hosts.length
+    ? `capturing ${hosts.length} host(s) only — TLS applies to new connections`
+    : "capturing every host again";
+  setTimeout(() => ($("#hosts-status").textContent = ""), 6000);
 };
-$("#decrypt-clear").onclick = () => {
-  $("#decrypt-hosts").value = "";
-  send({ type: "decrypt.set", hosts: [] });
+$("#hosts-clear").onclick = () => {
+  $("#hosts-list").value = "";
+  send({ type: "hosts.set", hosts: [] });
 };
 
 $("#rules-toggle").onclick = () => {

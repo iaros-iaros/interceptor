@@ -37,7 +37,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from bridge import Bridge  # noqa: E402
 from store import FlowStore  # noqa: E402
 
-MODES = ("intercept", "capture", "passthrough")
+# Two modes, because a mode only answers one question: does a matching flow stop?
+# What gets opened up is a separate axis, and it belongs to the Decrypt list.
+# Passthrough used to conflate the two -- it was "open nothing", which the Decrypt
+# list expresses as a pattern matching no host, so the mode was one concept too
+# many and read as "the tool is broken" whenever it was left on.
+MODES = ("intercept", "capture")
 
 # Saved sessions live here. Nothing is ever written without an explicit click:
 # a .mitm file is every captured request in plaintext, cookies and bearer tokens
@@ -109,6 +114,19 @@ def _open_private(path: Path) -> int:
     return os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
 
 
+def is_ws_handshake(flow: http.HTTPFlow) -> bool:
+    """A WebSocket flow starts life as an ordinary GET carrying `Upgrade:
+    websocket`, and `flow.websocket` stays None until the 101 completes.
+
+    Reading only `flow.websocket` meant a socket appeared under HTTP while its
+    handshake was in flight -- most visibly in Intercept, where the handshake is
+    held right at that moment -- and then vanished and reappeared under WebSocket
+    once forwarded. Same flow, two tabs, looking like a duplicate. The Upgrade
+    header is there from the first byte, so classify on that instead.
+    """
+    return "websocket" in flow.request.headers.get("upgrade", "").lower()
+
+
 def summary(flow: http.HTTPFlow) -> dict:
     r, resp = flow.request, flow.response
     ms = None
@@ -128,7 +146,9 @@ def summary(flow: http.HTTPFlow) -> dict:
         "resp_bytes": len(resp.raw_content or b"") if resp else 0,
         "start": r.timestamp_start,
         "ms": ms,
-        "ws": flow.websocket is not None,
+        # True from the handshake onwards, so a socket never starts under HTTP and
+        # then hops tabs once it upgrades.
+        "ws": flow.websocket is not None or is_ws_handshake(flow),
         "ws_frames": len(flow.websocket.messages) if flow.websocket else 0,
         # Whether the socket is still up, which a 101 status cannot tell you --
         # a closed connection keeps its handshake status forever.
@@ -450,6 +470,22 @@ class Interceptor:
         # NOISE_FILTER is a negation, so a flow that does NOT match it is noise.
         return bool(ctx.options.hide_noise) and not self._noise(flow)
 
+    @staticmethod
+    def _off_list(flow) -> bool:
+        """True when a host list is set and this flow is not on it.
+
+        The list has to mean the same thing for every protocol or its name is a
+        lie. mitmproxy's `allow_hosts` only governs TLS -- it decides what gets
+        terminated -- so plain HTTP and `ws://` sailed past it and kept appearing
+        from hosts the user had excluded. This is the other half: what gets kept.
+        Matched the way mitmproxy matches it, against `host:port`.
+        """
+        hosts = ctx.options.allow_hosts
+        if not hosts or not isinstance(flow, http.HTTPFlow):
+            return False
+        target = f"{flow.request.host}:{flow.request.port}"
+        return not any(re.search(h, target, re.IGNORECASE) for h in hosts if h.strip())
+
     # The store owns the byte accounting now. These stay so the rest of the addon,
     # the UI payload and the checks read the same names they always did.
     @property
@@ -466,6 +502,8 @@ class Interceptor:
 
     def _remember(self, flow) -> bool:
         if not isinstance(flow, http.HTTPFlow) or self._is_noise(flow):
+            return False
+        if self._off_list(flow):
             return False
         size = len(flow.request.raw_content or b"")
         if flow.response:
@@ -566,7 +604,10 @@ class Interceptor:
             self._push_state_soon()
 
     def websocket_message(self, flow: http.HTTPFlow) -> None:
-        if self._is_noise(flow):
+        # Frames are pushed straight to the UI rather than through _remember, so
+        # the host list has to be honoured here too or an excluded `ws://` socket
+        # would keep streaming rows into a table that claims to show one host.
+        if self._is_noise(flow) or self._off_list(flow):
             return
         msg = flow.websocket.messages[-1]
         self._remember(flow)
@@ -794,13 +835,27 @@ class Interceptor:
 
     # ------------------------------------------------------------ mode
 
+    @staticmethod
+    def _host_filter() -> str:
+        """The host list as a flow filter, so Intercept stops nothing outside it.
+
+        Without this the list would hide a host from the table while still holding
+        its requests -- a browser stalled on a queue you cannot see, because the
+        rows explaining it were filtered out. Quoted for the same reason the noise
+        filter is: the regex's own parentheses must not read as filter grouping.
+        """
+        hosts = [h.strip() for h in ctx.options.allow_hosts if h.strip()]
+        return f'~d "({"|".join(hosts)})"' if hosts else ""
+
     def _compose(self) -> str:
         # "~all" refuses to compose with "&" in mitmproxy's filter grammar, so an
-        # empty scope degrades to the noise filter alone.
-        noise = NOISE_FILTER if ctx.options.hide_noise else ""
-        if self.scope and noise:
-            return f"({self.scope}) & {noise}"
-        return self.scope or noise or "~all"
+        # empty scope degrades to whatever other terms exist, or to ~all alone.
+        terms = [
+            f"({self.scope})" if self.scope else "",
+            NOISE_FILTER if ctx.options.hide_noise else "",
+            self._host_filter(),
+        ]
+        return " & ".join(t for t in terms if t) or "~all"
 
     def _set_mode(self, mode: str, scope: str | None = None) -> None:
         if mode not in MODES:
@@ -834,15 +889,19 @@ class Interceptor:
             except ValueError as e:
                 self.bridge.push("error", message=f"bad scope filter: {e}")
                 return
-            ctx.options.update(ignore_hosts=[], intercept=expr)
+            ctx.options.update(intercept=expr)
         else:
-            # passthrough: ignore_hosts tunnels bytes without terminating TLS.
-            # NEW connections only -- existing keep-alives stay intercepted.
-            ctx.options.update(
-                ignore_hosts=[".*"] if mode == "passthrough" else [], intercept=None
-            )
+            # Capture: stop nothing, and release anything already held so switching
+            # out of Intercept never strands a waiting client.
+            ctx.options.update(intercept=None)
             for fid in list(self.paused):
                 self._resume(fid)
+        # `ignore_hosts` is deliberately not touched here any more. Passthrough used
+        # to set it to ".*" and every other mode reset it to [], which meant a mode
+        # switch silently discarded a hand-set `--set ignore_hosts=...`. Nothing in
+        # the UI owns that option now, so a per-host tunnel list passed on the
+        # command line survives -- mitmproxy's own equivalent of Burp's TLS pass
+        # through, for the case the Decrypt allowlist cannot express.
         self.mode = mode
         self._push_state()
 
@@ -942,8 +1001,8 @@ class Interceptor:
             self.repeat(msg.get("id"), msg.get("raw") or "")
         elif kind == "rules.set":
             self._set_rules(list(msg.get("body") or []), list(msg.get("headers") or []))
-        elif kind == "decrypt.set":
-            self._set_decrypt(list(msg.get("hosts") or []))
+        elif kind == "hosts.set":
+            self._set_hosts(list(msg.get("hosts") or []))
         elif kind == "ws.inject":
             self.inject_frame(msg.get("id"), bool(msg.get("to_client")),
                               msg.get("text", ""), bool(msg.get("is_text", True)))
@@ -1085,22 +1144,33 @@ class Interceptor:
 
     # ------------------------------------------------------------ decrypt scope
 
-    def _set_decrypt(self, hosts: list[str]) -> None:
-        """Limit TLS termination to these hosts; tunnel the rest.
+    def _set_hosts(self, hosts: list[str]) -> None:
+        """Capture only these hosts. One list, three effects:
 
-        This is mitmproxy's own `allow_hosts`. It matters for speed rather than
-        for filtering: terminating TLS costs two handshakes per connection on a
-        single-threaded event loop -- measured ~170 new HTTPS connections/second,
-        one core saturated, with this addon accounting for ~5% of it. A page
-        pulling from twenty hosts spends most of that budget on CDNs, fonts and
-        telemetry nobody is testing. Naming the hosts under test takes them out
-        of the crypto path entirely.
+        * mitmproxy's `allow_hosts` stops terminating TLS for anything else, which
+          is where the speed comes from -- two handshakes per connection on a
+          single-threaded loop, measured ~170 new HTTPS connections/second with
+          one core saturated. A page pulling from twenty hosts spends most of that
+          budget on CDNs, fonts and telemetry nobody is testing.
+        * `_off_list` keeps unlisted flows out of the store, so plain HTTP and
+          `ws://` obey the list too. `allow_hosts` alone governs TLS only, which
+          made the list a half-truth for everything unencrypted.
+        * `_host_filter` folds it into the intercept expression, so nothing off
+          the list is ever held. Filtering the table while still pausing those
+          requests would stall the browser against an invisible queue.
 
-        Not a security control. An allowed host is decrypted, a tunnelled one is
-        merely invisible to us -- it still reaches the client untouched.
+        Not a security control. An unlisted host is not blocked -- it reaches the
+        client untouched, it is merely not shown here.
         """
         cleaned = [h.strip() for h in hosts if h.strip()]
         for pattern in cleaned:
+            # The pattern is embedded in a quoted flowfilter term, so a quote of
+            # its own would break out of it and compose something else entirely.
+            if '"' in pattern:
+                self.bridge.push(
+                    "error",
+                    message=f"host pattern {pattern!r} cannot contain a double quote.")
+                return
             try:
                 re.compile(pattern)
             except re.error as e:
@@ -1110,17 +1180,25 @@ class Interceptor:
                             f"hostname such as  app.example.com  or a regular "
                             f"expression such as  .*\\.example\\.com  -- one per line.")
                 return
+        previous = list(ctx.options.allow_hosts)
         try:
             ctx.options.update(allow_hosts=cleaned)
+            # The list also becomes part of the intercept expression, so a pattern
+            # that parses as a regex but not as a filter term must not be stored.
+            if self.mode == "intercept":
+                flowfilter.parse(self._compose())
         except Exception as e:
-            self.bridge.push("error", message=f"decrypt scope rejected: {e}")
+            ctx.options.update(allow_hosts=previous)
+            self.bridge.push("error", message=f"host list rejected: {e}")
             return
-        # New connections only, exactly like passthrough: ignore/allow are consulted
-        # when a connection's next layer is chosen, so anything already established
-        # keeps being decrypted until it closes.
+        if self.mode == "intercept":
+            self._set_mode("intercept")   # the filter has to be re-armed
+        # TLS termination is chosen when a connection's next layer is picked, so
+        # the tunnelling half applies to new connections only; the storage half
+        # applies to every flow from here on.
         logging.log(ALERT,
-                    f"decrypting {cleaned} only, tunnelling the rest (new connections)"
-                    if cleaned else "decrypting every host again")
+                    f"capturing {cleaned} only (new connections for TLS)"
+                    if cleaned else "capturing every host again")
         self._push_state()
 
     # ------------------------------------------------------------ ws injection
@@ -1203,6 +1281,16 @@ class Interceptor:
             f"--proxy-bypass-list=<-loopback>;127.0.0.1:{ui_port};localhost:{ui_port}",
             # QUIC sidesteps HTTP proxies entirely: the #1 cause of a missing flow.
             "--disable-quic",
+            # The #2 cause: Chrome's own cache. A warm profile serves most of a
+            # reload from disk without touching the network, so the proxy sees a
+            # fraction of the requests and the table looks broken -- measured on a
+            # real site, a reload dropped from 149 flows to 30, and with Intercept
+            # armed almost nothing stopped. A capture tool that shows you four
+            # requests in five is worse than useless, so the throwaway profile runs
+            # with no cache at all. This is why testers reach for "Disable cache"
+            # in devtools; here it is simply always on.
+            "--disk-cache-size=1",
+            "--media-cache-size=1",
             # Background chatter pollutes the table and keeps Chrome alive forever.
             "--disable-background-networking",
             "--disable-component-update",

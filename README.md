@@ -16,10 +16,13 @@ interceptor          # proxy on :8080, UI opens on :9000
 
 ## What it does
 
-- **Captures everything** the proxy sees — HTTP/1.1, HTTP/2, WebSocket frames.
+- **Captures everything** the proxy sees — HTTP/1.1, HTTP/2, WebSocket frames — with
+  HTTP and WebSocket split into their own tabs, and a **Hosts** list to narrow the
+  capture to the app under test when a page's CDNs are drowning it.
 - **Pauses** any flow matching a scope filter, and holds it until you decide.
 - **Full edit** of a held request or response: request line, status line, every header,
-  and the body — as raw text, the way Burp does it.
+  and the body — as raw text, the way Burp does it, with JSON indented for reading and
+  a `Raw` toggle back to the exact bytes.
 - **WebSocket frames** can be edited, dropped, or **injected** in either direction on a
   live connection.
 - **Repeater**: resend any captured HTTP request, edited if you like.
@@ -66,7 +69,14 @@ default browser. The URL carries a per-run token in its fragment, and is also wr
 Then click **Launch Chrome**. That gives you a temporary-profile Chrome pointed at the
 proxy, with `--disable-quic`, `--proxy-bypass-list=<-loopback>` and an SPKI pin for
 mitmproxy's CA — so HTTPS is decrypted without installing a certificate into your system
-keychain, your login keychain, or any profile's NSS store. The profile directory is
+keychain, your login keychain, or any profile's NSS store.
+
+It also runs with **no HTTP cache** (`--disk-cache-size=1`, `--media-cache-size=1`).
+That is not a detail: a warm profile serves most of a reload out of Chrome's own cache
+without touching the network, so the proxy sees a fraction of the requests. Measured on
+a real site, a reload dropped from 149 flows to 30 — and with Intercept armed, almost
+nothing stopped, which reads as the tool being broken. This is the "Disable cache" box
+every tester ticks in devtools; here it is simply always on. The profile directory is
 wiped on a clean exit — it accumulates real session cookies, so if Interceptor is killed
 outright (`SIGKILL`, a crash), check your temp directory for a leftover
 `interceptor-profile-*`.
@@ -76,8 +86,9 @@ To use your own client instead, point it at `http://127.0.0.1:8080` and trust
 
 ## The UI
 
-The toolbar is grouped and labelled: the mode buttons, then **Stop flows matching**,
-**Options**, **Tools**, **Session**. Controls look different according to what they do —
+The toolbar is grouped and labelled: the mode buttons, then **Stop flows matching**
+(Intercept only), **Options**, **Tools**, **Session**. Controls look different according
+to what they do —
 the mode is a segmented control, on/off options are toggles with a filled dot,
 *Launch Chrome* is green like the `live` badge because it is how you start, *Apply* and
 *Instructions* are accent, and *Clear* is destructive. Under the toolbar, one line
@@ -89,12 +100,53 @@ to hover a control to find out.
 | Mode | Behaviour |
 |---|---|
 | **Intercept** | Pause every flow matching the scope filter. |
-| **Capture** | Decrypt and log everything, pause nothing. |
-| **Passthrough** | Tunnel bytes: no TLS termination, no capture. New connections only — existing keep-alives stay intercepted until they close. |
+| **Capture** | Log everything, pause nothing. |
 
-**Decrypt** (in *Tools*) narrows which hosts get TLS-terminated at all — Burp's *TLS
-pass through*, inverted. It is a **speed** control, not a filter, and it is the one lever
-that matters for responsiveness:
+A mode answers one question — *does a matching flow stop?* **What gets captured at all
+is a separate axis and belongs to the Hosts list.** There used to be a third mode,
+Passthrough, which conflated the two: it meant "capture nothing", so it left the table
+empty while browsing worked, and it reliably read as the tool being broken. The Hosts
+list says the same thing better, and can say the useful in-between as well.
+
+### Hosts — capture only what you are testing
+
+**Hosts** (in *Tools*) is the list of hosts worth looking at. Name them one per line, as
+plain hostnames or regexes, and nothing else is captured:
+
+```
+app.example.com
+api.example.com          # or one line:  .*\.example\.com
+```
+
+- Empty (the default) captures every host.
+- **It means the same thing for HTTPS, plain HTTP and WebSockets.** Verified with all
+  three against one on-list and one off-list host: on-list captured, off-list not, and
+  every request still reached its server in both cases.
+- A host left out is **not blocked** — it loads normally, it is simply not captured, not
+  shown, and never stopped in Intercept. This is not a security boundary.
+- Nothing off the list is ever **held**, either. A list that hid a host from the table
+  while Intercept still paused its requests would stall the browser against a queue whose
+  rows were filtered out — so the list is folded into the pause filter as well.
+- To capture **nothing** — what Passthrough used to do — use a pattern that matches no
+  host, such as `^$`. Verified equivalent: both leave zero flows captured while the
+  request still returns 200.
+- An active list is never silent: the toolbar says `2 hosts only` and the line under the
+  mode buttons names them, because "why is my traffic missing?" is otherwise a long hunt.
+
+It is also **the main speed control**, which is the other half of why it exists.
+
+### What "capturing" costs
+
+The proxy can only show you an HTTPS request if it breaks the encryption deliberately:
+it answers your browser **pretending to be the site**, using a certificate it mints on
+the spot, and opens its own TLS connection onward to the real server. Holding both keys
+is what lets it print a URL, show a body, or let you edit one. Your browser accepts the
+forged certificate only because of the SPKI pin the launcher passes — no CA is installed
+anywhere.
+
+Without that, a proxy sees only ciphertext: it knows *that* you reached
+`example.com:443` and how many bytes moved, and nothing more. Plain `http://` has no
+encryption in the first place, so it is always visible — there is nothing to open.
 
 Terminating TLS costs two handshakes per connection (one with the browser using a forged
 cert, one with the real server), and mitmproxy runs single-threaded, so all of it lands on
@@ -104,23 +156,11 @@ same (171 vs 158 req/s), so this is mitmproxy's cost, not this project's — the
 spend less is to decrypt fewer connections.
 
 A page pulling from twenty hosts spends most of that budget on CDNs, fonts, analytics and
-telemetry nobody is testing. Name the hosts under test, one per line — a plain hostname or
-a regex — and the rest is tunnelled:
+telemetry nobody is testing, and a host left off the list costs none of it.
 
-```
-app.example.com
-api.example.com          # or one line:  .*\.example\.com
-```
-
-- Empty (the default) decrypts everything.
-- **New connections only**, like passthrough. Anything already open stays decrypted.
-- Plain HTTP is captured either way; this only governs TLS.
-- Passthrough still tunnels everything, allowlist or not.
-- A tunnelled host is **not** blocked — it reaches the browser untouched, it is just
-  invisible here. This is not a security boundary.
-- An active allowlist is never silent: the toolbar counter says
-  `decrypting 2 hosts only` and the line under the mode buttons names them, because
-  "why is my traffic missing?" is otherwise a long hunt.
+The two halves apply on slightly different schedules: skipping TLS is decided when a
+connection's next layer is chosen, so it takes effect for **new connections**, while the
+capture half applies to every flow from the moment you press Apply.
 
 **Stop flows matching** is the field under the mode buttons — mitmproxy's `flowfilter`
 syntax. It decides which flows **Intercept** stops; it does not decide what gets captured.
@@ -129,9 +169,11 @@ Empty means everything stops.
 Three things to know about it:
 
 - **It applies on Enter, or when you click away.** Typing alone changes nothing.
-- **It only bites in Intercept mode.** In Capture nothing stops by definition, so a filter
-  there does nothing at all — the label dims and says so, and a **Switch to Intercept**
-  button appears beside the field so it is one click, not a hunt.
+- **It appears only in Intercept mode**, because it can only do anything there. It used
+  to sit in the toolbar permanently, dimmed and captioned "applies in Intercept mode",
+  which is still a box asking to be typed into for no effect. A filter set earlier is not
+  lost when you leave Intercept — the line under the mode buttons names it, and it comes
+  back the moment you arm Intercept again.
 - **A bad filter is refused, not stored.** The field turns red, a message says why, and the
   filter that was already working stays in force. Note that filter syntax is *not* rules
   syntax: `~u /api/`, never `|~u /api/` — the leading separator belongs to rewrite rules.
@@ -149,9 +191,13 @@ Full cheat sheet in the in-app reference (**Rules → Instructions**, or the `?`
 field).
 
 **Second toolbar row**: the filter field, then *Options* (*Stop replies*, off by
-default — see below; *Hide noise*), *Tools* (*Rules*, *Decrypt*, *Launch Chrome*) and *Session*
+default — see below; *Hide noise*), *Tools* (*Rules*, *Hosts*, *Launch Chrome*) and *Session*
 (*Save*, *Open*, *Clear*). The top right carries a live count of stored flows, bytes,
-evictions and hidden noise, the bridge connection badge, and the light/dark toggle.
+evictions, hidden noise and any active host list, the bridge connection badge, and the
+light/dark toggle.
+
+Only one panel is open at a time — *Rules*, *Hosts* and *Open session* replace each
+other rather than stacking above the workspace.
 
 **HTTP / WebSocket** tabs sit at the top of the table pane and split the capture by
 protocol, the way Burp does. Each carries a count, so "is anything using a socket?" is
@@ -160,6 +206,12 @@ still open. A socket is one row that lives for minutes while frames stream under
 mixed into several hundred request rows it was effectively invisible. Selecting one lands
 on **Frames** directly, and its frame count now ticks up live rather than sitting at
 `ws (0)` until the connection closes.
+
+A socket is classified from its **handshake**, not from its upgrade. The handshake is
+an ordinary GET carrying `Upgrade: websocket`, and `flow.websocket` stays empty until
+the 101 lands — so classifying on that alone put the flow under HTTP first and moved it
+to WebSocket once forwarded, which reads as one connection appearing twice. Most visible
+in Intercept, which holds the flow at exactly that moment.
 
 **Filter rows** sits above the table and is **view-only**: it hides rows that don't
 match what you type, and changes nothing about capture, stopping, rewriting, or what a
@@ -322,6 +374,12 @@ WebSocket**. That is not an optimisation — `resume()` and frame injection act 
 exact object the proxy is awaiting, so handing back a copy rehydrated from the database
 would look correct, release nothing, and strand the client.
 
+One consequence worth knowing: a **reconnecting UI is sent the newest 2000 summaries**,
+not the whole store. Memory no longer bounds the capture, so without that cap a reload
+would try to push an entire session down one WebSocket message — and the browser discards
+everything past its own 2000-row limit anyway. Older flows are still on disk and still go
+into a saved session; they simply aren't re-listed in the table after a reload.
+
 The cost is about **15% of peak store throughput** (1330 → 1132 flows/second on the same
 loopback workload), because each finalised flow is serialised and written once. That
 ceiling sits roughly 6× above the ~170 new HTTPS connections/second that TLS termination
@@ -373,6 +431,8 @@ Everything else is a `--set` flag after `interceptor`:
 | `ui_host` | `127.0.0.1` | UI bind host. |
 | `store_bytes` | `2GB` | Flow store cap **in bytes of captured traffic**. Bodies dominate, so the cap is bytes, not flow count; oldest flows are evicted and the count is shown in the UI. This caps the **store file**, not memory — see Storage. The file runs about half again larger than the cap (serialisation, index and WAL). |
 | `hide_noise` | `true` | Hide browser background chatter (Google telemetry, safebrowsing, gstatic). Counted and reported, never silently dropped. |
+| `allow_hosts` | *(empty)* | The **Hosts** list, presettable from the command line: capture only these. Empty captures everything. |
+| `ignore_hosts` | *(empty)* | The inverse, and the one thing the Hosts list cannot express: tunnel *these* hosts and capture everything else — mitmproxy's equivalent of Burp's TLS pass through, for a certificate-pinned host that breaks under interception. Command line only; nothing in the UI writes it, so a value set here survives every mode switch. |
 | `intercept_responses` | `false` | Also stop replies. Same as the *Stop replies* toggle. |
 | `expose` | `false` | Permit binding off loopback. Without it, that is refused outright — see Security. |
 | `ssl_insecure` | `false` | Accept self-signed/expired certs on upstream targets. Commented out in `run.sh`. |
@@ -461,12 +521,19 @@ Also:
 - The proxy port itself (`8080`) has no authentication — it relies on being bound to
   loopback.
 - Saved `.mitm` files are decrypted traffic. See Sessions above.
+- **The working store is decrypted traffic too.** It is a SQLite file created `0600` in
+  your temp directory and deleted on shutdown, so an ordinary quit leaves nothing behind
+  — but a `SIGKILL` or a crash can leave an `interceptor-store-*` directory, exactly as
+  it can leave an `interceptor-profile-*`. Check for both if the process died hard. See
+  Storage.
+- The **Hosts** list is not a security boundary. A host left off it is not blocked or
+  isolated in any way; it simply isn't captured.
 
 ## Tests
 
 ```bash
 .venv/bin/python spike/spike.py --chrome --net    # browser + network reality   4/4
-.venv/bin/python spike/check.py                   # units + end-to-end        58/58
+.venv/bin/python spike/check.py                   # units + end-to-end        60/60
 ```
 
 Both are safe to run while a real instance is up — separate ports (`18xxx`/`19000`), their
@@ -489,8 +556,10 @@ force-forward on UI disconnect, the flow store's SQLite round trip and its refus
 hand back a copy of a live flow, byte accounting and eviction (WebSocket frames
 included, each counted exactly once so a long-lived socket stays O(1) per frame rather
 than O(n²)), the streaming cutoff, WebSocket frame editing, truncation refusal and
-injection, body and header rewrite rules, the decrypt allowlist's validation, the repeater,
-session save/open including a
+injection, a socket being classified from its handshake rather than its upgrade (and an
+`h2c` upgrade not being dragged in with it), body and header rewrite rules, the host list
+(validation, and that it covers HTTP, HTTPS and WebSocket alike and reaches the pause
+filter), the repeater, session save/open including a
 full-restart round trip, file modes at creation time under a permissive umask, and the
 loopback guard — every entry path including `--mode` specs, without ever opening a public
 socket to prove it.
@@ -502,14 +571,21 @@ pretty-printer (headers byte-identical, non-JSON and CRLF bodies untouched, and 
 line inside a body never mistaken for the header separator).
 
 **Not covered:** anything needing a DOM — `index.html`, `style.css` and every rendering
-path in `app.js`; `node --check` is syntax-only. Also passthrough mode, the `error`-hook
-queue cleanup, the noise counter, `launch_chrome`, and concurrent held flows.
+path in `app.js`; `node --check` is syntax-only. Also the `error`-hook queue cleanup, the
+noise counter, `launch_chrome`'s flags, and concurrent held flows.
+
+Neither suite talks to the internet through a real browser, and that gap has cost real
+bugs: a WebSocket handshake showing under HTTP until it upgraded, and Chrome's own cache
+hiding four requests in five on a reload. Both were invisible to loopback echo servers
+and only appeared when driving the launcher's Chrome against a live site. Check that by
+hand after changing anything about modes, classification or the launcher.
 
 ## Layout
 
 ```
 addon/
-  interceptor.py   # hooks, flow store, mode switch, pause queue, sessions, launcher
+  interceptor.py   # hooks, mode switch, host list, pause queue, sessions, launcher
+  store.py         # flows in SQLite; live and held ones held in RAM by identity
   bridge.py        # WebSocket + static files on one port, token + Origin gates
 ui/
   index.html

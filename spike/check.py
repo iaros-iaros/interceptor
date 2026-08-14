@@ -1319,6 +1319,53 @@ def units_row_filter() -> None:
           not bad, "; ".join(bad) or f"{len(patterns)} patterns correct, bad regex falls back")
 
 
+def units_ws_classification() -> None:
+    """A socket must read as a socket from its handshake, not from its upgrade.
+
+    `flow.websocket` is None until the 101 completes, so classifying on it alone
+    put a handshake under the HTTP tab, then moved the same flow to the WebSocket
+    tab once forwarded -- one connection appearing twice, in two places. Most
+    visible in Intercept, which holds the flow at exactly that moment.
+    Reproduced against a real site before this test existed.
+    """
+    import interceptor as I
+    from mitmproxy.test import tflow
+
+    notes = []
+    # Handshake in flight: no .websocket yet, but the Upgrade header is there.
+    hs = tflow.tflow(resp=False)
+    hs.request.headers["connection"] = "Upgrade"
+    hs.request.headers["upgrade"] = "websocket"
+    if not I.summary(hs)["ws"]:
+        notes.append("handshake in flight classified as HTTP")
+    if I.summary(hs)["ws_open"]:
+        notes.append("handshake in flight reported as an open socket")
+
+    # Header casing is not guaranteed.
+    hs2 = tflow.tflow(resp=False)
+    hs2.request.headers["Upgrade"] = "WebSocket"
+    if not I.summary(hs2)["ws"]:
+        notes.append("upgrade header matched case-sensitively")
+
+    # Established socket stays ws.
+    est = tflow.twebsocketflow()
+    if not I.summary(est)["ws"]:
+        notes.append("established socket not classified as ws")
+
+    # An ordinary request must not be dragged in, including other upgrades.
+    plain = tflow.tflow(resp=True)
+    if I.summary(plain)["ws"]:
+        notes.append("plain HTTP flow classified as ws")
+    h2c = tflow.tflow(resp=True)
+    h2c.request.headers["upgrade"] = "h2c"
+    if I.summary(h2c)["ws"]:
+        notes.append("a non-websocket upgrade was classified as ws")
+
+    check("a WebSocket reads as one from its handshake, not only after upgrading",
+          not notes, "; ".join(notes) or "handshake, casing, established, plain and "
+                                         "h2c all classified correctly")
+
+
 def units_flow_store() -> None:
     """The store keeps completed flows on disk and in-flight ones in RAM. Two
     things must hold or it is worse than the OrderedDict it replaced:
@@ -1404,7 +1451,71 @@ def units_flow_store() -> None:
                                         "sockets kept by identity")
 
 
-def units_decrypt_scope() -> None:
+def units_host_uniform() -> None:
+    """The host list has to mean the same thing for every protocol.
+
+    mitmproxy's `allow_hosts` governs TLS only, so on its own the list was a
+    half-truth: plain HTTP and `ws://` from excluded hosts kept appearing. And a
+    list that hid a host from the table while Intercept still held its requests
+    would stall the browser against a queue with no visible rows.
+    """
+    import interceptor as I
+    from mitmproxy.test import taddons, tflow
+
+    notes = []
+    addon = I.Interceptor()
+    with taddons.context(addon) as tctx:
+        tctx.configure(addon, hide_noise=False)
+
+        def flow_for(host, port=443):
+            f = tflow.tflow(resp=True)
+            f.request.host = host
+            f.request.port = port
+            return f
+
+        tctx.options.allow_hosts = ["app.example.com"]
+        if addon._off_list(flow_for("app.example.com")):
+            notes.append("a listed host was treated as off-list")
+        if not addon._off_list(flow_for("cdn.other.com")):
+            notes.append("an unlisted host was treated as on-list")
+        # Plain HTTP is the case allow_hosts alone cannot cover.
+        if not addon._off_list(flow_for("cdn.other.com", 80)):
+            notes.append("plain HTTP from an unlisted host was not excluded")
+        if addon._off_list(flow_for("app.example.com", 80)):
+            notes.append("plain HTTP from a listed host was excluded")
+        # Empty list means capture everything, not capture nothing.
+        tctx.options.allow_hosts = []
+        if addon._off_list(flow_for("anything.example.com")):
+            notes.append("an empty list excluded a host")
+
+        # The list must reach the intercept filter, or excluded hosts still stop.
+        tctx.options.allow_hosts = ["app.example.com"]
+        expr = addon._compose()
+        if "app.example.com" not in expr:
+            notes.append(f"host list missing from the intercept filter: {expr!r}")
+        try:
+            from mitmproxy import flowfilter
+            if flowfilter.parse(expr) is None:
+                notes.append(f"composed filter does not parse: {expr!r}")
+        except ValueError as e:
+            notes.append(f"composed filter rejected: {e}")
+        # ...and must still compose with a scope filter and the noise filter.
+        addon.scope = "~m POST"
+        tctx.options.hide_noise = True
+        both = addon._compose()
+        try:
+            from mitmproxy import flowfilter as ff
+            if ff.parse(both) is None:
+                notes.append(f"scope + noise + hosts does not parse: {both!r}")
+        except ValueError as e:
+            notes.append(f"scope + noise + hosts rejected: {e}")
+
+    check("the host list covers HTTP, HTTPS and WebSocket, and reaches the pause filter",
+          not notes, "; ".join(notes) or "on/off-list correct for :443 and :80, empty "
+                                         "means all, and it composes into the filter")
+
+
+def units_host_scope() -> None:
     """The decrypt allowlist is mitmproxy's `allow_hosts`, so the part that is ours
     is validation: a bad pattern must be refused with the working list left in
     force, exactly like the scope filter. A rejected pattern that still got stored
@@ -1429,13 +1540,13 @@ def units_decrypt_scope() -> None:
         tctx.configure(addon, hide_noise=False)
         addon.bridge = Collect()
 
-        addon._set_decrypt(["app.example.com", " api.example.com "])
+        addon._set_hosts(["app.example.com", " api.example.com "])
         if list(ctx_opt(tctx, "allow_hosts")) != ["app.example.com", "api.example.com"]:
             notes.append(f"good patterns not stored/trimmed: {ctx_opt(tctx, 'allow_hosts')}")
 
         # A bad regex must be refused outright, keeping what already worked.
         addon.bridge.sent.clear()
-        addon._set_decrypt(["ok.example.com", "*nope(("])
+        addon._set_hosts(["ok.example.com", "*nope(("])
         errs = [m for m in addon.bridge.sent if m["type"] == "error"]
         if not errs:
             notes.append("bad pattern accepted without an error")
@@ -1443,19 +1554,19 @@ def units_decrypt_scope() -> None:
             notes.append(f"bad batch clobbered the working list: {ctx_opt(tctx, 'allow_hosts')}")
 
         # Empty means decrypt everything again -- the documented way back.
-        addon._set_decrypt([])
+        addon._set_hosts([])
         if list(ctx_opt(tctx, "allow_hosts")) != []:
             notes.append("empty list did not clear the allowlist")
 
         # And it has to reach the UI, or an active allowlist is invisible.
-        addon._set_decrypt(["only.example.com"])
+        addon._set_hosts(["only.example.com"])
         addon.bridge.sent.clear()
         addon._push_state()
         state = next((m for m in addon.bridge.sent if m["type"] == "state"), {})
         if state.get("allow_hosts") != ["only.example.com"]:
             notes.append(f"state does not carry allow_hosts: {state.get('allow_hosts')}")
 
-    check("the decrypt allowlist validates and never half-applies",
+    check("the host list validates and never half-applies",
           not notes, "; ".join(notes) or "trimmed, bad regex refused, clearable, in state")
 
 
@@ -1688,8 +1799,10 @@ async def main() -> int:
     units_rule_builder()
     units_row_filter()
     units_pretty_body()
+    units_ws_classification()
     units_flow_store()
-    units_decrypt_scope()
+    units_host_uniform()
+    units_host_scope()
     await integration()
     await restart_and_load()
     cleanup_saved_session()
