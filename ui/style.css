@@ -463,7 +463,11 @@ textarea:focus { outline: none; border-color: var(--accent); }
    into two columns. */
 #workspace {
   flex: 1;            /* all the height the toolbar and panels do not use */
-  min-height: 0;      /* so the children's own overflow:auto actually scrolls */
+  /* A floor, not 0. It still sits far below the content, so the children's own
+     overflow:auto scrolls exactly as it did -- but a panel above that grows
+     without limit (Rules, with a row per rule) can no longer squeeze the table
+     and the editor down to nothing. The panel shrinks and scrolls instead. */
+  min-height: 220px;
   display: grid;
   /* Width lives in a variable so the splitter can move it without touching the
      template, and so a saved width applies before first paint. */
@@ -852,6 +856,19 @@ pre.anatomy b { color: var(--accent); }
 #doc-body td:first-child code { white-space: nowrap; }
 
 /* ------------------------------------------------------- rule builder + filter */
+
+/* Bounded, and it scrolls -- the same trade as #queue-list. Four body rows plus
+   the fault block already out-measure a 900px window, and `body` is a fixed 100vh
+   flex column with no page scroll, so the extra height pushed #workspace clean off
+   the bottom edge: the flow table and the editor gone, with no way to reach them.
+
+   A `max-height: 50vh` cap does not hold -- measured, it still left #workspace 4px
+   tall at 620px, because the toolbar, the proxy banner and an open hold queue take
+   from the same column and none of them scale with vh. So the panel shrinks as the
+   flex item it already is, and #workspace carries the floor (see layout). Bounding
+   the body rather than the section keeps the head -- and Close -- put. */
+#rules { display: flex; flex-direction: column; min-height: 0; }
+#rules .panel-body { min-height: 0; overflow-y: auto; }
 
 .rule-block { margin-bottom: 14px; }
 .rule-block-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 6px; }
