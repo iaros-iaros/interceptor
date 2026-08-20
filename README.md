@@ -620,6 +620,14 @@ queue like any other frame.
 
 Repeat is hidden for WebSocket flows — mitmproxy's client replay refuses them.
 
+## Agents
+
+Everything above is reachable from a script or an AI agent — the UI has no privileged
+path, it is a WebSocket client like any other. Start with `IC_OPEN_UI=false`, read the
+token from `.ui-url`, and speak the same twenty commands the browser does.
+
+The protocol, the payloads, and the traps are in **[AGENT-API.md](AGENT-API.md)**.
+
 ## Configuration
 
 `run.sh` already passes six options, so those are changed by **environment variable** —
@@ -747,7 +755,7 @@ Also:
 
 ```bash
 .venv/bin/python spike/spike.py --chrome --net    # browser + network reality   4/4
-.venv/bin/python spike/check.py                   # units + end-to-end        69/69
+.venv/bin/python spike/check.py                   # units + end-to-end        70/70
 ```
 
 Both are safe to run while a real instance is up — separate ports (`18xxx`/`19000`), their
@@ -773,7 +781,9 @@ than O(n²)), the streaming cutoff, WebSocket frame editing, truncation refusal 
 injection, a socket being classified from its handshake rather than its upgrade (and an
 `h2c` upgrade not being dragged in with it), body and header rewrite rules, the host list
 (validation, and that it covers HTTP, HTTPS and WebSocket alike and reaches the pause
-filter), the repeater, session save/open including a
+filter), the scope filter (every argument-less filter usable as a scope, an OR scope still
+grouped so the noise and host terms cannot land on one branch, and rules syntax in the
+filter box still refused), the repeater, session save/open including a
 full-restart round trip, file modes at creation time under a permissive umask, and the
 loopback guard — every entry path including `--mode` specs, without ever opening a public
 socket to prove it.

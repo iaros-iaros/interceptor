@@ -1576,6 +1576,81 @@ def ctx_opt(tctx, name):
     return getattr(tctx.options, name)
 
 
+def units_scope_atoms() -> None:
+    """An argument-less filter has to work as a scope.
+
+    `_compose` wraps the scope in parentheses so that a scope containing `|`
+    composes correctly with the noise and host filters: `&` binds tighter than
+    `|`, so ungrouped, `~u /a | ~u /b` would apply those filters to the second
+    branch alone. But mitmproxy builds an argument-less filter as
+    `Literal("~websocket") + WordEnd()`, and pyparsing's `WordEnd` defaults its
+    word characters to `printables` -- which contains `)`. So `~websocket` parsed
+    alone and `(~websocket)` did not, and every argument-less filter was unusable
+    as a scope, in the UI's box exactly as much as over the bridge.
+
+    Both halves are asserted, because the obvious fix -- dropping the parentheses
+    -- trades this loud bug for a silent one, and only the second half catches
+    that.
+    """
+    import interceptor as I
+    from mitmproxy import flowfilter
+    from mitmproxy.addons import intercept, modifybody, modifyheaders
+    from mitmproxy.test import taddons
+
+    # Every filter mitmproxy defines that takes no argument. Each parses alone;
+    # each used to fail the moment _compose wrapped it.
+    ZERO_ARG = ["~all", "~http", "~websocket", "~tcp", "~udp", "~dns",
+                "~marked", "~replay", "~q", "~s", "~a", "~e"]
+
+    class Collect:
+        def __init__(self):
+            self.clients = {"x"}
+            self.sent = []
+
+        def push(self, type_, **payload):
+            self.sent.append({"type": type_, **payload})
+
+    addon = I.Interceptor()
+    notes = []
+    with taddons.context(addon, intercept.Intercept(), modifybody.ModifyBody(),
+                         modifyheaders.ModifyHeaders()) as tctx:
+        # hide_noise on is the realistic case and the one that broke: it is what
+        # puts a second term after the scope and forces the grouping.
+        tctx.configure(addon, hide_noise=True)
+        addon.bridge = Collect()
+
+        for atom in ZERO_ARG:
+            addon.bridge.sent.clear()
+            addon._set_mode("intercept", atom)
+            errs = [m for m in addon.bridge.sent if m["type"] == "error"]
+            if errs:
+                notes.append(f"{atom} rejected: {errs[0]['message'][:44]}")
+            elif addon.mode != "intercept" or addon.scope != atom:
+                notes.append(f"{atom} did not arm "
+                             f"(mode={addon.mode} scope={addon.scope!r})")
+
+        # The parens are load-bearing. Assert the composed tree, not just that it
+        # parses: an ungrouped OR still parses, it simply means something else.
+        addon._set_mode("intercept", "~u /a | ~u /b")
+        composed = addon._compose()
+        if not isinstance(flowfilter.parse(composed), flowfilter.FAnd):
+            notes.append(f"OR scope no longer grouped: {composed!r}")
+
+        # And composing is still what catches a stray leading pipe -- rules syntax
+        # typed into the filter box, which parses alone and must not be stored.
+        addon.bridge.sent.clear()
+        addon._set_mode("intercept", "|~u /api/")
+        if not [m for m in addon.bridge.sent if m["type"] == "error"]:
+            notes.append("stray leading pipe accepted")
+        if addon.scope != "~u /a | ~u /b":
+            notes.append(f"rejected scope was stored anyway: {addon.scope!r}")
+
+        addon._set_mode("capture", "")
+
+    check("argument-less filters work as a scope", not notes,
+          "; ".join(notes) or f"{len(ZERO_ARG)} atoms, OR still grouped, |~u caught")
+
+
 def units_pretty_body() -> None:
     """The editor indents a JSON body for reading, and what it produces can be
     forwarded. So the header block must come back byte-identical, a non-JSON body
@@ -2108,6 +2183,7 @@ async def main() -> int:
     units_flow_store()
     units_host_uniform()
     units_host_scope()
+    units_scope_atoms()
     units_repeat_burst()
     await units_faults()
     units_search()

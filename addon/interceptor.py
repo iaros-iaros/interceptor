@@ -918,8 +918,18 @@ class Interceptor:
     def _compose(self) -> str:
         # "~all" refuses to compose with "&" in mitmproxy's filter grammar, so an
         # empty scope degrades to whatever other terms exist, or to ~all alone.
+        #
+        # The space before the closing paren is load-bearing, not a typo. An
+        # argument-less filter is built as `Literal("~websocket") + WordEnd()`, and
+        # pyparsing's WordEnd defaults its word characters to `printables` -- which
+        # contains ")". So "(~websocket)" fails to parse while "~websocket" alone is
+        # fine, and every argument-less filter (~q ~s ~a ~e ~all ~http ~websocket
+        # ~tcp ~udp ~dns ~marked ~replay) was unusable as a scope. A space is enough
+        # to satisfy WordEnd. The parens themselves have to stay: "&" binds tighter
+        # than "|", so an ungrouped "~u /a | ~u /b" would put the noise and host
+        # filters on the second branch only. units_scope_atoms covers both halves.
         terms = [
-            f"({self.scope})" if self.scope else "",
+            f"({self.scope} )" if self.scope else "",
             NOISE_FILTER if ctx.options.hide_noise else "",
             self._host_filter(),
         ]
