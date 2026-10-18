@@ -163,6 +163,11 @@ function renderQueue() {
   // pushing the flow table down every time a single request stopped.
   $("#stall-note").hidden = !stalled;
   const list = $("#queue-list");
+  // Rebuilt only when what it shows changes: recreated every tick, its Forward
+  // and Drop buttons lost clicks the same way the table rows did.
+  const sig = JSON.stringify([q, ui.sel]);
+  if (list.dataset.sig === sig) return;
+  list.dataset.sig = sig;
   list.textContent = "";
   for (const item of q) {
     const row = el("div", "q-item");
@@ -185,6 +190,9 @@ function renderQueue() {
 
 function renderSessions() {
   const list = $("#sessions-list");
+  const sig = JSON.stringify(ui.sessions);   // see renderQueue
+  if (list.dataset.sig === sig) return;
+  list.dataset.sig = sig;
   list.textContent = "";
   if (!ui.sessions.length) {
     list.append(el("p", "hint", "No saved sessions yet. Hit “Save session” to make one."));

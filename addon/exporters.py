@@ -12,6 +12,8 @@ traffic with cookies and bearer tokens in them.
 
 from __future__ import annotations
 
+import asyncio
+import itertools
 import json
 import os
 from datetime import datetime
@@ -37,11 +39,16 @@ def export_text(flow: http.HTTPFlow, fmt: str) -> str:
     return ctx.master.commands.call("export", fmt, flow)
 
 
-def write_har(flows, directory: Path, open_private) -> tuple[str, int]:
+async def write_har(flows, directory: Path, open_private) -> tuple[str, int]:
     """Every flow as a HAR file in `directory`. Returns (filename, bytes).
 
     HAR is the interchange format devtools, performance tooling and most other
     proxies all read, so this is what makes a capture outlive Interceptor.
+
+    Streamed: each entry is built, written and dropped in turn, and the event loop
+    gets a turn every 50 flows. make_har() on the whole capture held it three times
+    over -- flows, dict, JSON string -- several GB at the default store cap, all
+    while the proxy waited.
 
     `open_private` is the addon's 0600 opener, passed in rather than imported so
     this module does not reach back into interceptor.py. A HAR holds full request
@@ -54,15 +61,25 @@ def write_har(flows, directory: Path, open_private) -> tuple[str, int]:
 
     # Only HTTP flows: make_har logs and skips anything else, and a HAR of zero
     # entries is a confusing thing to hand someone.
-    http_flows = [f for f in flows if isinstance(f, http.HTTPFlow)]
-    if not http_flows:
+    flows = (f for f in flows if isinstance(f, http.HTTPFlow))
+    first = next(flows, None)
+    if first is None:
         raise ValueError("nothing to export yet")
 
     directory.mkdir(mode=0o700, exist_ok=True)
     if directory.stat().st_mode & 0o077:
         directory.chmod(0o700)  # mkdir(exist_ok) does not touch an existing dir
     name = f"{datetime.now().strftime('%Y-%m-%d_%H%M%S')}.har"
-    blob = json.dumps(savehar.make_har(http_flows), indent=2).encode()
-    with os.fdopen(open_private(directory / name), "wb") as fh:
-        fh.write(blob)
-    return name, len(blob)
+    # make_har([]) is the envelope -- version, creator, pages -- with the entries
+    # written into it by hand: its JSON minus the closing "}}", then the list.
+    log = savehar.make_har([])["log"]
+    del log["entries"]
+    servers_seen: set = set()
+    with os.fdopen(open_private(directory / name), "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"log": log})[:-2] + ', "entries": [')
+        for i, f in enumerate(itertools.chain([first], flows)):
+            fh.write(("," if i else "") + json.dumps(savehar.flow_entry(f, servers_seen)))
+            if i % 50 == 49:
+                await asyncio.sleep(0)
+        fh.write("]}}")
+    return name, (directory / name).stat().st_size

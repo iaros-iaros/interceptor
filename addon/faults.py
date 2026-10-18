@@ -61,9 +61,10 @@ class Fault:
         if not (self.delay_ms or self.drop or self.status is not None):
             raise ValueError("rule does nothing: set a delay, a status, or drop")
 
-        expr = f"~u {self.url}" if self.url else "~all"
+        # FUrl itself, not parse(f"~u {url}"): the filter grammar reads the regex's
+        # own ( | ) as filter syntax, so /api/v(1|2)/x matched /api/v9/x1.
         try:
-            self._filter = flowfilter.parse(expr)
+            self._filter = flowfilter.FUrl(self.url) if self.url else flowfilter.FAll()
         except ValueError as e:
             raise ValueError(f"bad URL pattern {self.url!r}: {e}") from e
 

@@ -1490,18 +1490,9 @@ def units_host_uniform() -> None:
         if addon._off_list(flow_for("anything.example.com")):
             notes.append("an empty list excluded a host")
 
-        # The list must reach the intercept filter, or excluded hosts still stop.
+        # Holding is _maybe_pause's half -- units_host_predicate covers it. The
+        # composed filter must still parse with a list, a scope and the noise term.
         tctx.options.allow_hosts = ["app.example.com"]
-        expr = addon._compose()
-        if "app.example.com" not in expr:
-            notes.append(f"host list missing from the intercept filter: {expr!r}")
-        try:
-            from mitmproxy import flowfilter
-            if flowfilter.parse(expr) is None:
-                notes.append(f"composed filter does not parse: {expr!r}")
-        except ValueError as e:
-            notes.append(f"composed filter rejected: {e}")
-        # ...and must still compose with a scope filter and the noise filter.
         addon.scope = "~m POST"
         tctx.options.hide_noise = True
         both = addon._compose()
@@ -1512,9 +1503,9 @@ def units_host_uniform() -> None:
         except ValueError as e:
             notes.append(f"scope + noise + hosts rejected: {e}")
 
-    check("the host list covers HTTP, HTTPS and WebSocket, and reaches the pause filter",
+    check("the host list covers HTTP, HTTPS and WebSocket alike",
           not notes, "; ".join(notes) or "on/off-list correct for :443 and :80, empty "
-                                         "means all, and it composes into the filter")
+                                         "means all, the filter still composes")
 
 
 def units_host_scope() -> None:
@@ -1748,7 +1739,9 @@ def units_rule_builder() -> None:
       const fns = new Function(code + "; return {composeRule, ruleFromSpec};")();
       const cases = JSON.parse(process.env.CASES);
       console.log(JSON.stringify(cases.map((c) =>
-        c.kind === "compose" ? fns.composeRule(c.rule) : fns.ruleFromSpec(c.spec))));
+        c.kind === "compose" ? fns.composeRule(c.rule)
+        : c.kind === "roundtrip" ? fns.ruleFromSpec(fns.composeRule(c.rule))
+        : fns.ruleFromSpec(c.spec))));
     """
 
     cases = [
@@ -1763,6 +1756,11 @@ def units_rule_builder() -> None:
         {"kind": "parse", "spec": "|~s|a|b"},
         {"kind": "parse", "spec": "|a|b"},
         {"kind": "parse", "spec": "|~c 500 & ~t json|a|b"},
+        # 9-10: a URL regex holding filter metacharacters and backslashes
+        {"kind": "compose", "rule": {"where": "both", "url": "/api/v(1|2)/x", "find": "a", "repl": "b", "raw": None}},
+        {"kind": "compose", "rule": {"where": "both", "url": r"\.json$", "find": "a", "repl": "b", "raw": None}},
+        # 11: and the form reads such a rule back unchanged
+        {"kind": "roundtrip", "rule": {"where": "req", "url": r'/q"x"\d+(a|b)', "find": "a", "repl": "b", "raw": None}},
     ]
     out = subprocess.run(["node", "--input-type=module", "-e", harness],
                          cwd=ROOT, capture_output=True, text=True, timeout=60,
@@ -1807,6 +1805,50 @@ def units_rule_builder() -> None:
 
     check("the rule form composes specs mitmproxy accepts and parses them back",
           not notes, "; ".join(notes) or f"{len(cases)} cases correct, separators avoided")
+
+    import faults as F
+    from mitmproxy.test import tflow
+
+    def at(url):
+        f = tflow.tflow(resp=True)
+        f.request.url = url
+        return f
+
+    # Parsing is not enough -- case 3 always parsed. With no filter the spec has
+    # two parts, so a separator inside the replacement turned `find` into a URL
+    # filter and half the replacement into the find text.
+    meaning = ""
+    try:
+        s = parse_modify_spec(got[3], True)
+        if (s.subject, s.replacement_str) != (b"a", "keep|the|pipes"):
+            meaning = f"find {s.subject!r} -> {s.replacement_str!r}"
+        elif not s.matches(at("http://h/zzz")):
+            meaning = "the rule acquired a URL filter"
+    except Exception as e:
+        meaning = f"rejected: {e}"
+    check("a rule's replacement may contain the separator without changing the rule",
+          not meaning, meaning or f"{got[3]!r} still means: find 'a', replace 'keep|the|pipes'")
+
+    # Unquoted, `~u /api/v(1|2)/x` was read as `~u /api/v & (1 | 2) & /x` -- a
+    # different rule. Both the rules form and the fault rules take a URL regex.
+    wrong = []
+    for i, hit, miss in ((9, "http://h/api/v1/x", "http://h/api/v9/x1"),
+                         (10, "http://h/a.json", "http://h/ajson")):
+        try:
+            s = parse_modify_spec(got[i] or "", True)
+            if not s.matches(at(hit)) or s.matches(at(miss)):
+                wrong.append(f"rule {got[i]!r}: {hit} -> {bool(s.matches(at(hit)))}, "
+                             f"{miss} -> {bool(s.matches(at(miss)))}")
+        except Exception as e:
+            wrong.append(f"rule {got[i]!r} rejected: {e}")
+    back = got[11] or {}
+    if back.get("raw") is not None or back.get("url") != r'/q"x"\d+(a|b)':
+        wrong.append(f"form did not read its own rule back: {back!r}")
+    fault = F.Fault({"url": "/api/v(1|2)/x", "status": 503})
+    if not fault.matches(at("http://h/api/v1/x")) or fault.matches(at("http://h/api/v9/x1")):
+        wrong.append("fault rule matched /api/v9/x1 for /api/v(1|2)/x")
+    check("a URL regex means what it says in rules and faults, metacharacters included",
+          not wrong, "; ".join(wrong) or "(1|2), \\. and $ honoured; quotes round-trip")
 
 
 def units_chain_flag() -> None:
@@ -2159,6 +2201,363 @@ def units_stop_reply() -> None:
           "; ".join(notes) or "armed reply held, arm consumed, unarmed reply passed")
 
 
+class _Collect:
+    """A bridge that records what the addon pushed, with one client listening."""
+
+    def __init__(self):
+        self.clients = {"x"}
+        self.sent = []
+
+    def push(self, type_, **payload):
+        self.sent.append({"type": type_, **payload})
+
+
+async def units_fault_loaded() -> None:
+    """Opening a session replays every flow through the request hook, but those
+    flows are history: a fault armed now must not rewrite what was captured then.
+    mitmproxy's own modify_body skips non-live flows for the same reason."""
+    import faults as F
+    import interceptor as I
+    from mitmproxy.test import taddons, tflow
+
+    addon = I.Interceptor()
+    with taddons.context(addon) as tctx:
+        tctx.configure(addon, hide_noise=False)
+        addon.faults = F.parse_all([{"url": "", "status": 503}])
+        f = tflow.tflow(resp=True)
+        f.live = False                       # what a flow read from a .mitm file is
+        await addon.request(f)
+        addon.store.close()
+    check("a fault rule never rewrites a flow loaded from a session",
+          f.response.status_code == 200 and not f.metadata.get("faulted"),
+          f"loaded 200 came back {f.response.status_code}, "
+          f"faulted={f.metadata.get('faulted')!r}")
+
+
+def units_ws_finalised() -> None:
+    """A socket that closes is a finished flow: written to disk, released from RAM,
+    summarised as closed. Otherwise every closed socket keeps its frames in memory
+    for the life of the process and reloads into the UI as still open."""
+    import interceptor as I
+    from mitmproxy.test import taddons, tflow
+    from mitmproxy.websocket import WebSocketMessage
+
+    addon = I.Interceptor()
+    notes = []
+    with taddons.context(addon) as tctx:
+        tctx.configure(addon, hide_noise=False)
+        ws = tflow.twebsocketflow()
+        ws.websocket.timestamp_end = None
+        ws.websocket.messages = []
+        addon.response(ws)
+        addon.websocket_start(ws)
+        for i in range(3):
+            ws.websocket.messages.append(WebSocketMessage(1, True, b"frame%d" % i))
+            addon.websocket_message(ws)
+        ws.websocket.timestamp_end = time.time()
+        addon.websocket_end(ws)
+        addon.store.flush()
+        if ws.id in addon.store._live:
+            notes.append("closed socket still held in RAM by reference")
+        snap = next((s for s in addon.store.summaries() if s["id"] == ws.id), {})
+        if snap.get("ws_open") is not False:
+            notes.append(f"stored summary says ws_open={snap.get('ws_open')!r}")
+        addon.store._cache.clear()
+        back = addon.store.get(ws.id)
+        if back is None or len(back.websocket.messages) != 3:
+            notes.append("frames did not come back from disk")
+        addon.store.close()
+    check("a WebSocket that closes is stored, released and summarised as closed",
+          not notes, "; ".join(notes) or "on disk with 3 frames, out of RAM, ws_open=False")
+
+
+def units_remember_cost() -> None:
+    """Storing one flow must not walk the whole store. Once any socket had been
+    seen it did, twice a call: 9ms per flow at 100k stored, on the proxy's loop."""
+    import interceptor as I
+    from mitmproxy.test import taddons, tflow
+    from store import FlowStore
+
+    addon = I.Interceptor()
+    notes = []
+    walks = 0
+    real_iter = FlowStore.__iter__
+
+    def counting_iter(self):
+        nonlocal walks
+        walks += 1
+        return real_iter(self)
+
+    with taddons.context(addon) as tctx:
+        tctx.configure(addon, hide_noise=False)
+        ws = tflow.twebsocketflow()
+        ws.websocket.timestamp_end = None
+        addon._remember(ws)                  # a socket with frames: it has a cursor
+        if ws.id not in addon.ws_seen:
+            notes.append("setup: the socket got no frame cursor")
+        FlowStore.__iter__ = counting_iter
+        try:
+            for _ in range(5):
+                addon._remember(tflow.tflow(resp=True))
+        finally:
+            FlowStore.__iter__ = real_iter
+        if walks:
+            notes.append(f"{walks} walks of the whole store for 5 flows that evicted nothing")
+        # ...but an evicted socket must still lose its cursor.
+        tctx.options.store_bytes = 1
+        addon._remember(tflow.tflow(resp=True))
+        if ws.id in addon.ws_seen:
+            notes.append("an evicted socket kept its frame cursor")
+        addon.store.close()
+    check("storing a flow does not walk the whole store", not notes,
+          "; ".join(notes) or "0 store walks for 5 flows; eviction still drops cursors")
+
+
+async def units_host_predicate() -> None:
+    """Storing and holding must agree on what is on the Hosts list. Quoting the
+    patterns into a `~d` filter stripped their backslashes and matched the host
+    where storage matches host:port: `api\\d+` hosts were shown but never held,
+    and a `$`-anchored pattern held flows the table never showed -- a socket's
+    frame that way was never released at all."""
+    import interceptor as I
+    from mitmproxy.addons import intercept, modifybody, modifyheaders
+    from mitmproxy.test import taddons, tflow
+
+    addon = I.Interceptor()
+    ic = intercept.Intercept()
+    notes = []
+    with taddons.context(ic, addon, modifybody.ModifyBody(),
+                         modifyheaders.ModifyHeaders()) as tctx:
+        tctx.configure(addon, hide_noise=False)
+        addon.bridge = _Collect()
+        for pattern, host, want in ((r"api\d+\.example\.com", "api12.example.com", True),
+                                    (r"^app\.example\.com$", "app.example.com", False)):
+            addon._set_hosts([pattern])
+            addon._set_mode("intercept", "")
+            f = tflow.tflow()
+            f.request.host, f.request.port = host, 80
+            f.request.headers["Host"] = host
+            ic.request(f)                    # mitmproxy's Intercept decides first, as live
+            await addon.request(f)
+            held, shown = f.id in addon.paused, f.id in addon.store
+            if held != want:
+                notes.append(f"{pattern}: held={held}, want {want}")
+            if held and not shown:
+                notes.append(f"{pattern}: held but never shown")
+            if not held and f.intercepted:
+                notes.append(f"{pattern}: left intercepted with nothing holding it")
+            addon._set_mode("capture", "")
+        # A frame on an off-list socket must be released, not left waiting.
+        addon._set_hosts([r"^app\.example\.com$"])
+        addon._set_mode("intercept", "")
+        ws = tflow.twebsocketflow()
+        ws.request.host, ws.request.port = "app.example.com", 80
+        ic.websocket_message(ws)
+        addon.websocket_message(ws)
+        if ws.intercepted:
+            notes.append("a frame on an off-list socket was left intercepted")
+        # Nothing here shows or releases a raw TCP or UDP message, so Intercept
+        # must never catch one -- with or without a list.
+        for t in (tflow.ttcpflow(), tflow.tudpflow()):
+            (ic.tcp_message if t.type == "tcp" else ic.udp_message)(t)
+            if t.intercepted:
+                notes.append(f"a {t.type} message was intercepted, and nothing releases it")
+        addon._set_mode("capture", "")
+        addon.store.close()
+    check("the Hosts list decides storing and holding with one predicate", not notes,
+          "; ".join(notes) or "\\d pattern shown and held; off-list flow and frame "
+                              "released; tcp/udp never caught")
+
+
+BRIDGE_PORT = _port("IC_TEST_BRIDGE_PORT", 18083)
+
+
+async def units_reply_routing() -> None:
+    """A command's reply goes to the client that sent it. One shared outbox sent
+    an agent's snapshot to the human's tab, where it wipes unsent edits, and the
+    agent's export into the human's clipboard."""
+    import interceptor as I
+    from bridge import Bridge
+    from mitmproxy.addons import export, intercept, modifybody, modifyheaders
+    from mitmproxy.test import taddons, tflow
+
+    if not port_free(BRIDGE_PORT):
+        return check("a command's reply reaches only the client that sent it", None,
+                     f"port {BRIDGE_PORT} busy (set IC_TEST_BRIDGE_PORT)")
+    addon = I.Interceptor()
+    notes = []
+    replies = {"snapshot", "export", "error"}
+    with taddons.context(addon, intercept.Intercept(), export.Export(),
+                         modifybody.ModifyBody(), modifyheaders.ModifyHeaders()) as tctx:
+        tctx.configure(addon, hide_noise=False)
+        b = Bridge("127.0.0.1", BRIDGE_PORT, ROOT / "ui",
+                   addon._on_message, addon._on_ui_gone)
+        addon.bridge = b
+        await b.start()
+        try:
+            f = tflow.tflow(resp=True)
+            addon.store.put(f, 10, I.summary(f), 10**9)
+            url = f"ws://127.0.0.1:{BRIDGE_PORT}/ws?token={b.token}"
+            hdr = {"Origin": b.origin}
+            async with websockets.connect(url, additional_headers=hdr) as human, \
+                       websockets.connect(url, additional_headers=hdr) as agent:
+                for msg in ({"type": "hello"},
+                            {"type": "export", "id": f.id, "format": "curl"},
+                            {"type": "mode.set", "mode": "intercept", "scope": "|~u /api/"}):
+                    await agent.send(json.dumps(msg))
+
+                async def drain(conn):
+                    got = set()
+                    try:
+                        while True:
+                            frame = await asyncio.wait_for(conn.recv(), 0.6)
+                            got |= {m["type"] for m in json.loads(frame)}
+                    except asyncio.TimeoutError:
+                        return got
+
+                h, a = await asyncio.gather(drain(human), drain(agent))
+                if h & replies:
+                    notes.append(f"the other client got {sorted(h & replies)}")
+                if replies - a:
+                    notes.append(f"the sender never got {sorted(replies - a)}")
+                if "state" not in h:
+                    notes.append("shared state stopped reaching the other client")
+        finally:
+            await b.stop()
+            addon.store.close()
+    check("a command's reply reaches only the client that sent it", not notes,
+          "; ".join(notes) or "snapshot, export and error to the sender; state to both")
+
+
+def units_row_sync() -> None:
+    """The table must never detach a row that stays on screen. Replacing the whole
+    tbody every tick lost 11 of 20 real clicks at ~5 req/s: a row removed between
+    mousedown and mouseup never receives its click."""
+    harness = r"""
+      import { readFileSync } from "node:fs";
+      const src = readFileSync("ui/table.js", "utf8");
+      const grab = (name) => {
+        const i = src.indexOf(`function ${name}(`);
+        if (i < 0) throw new Error(`missing ${name}`);
+        let depth = 0, j = src.indexOf("{", i);
+        for (let k = j; k < src.length; k++) {
+          if (src[k] === "{") depth++;
+          else if (src[k] === "}" && --depth === 0) return src.slice(i, k + 1);
+        }
+        throw new Error(`unbalanced ${name}`);
+      };
+      const { syncRows } = new Function(grab("syncRows") + "; return { syncRows };")();
+      // Just enough of a DOM parent for syncRows, recording every detach.
+      function parent(ids) {
+        const p = { kids: [], detached: [] };
+        Object.defineProperty(p, "children", { get: () => p.kids });
+        p.make = (id) => ({ id, parent: null, remove() {
+          const i = p.kids.indexOf(this);
+          if (i >= 0) { p.kids.splice(i, 1); p.detached.push(this.id); }
+          this.parent = null;
+        } });
+        p.insertBefore = (n, ref) => {
+          if (n.parent) n.remove();
+          const i = ref ? p.kids.indexOf(ref) : -1;
+          p.kids.splice(i < 0 ? p.kids.length : i, 0, n);
+          n.parent = p;
+        };
+        for (const id of ids) p.insertBefore(p.make(id), null);
+        p.detached = [];
+        return p;
+      }
+      console.log(JSON.stringify(JSON.parse(process.env.CASES).map(([have, want]) => {
+        const p = parent(have);
+        const byId = new Map(p.kids.map((n) => [n.id, n]));
+        syncRows(p, want.map((id) => byId.get(id) ?? p.make(id)));
+        return { order: p.kids.map((n) => n.id), detached: p.detached };
+      })));
+    """
+    cases = [
+        (["a", "b", "c"], ["n", "a", "b", "c"]),  # a new flow arrives: the usual tick
+        (["a", "b", "c"], ["a", "b", "c"]),       # nothing changed
+        (["a", "b", "c"], ["a", "c"]),            # a row leaves from the middle
+        (["a", "b", "c"], ["c", "a"]),            # a reorder may move rows, must end right
+        ([], ["x", "y"]),
+    ]
+    want_detached = [[], [], ["b"], None, []]     # None: moves allowed
+    out = subprocess.run(["node", "--input-type=module", "-e", harness], cwd=ROOT,
+                         capture_output=True, text=True, timeout=60,
+                         env={**os.environ, "CASES": json.dumps(cases)})
+    if out.returncode != 0:
+        return check("the flow table never detaches a row that stays", False,
+                     f"node failed: {out.stderr.strip()[:160]}")
+    got = json.loads(out.stdout)
+    bad = []
+    for (have, want), g, det in zip(cases, got, want_detached):
+        if g["order"] != want:
+            bad.append(f"{have}->{want} gave {g['order']}")
+        if det is not None and g["detached"] != det:
+            bad.append(f"{have}->{want} detached {g['detached']}")
+    check("the flow table never detaches a row that stays", not bad,
+          "; ".join(bad) or f"{len(cases)} cases: prepend and no-op detach nothing")
+
+
+async def units_har_stream() -> None:
+    """HAR export has to stream. It built the whole store into one list, one dict
+    and one JSON string -- several GB at the default 2GB cap -- while the proxy's
+    loop waited."""
+    import gc
+    import inspect
+    import tempfile
+    import weakref
+
+    import interceptor as I
+    from exporters import write_har
+    from mitmproxy.addons import savehar
+    from mitmproxy.test import taddons, tflow
+
+    alive = weakref.WeakSet()
+    peak = 0
+
+    def flows(n):
+        nonlocal peak
+        for i in range(n):
+            if i % 50 == 0:
+                gc.collect()  # test flows sit in reference cycles: count what is held
+                peak = max(peak, len(alive))
+            f = tflow.tflow(resp=True)
+            f.request.path = f"/item/{i}"
+            alive.add(f)
+            yield f
+
+    ticks = 0
+
+    async def ticker():
+        nonlocal ticks
+        while True:
+            ticks += 1
+            await asyncio.sleep(0)
+
+    notes = []
+    with taddons.context(savehar.SaveHar()), tempfile.TemporaryDirectory() as d:
+        t = asyncio.create_task(ticker())
+        try:
+            res = write_har(flows(300), Path(d), I._open_private)
+            name, _size = await res if inspect.isawaitable(res) else res
+        finally:
+            t.cancel()
+        try:
+            entries = json.loads((Path(d) / name).read_text())["log"]["entries"]
+        except Exception as e:
+            entries = []
+            notes.append(f"not a valid HAR: {e}")
+        if len(entries) != 300 or not entries[-1]["request"]["url"].endswith("/item/299"):
+            notes.append(f"{len(entries)} entries written, want 300 in order")
+        if peak > 2:
+            notes.append(f"{peak} flows alive at once -- the export holds the capture")
+        if ticks < 2:
+            notes.append("the event loop never ran during the export")
+    check("HAR export streams one flow at a time and keeps the proxy responsive",
+          not notes, "; ".join(notes) or f"300 entries, peak {peak} flow(s) alive, "
+                                         f"loop ran {ticks} times meanwhile")
+
+
 def cleanup_saved_session() -> None:
     """The suite writes a real file into the user's sessions/ folder to prove the
     save path. Leaving it there would clutter the picker a little more every run."""
@@ -2178,18 +2577,25 @@ async def main() -> int:
     units_chain_flag()
     units_rule_builder()
     units_row_filter()
+    units_row_sync()
     units_pretty_body()
     units_ws_classification()
     units_flow_store()
+    units_ws_finalised()
+    units_remember_cost()
     units_host_uniform()
     units_host_scope()
+    await units_host_predicate()
     units_scope_atoms()
     units_repeat_burst()
     await units_faults()
+    await units_fault_loaded()
     units_search()
     units_contentview()
     units_export()
     units_stop_reply()
+    await units_reply_routing()
+    await units_har_stream()
     await integration()
     await restart_and_load()
     cleanup_saved_session()

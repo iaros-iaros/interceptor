@@ -52,9 +52,20 @@ export function renderTable() {
       `${hiddenCount} older matching flow(s) not rendered (newest ${MAX_ROWS} shown).`;
   }
 
-  const body = document.createElement("tbody");
-  for (const f of shown) body.append(row(f));
-  $("#flows").tBodies[0].replaceWith(body);
+  syncRows($("#flows").tBodies[0], shown.map(rowFor));
+  // A row that left the screen is rebuilt if it comes back; keep only what is shown.
+  for (const [id, tr] of rowEls) if (!tr.isConnected) rowEls.delete(id);
+}
+
+// Put exactly `wanted` under `parent`, in order, without detaching any row that
+// stays. A row removed between mousedown and mouseup never gets its click, and
+// replacing the whole tbody every tick lost 11 of 20 clicks at ~5 req/s.
+function syncRows(parent, wanted) {
+  const keep = new Set(wanted);
+  for (const n of [...parent.children]) if (!keep.has(n)) n.remove();
+  wanted.forEach((n, i) => {
+    if (parent.children[i] !== n) parent.insertBefore(n, parent.children[i] ?? null);
+  });
 }
 
 function renderFilterStrip(matched, total, searching) {
@@ -140,20 +151,44 @@ function renderTrafficTabs(everything) {
   }
 }
 
-function row(f) {
-  const tr = document.createElement("tr");
-  if (f.id === ui.sel) tr.classList.add("sel");
-  if (f.intercepted) tr.classList.add("held");
-  if (f.faulted) tr.classList.add("faulted");
-  tr.onclick = () => select(f.id);
-  // Right-click is where everything that acts on one flow lives, so the toolbar
-  // does not grow a button per feature.
-  tr.oncontextmenu = (e) => {
-    e.preventDefault();
-    select(f.id);
-    openMenu(e.clientX, e.clientY, f);
-  };
+// One <tr> per flow id, kept across renders and updated in place, so the row under
+// the pointer is the same element from mousedown to mouseup.
+const rowEls = new Map();
 
+// Everything a row draws. A `ws.message` bumps ws_frames on the same summary
+// object, so identity alone cannot say whether a row changed.
+const rowSig = (f) => [f.method, statusText(f), statusClass(f), f.host, f.port, f.path,
+  f.ws, f.ws_frames, f.ctype, f.resp_bytes, f.req_bytes, f.ms, f.streamed, f.replay_of,
+  f.is_replay, f.faulted, f.http_version].join("\u0001");
+
+function rowFor(f) {
+  let tr = rowEls.get(f.id);
+  if (!tr) {
+    tr = document.createElement("tr");
+    for (let i = 0; i < 7; i++) tr.append(document.createElement("td"));
+    tr.onclick = () => select(tr.flow.id);
+    // Right-click is where everything that acts on one flow lives, so the toolbar
+    // does not grow a button per feature.
+    tr.oncontextmenu = (e) => {
+      e.preventDefault();
+      select(tr.flow.id);
+      openMenu(e.clientX, e.clientY, tr.flow);
+    };
+    rowEls.set(f.id, tr);
+  }
+  tr.flow = f;
+  tr.classList.toggle("sel", f.id === ui.sel);
+  tr.classList.toggle("held", !!f.intercepted);
+  tr.classList.toggle("faulted", !!f.faulted);
+  const sig = rowSig(f);
+  if (tr.dataset.sig !== sig) {
+    tr.dataset.sig = sig;
+    fillRow(tr, f);
+  }
+  return tr;
+}
+
+function fillRow(tr, f) {
   const port = f.port !== 80 && f.port !== 443 ? `:${f.port}` : "";
   const cells = [
     [f.method, "c-m"],
@@ -164,7 +199,11 @@ function row(f) {
     [fmtBytes(f.resp_bytes || f.req_bytes || 0), "c-n"],
     [f.ms == null ? "" : `${f.ms}ms`, "c-n"],
   ];
-  for (const [text, cls] of cells) tr.append(el("td", cls, text));
+  // The cells stay, only their content changes: a press on one survives an update.
+  cells.forEach(([text, cls], i) => {
+    tr.children[i].className = cls;
+    tr.children[i].textContent = text;
+  });
   if (f.streamed) tr.children[5].append(el("span", "tag tag-streamed", "streamed"));
   if (f.replay_of || f.is_replay) tr.children[0].append(el("span", "tag tag-replay", "replay"));
   // Never silent: an unlabelled injected failure is an hour of debugging a rule
@@ -177,7 +216,6 @@ function row(f) {
   if (f.http_version && f.http_version.includes("2")) {
     tr.children[4].append(el("span", "tag tag-h2", "h2"));
   }
-  return tr;
 }
 
 // ---------------------------------------------------------------- filter strip
