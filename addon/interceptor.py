@@ -4,9 +4,10 @@ Run:  ./run.sh          (mitmdump -s addon/interceptor.py)
 
 Interception itself is the built-in `Intercept` addon's job -- we set
 `ctx.options.intercept` to a filter expression and it handles HTTP requests and
-responses, WebSocket messages, TCP, UDP and DNS, including the `is_replay`
-guard. This addon owns the half that is actually ours: what to store, what to
-show, and how to resume with edits.
+responses and WebSocket messages, including the `is_replay` guard. (It could
+hold TCP, UDP and DNS too; `_compose` keeps them out, because nothing here can
+show or release them.) This addon owns the half that is actually ours: what to
+store, what to show, and how to resume with edits.
 """
 
 from __future__ import annotations
@@ -549,13 +550,15 @@ class Interceptor:
                 total += sum(len(m.content) for m in msgs[counted:])
                 self.ws_seen[flow.id] = (len(msgs), total)
             size += total
-        before = set(self.store) if self.ws_seen else None
+        evicted = self.store.evicted
         self.store.put(flow, size, summary(flow), ctx.options.store_bytes)
         # Frame cursors for flows the store just evicted would otherwise leak for
-        # the life of the process, and a recycled id would resume mid-count.
-        if before is not None:
-            for gone in before - set(self.store):
-                self.ws_seen.pop(gone, None)
+        # the life of the process, and a recycled id would resume mid-count. Only
+        # after an eviction, and only over the cursors: diffing set(self.store) on
+        # every call cost 9ms a call at 100k stored flows, on the proxy's loop.
+        if self.store.evicted != evicted:
+            for gone in [fid for fid in self.ws_seen if fid not in self.store]:
+                del self.ws_seen[gone]
         return True
 
     def _push_flow(self, flow) -> None:
@@ -626,8 +629,12 @@ class Interceptor:
 
         Skipped for replays too. Repeating a request to compare it against the
         original is not the moment to have it broken underneath you.
+
+        And for flows that are not live: opening a session replays every saved
+        flow through this hook, and a rule armed today must not rewrite what was
+        captured yesterday. mitmproxy's own modify_body skips them the same way.
         """
-        if not self.faults or flow.intercepted or flow.is_replay:
+        if not self.faults or flow.intercepted or flow.is_replay or not flow.live:
             return
         if self._off_list(flow):
             return
@@ -660,7 +667,10 @@ class Interceptor:
         # Frames are pushed straight to the UI rather than through _remember, so
         # the host list has to be honoured here too or an excluded `ws://` socket
         # would keep streaming rows into a table that claims to show one host.
+        # Released, not just skipped: Intercept may have caught the frame (see
+        # _maybe_pause), and a frame nothing will ever show must not wait.
         if self._is_noise(flow) or self._off_list(flow):
+            flow.resume()
             return
         msg = flow.websocket.messages[-1]
         self._remember(flow)
@@ -676,6 +686,10 @@ class Interceptor:
         self._maybe_pause(flow, "websocket")
 
     def websocket_end(self, flow: http.HTTPFlow) -> None:
+        # Re-store it: a closed socket is finished, so this is where it goes to disk
+        # and leaves RAM. Pushing alone left every closed socket's frames in memory
+        # for the life of the process, and its stored summary saying "open".
+        self._remember(flow)
         self._push_flow(flow)
 
     def error(self, flow) -> None:
@@ -710,6 +724,13 @@ class Interceptor:
             # to the table, so every loaded row rendered as "held" with an empty
             # queue. Clear the flag on the way out; resume() on a flow with no
             # waiter is a no-op.
+            flow.resume()
+            return
+        if self._off_list(flow):
+            # The Hosts list is not in the Intercept filter: quoting a regex into
+            # `~d "..."` strips its backslashes, and `~d` matches the host where
+            # the list means host:port. Two predicates disagreed both ways, so
+            # _off_list is the only one -- what the table never shows never stops.
             flow.resume()
             return
         listening = self.bridge is not None and bool(self.bridge.clients)
@@ -903,21 +924,12 @@ class Interceptor:
 
     # ------------------------------------------------------------ mode
 
-    @staticmethod
-    def _host_filter() -> str:
-        """The host list as a flow filter, so Intercept stops nothing outside it.
-
-        Without this the list would hide a host from the table while still holding
-        its requests -- a browser stalled on a queue you cannot see, because the
-        rows explaining it were filtered out. Quoted for the same reason the noise
-        filter is: the regex's own parentheses must not read as filter grouping.
-        """
-        hosts = [h.strip() for h in ctx.options.allow_hosts if h.strip()]
-        return f'~d "({"|".join(hosts)})"' if hosts else ""
-
     def _compose(self) -> str:
         # "~all" refuses to compose with "&" in mitmproxy's filter grammar, so an
-        # empty scope degrades to whatever other terms exist, or to ~all alone.
+        # empty scope adds no term at all. ~http always leads: this addon shows and
+        # releases HTTP flows (WebSockets included) and nothing else, so a TCP or
+        # UDP message Intercept caught would wait forever. The `~d` host term used
+        # to exclude those by accident whenever a host list was set.
         #
         # The space before the closing paren is load-bearing, not a typo. An
         # argument-less filter is built as `Literal("~websocket") + WordEnd()`, and
@@ -926,14 +938,16 @@ class Interceptor:
         # fine, and every argument-less filter (~q ~s ~a ~e ~all ~http ~websocket
         # ~tcp ~udp ~dns ~marked ~replay) was unusable as a scope. A space is enough
         # to satisfy WordEnd. The parens themselves have to stay: "&" binds tighter
-        # than "|", so an ungrouped "~u /a | ~u /b" would put the noise and host
-        # filters on the second branch only. units_scope_atoms covers both halves.
+        # than "|", so an ungrouped "~u /a | ~u /b" would put the noise filter on
+        # the second branch only. units_scope_atoms covers both halves.
+        #
+        # The Hosts list is deliberately not a term here; _maybe_pause applies it.
         terms = [
+            "~http",
             f"({self.scope} )" if self.scope else "",
             NOISE_FILTER if ctx.options.hide_noise else "",
-            self._host_filter(),
         ]
-        return " & ".join(t for t in terms if t) or "~all"
+        return " & ".join(t for t in terms if t)
 
     def _set_mode(self, mode: str, scope: str | None = None) -> None:
         if mode not in MODES:
@@ -1079,7 +1093,7 @@ class Interceptor:
         elif kind == "export":
             self._export(msg.get("id"), msg.get("format", "curl"))
         elif kind == "har.save":
-            self._save_har()
+            await self._save_har()
         elif kind == "faults.set":
             self._set_faults(list(msg.get("faults") or []))
         elif kind == "clear":
@@ -1103,7 +1117,7 @@ class Interceptor:
         elif kind == "sessions.list":
             self._push_sessions()
         elif kind == "session.save":
-            self._save_session()
+            await self._save_session()
         elif kind == "session.load":
             await self._load_session(msg.get("name", ""))
         elif kind == "replay":
@@ -1142,7 +1156,7 @@ class Interceptor:
                               "mtime": stat.st_mtime})
         self.bridge.push("sessions", items=items, dir=str(SESSIONS))
 
-    def _save_session(self) -> None:
+    async def _save_session(self) -> None:
         from mitmproxy import io as mitm_io
 
         if not self.store:
@@ -1156,13 +1170,19 @@ class Interceptor:
         # 0600 before the first flow lands, not after the last one: this is
         # decrypted traffic with cookies and bearer tokens in it, and chmod-after
         # left the whole dump readable by any local user while it was being written.
+        count = 0
         with os.fdopen(_open_private(path), "wb") as fh:
             writer = mitm_io.FlowWriter(fh)
             # Streamed one at a time: the store can hold far more than fits in RAM.
+            # And the loop gets a turn every 50 flows, so a long save never stalls
+            # the proxy -- which also means flows can arrive mid-save, so count.
             for flow in self.store.iter_flows():
                 writer.add(flow)
-        logging.log(ALERT, f"saved {len(self.store)} flow(s) -> sessions/{name}")
-        self.bridge.push("saved", name=name, flows=len(self.store))
+                count += 1
+                if count % 50 == 0:
+                    await asyncio.sleep(0)
+        logging.log(ALERT, f"saved {count} flow(s) -> sessions/{name}")
+        self.bridge.push("saved", name=name, flows=count)
         self._push_sessions()
 
     async def _load_session(self, name: str) -> None:
@@ -1214,7 +1234,7 @@ class Interceptor:
             return
         self.bridge.push("export", id=fid, format=fmt, text=text)
 
-    def _save_har(self) -> None:
+    async def _save_har(self) -> None:
         """Every captured flow as a HAR file in sessions/.
 
         A file rather than a download: a HAR of a real session is tens of
@@ -1223,7 +1243,7 @@ class Interceptor:
         user has open. Same destination and same 0600 treatment as a session dump.
         """
         try:
-            name, size = write_har(self.store.iter_flows(), SESSIONS, _open_private)
+            name, size = await write_har(self.store.iter_flows(), SESSIONS, _open_private)
         except Exception as e:
             self.bridge.push("error", message=f"HAR export failed: {e}")
             return
@@ -1307,7 +1327,7 @@ class Interceptor:
         logging.log(ALERT, f"{len(body)} body + {len(headers)} header rule(s) active{streamed_note}")
         self._push_state()
 
-    # ------------------------------------------------------------ decrypt scope
+    # ------------------------------------------------------------ host list
 
     def _set_hosts(self, hosts: list[str]) -> None:
         """Capture only these hosts. One list, three effects:
@@ -1320,22 +1340,17 @@ class Interceptor:
         * `_off_list` keeps unlisted flows out of the store, so plain HTTP and
           `ws://` obey the list too. `allow_hosts` alone governs TLS only, which
           made the list a half-truth for everything unencrypted.
-        * `_host_filter` folds it into the intercept expression, so nothing off
-          the list is ever held. Filtering the table while still pausing those
+        * `_maybe_pause` releases what `_off_list` excludes, so nothing off the
+          list is ever held. Filtering the table while still pausing those
           requests would stall the browser against an invisible queue.
+
+        Patterns match `host:port`, as mitmproxy's own `allow_hosts` does.
 
         Not a security control. An unlisted host is not blocked -- it reaches the
         client untouched, it is merely not shown here.
         """
         cleaned = [h.strip() for h in hosts if h.strip()]
         for pattern in cleaned:
-            # The pattern is embedded in a quoted flowfilter term, so a quote of
-            # its own would break out of it and compose something else entirely.
-            if '"' in pattern:
-                self.bridge.push(
-                    "error",
-                    message=f"host pattern {pattern!r} cannot contain a double quote.")
-                return
             try:
                 re.compile(pattern)
             except re.error as e:
@@ -1348,16 +1363,10 @@ class Interceptor:
         previous = list(ctx.options.allow_hosts)
         try:
             ctx.options.update(allow_hosts=cleaned)
-            # The list also becomes part of the intercept expression, so a pattern
-            # that parses as a regex but not as a filter term must not be stored.
-            if self.mode == "intercept":
-                flowfilter.parse(self._compose())
         except Exception as e:
             ctx.options.update(allow_hosts=previous)
             self.bridge.push("error", message=f"host list rejected: {e}")
             return
-        if self.mode == "intercept":
-            self._set_mode("intercept")   # the filter has to be re-armed
         # TLS termination is chosen when a connection's next layer is picked, so
         # the tunnelling half applies to new connections only; the storage half
         # applies to every flow from here on.

@@ -10,8 +10,10 @@ import { send } from "./transport.js";
 // <sep><filter><sep><find><sep><replace>. Nobody should have to type that, and a
 // separator that also appears in the pattern is the most common way to get it
 // wrong -- so the form owns the syntax and picks a separator that appears in
-// neither the filter nor the find text. It may appear in the replacement:
-// parse_spec splits with maxsplit=2, so the tail is taken whole.
+// neither the filter nor the find text. It may appear in the replacement only
+// when there is a filter: parse_spec splits with maxsplit=2, so the tail of a
+// three-part spec is taken whole, but a two-part spec has no tail -- a separator
+// in its replacement turns `find` into a URL filter.
 const SEP_CANDIDATES = ["|", ":", "#", "@", "%", "^", "!", ";", ",", "+", "=", "~",
                         "/", "?", "*", "<", ">", "(", ")", "[", "]", "{", "}"];
 
@@ -23,7 +25,10 @@ function filterFor(r) {
   const terms = [];
   if (r.where === "req") terms.push("~q");
   if (r.where === "resp") terms.push("~s");
-  if ((r.url || "").trim()) terms.push("~u " + r.url.trim());
+  // Quoted, with \ and " escaped. Bare, the filter grammar reads the regex's own
+  // ( | ) as filter syntax -- /api/v(1|2)/x matched /api/v9/x1 -- and quoted
+  // without escaping, the quote parser strips every backslash.
+  if ((r.url || "").trim()) terms.push(`~u "${r.url.trim().replace(/[\\"]/g, "\\$&")}"`);
   return terms.join(" & ");
 }
 
@@ -32,7 +37,7 @@ export function composeRule(r) {
   const find = r.find || "";
   if (!find.trim()) return null;          // nothing to look for
   const filt = filterFor(r);
-  const sep = pickSep(filt, find);
+  const sep = pickSep(filt, find, filt ? "" : r.repl);
   if (!sep) return null;                  // every candidate occurs in the input
   const repl = r.repl || "";
   return filt ? sep + filt + sep + find + sep + repl
@@ -58,13 +63,14 @@ export function ruleFromSpec(spec) {
   const parts = splitSpec(spec);
   if (!parts) return { where: "both", url: "", find: "", repl: "", raw: spec };
   const f = parts.filter.trim();
-  const m = f.match(/^(?:(~q|~s)\s*(?:&\s*)?)?(?:~u\s+(\S+))?$/);
+  // `~u "..."` is what filterFor writes; a bare `~u x` is what older rules hold.
+  const m = f.match(/^(?:(~q|~s)\s*(?:&\s*)?)?(?:~u\s+(?:"((?:[^"\\]|\\.)*)"|([^\s"]\S*)))?$/);
   if (f && !m) return { where: "both", url: "", find: "", repl: "", raw: spec };
   let where = "both", url = "";
   if (m) {
     if (m[1] === "~q") where = "req";
     if (m[1] === "~s") where = "resp";
-    url = m[2] || "";
+    url = m[2] != null ? m[2].replace(/\\(.)/g, "$1") : m[3] || "";
   }
   return { where, url, find: parts.find, repl: parts.repl, raw: null };
 }

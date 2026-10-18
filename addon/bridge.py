@@ -21,6 +21,7 @@ import json
 import logging
 import secrets
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 from pathlib import Path
 from urllib.parse import parse_qs
 
@@ -31,6 +32,20 @@ from websockets.http11 import Response
 # One batched frame per tick. A single page load is 300-500 flows; one WS frame
 # each melts the UI.
 FLUSH_INTERVAL = 0.05
+
+# Answers to one client's command. They go to that client alone: broadcast, an
+# agent's `hello` wiped the human's unsent edits (the UI resets on `snapshot`) and
+# its `export` landed in the human's clipboard. Everything else -- flows, holds,
+# frames, state, cleared, loaded -- is the shared picture and goes to everyone.
+REPLIES = frozenset({"snapshot", "body", "frames", "results", "export",
+                     "sessions", "saved", "har", "error"})
+
+# The connection whose command is being handled. A ContextVar because each
+# connection's handler is its own asyncio task: a command that awaits (a session
+# load) cannot have its replies misrouted by another client's command meanwhile.
+# Outside any command (a hook, mitmproxy's own command line) there is no
+# requester, and a reply-type message is broadcast.
+_requester: ContextVar[ServerConnection | None] = ContextVar("requester", default=None)
 
 CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -60,7 +75,7 @@ class Bridge:
         self.on_message = on_message
         self.on_last_client_gone = on_last_client_gone
         self.clients: set[ServerConnection] = set()
-        self._out: list[dict] = []
+        self._out: list[tuple[ServerConnection | None, dict]] = []  # (to, msg); None = all
         self._server = None
         self._flusher: asyncio.Task | None = None
 
@@ -133,6 +148,7 @@ class Bridge:
 
     async def _handle(self, conn: ServerConnection) -> None:
         self.clients.add(conn)
+        _requester.set(conn)  # this task only: see REPLIES
         try:
             async for raw in conn:
                 try:
@@ -157,7 +173,8 @@ class Bridge:
                 self.on_last_client_gone()
 
     def push(self, type_: str, **payload) -> None:
-        self._out.append({"type": type_, **payload})
+        to = _requester.get() if type_ in REPLIES else None
+        self._out.append((to, {"type": type_, **payload}))
 
     async def _flush_loop(self) -> None:
         while True:
@@ -165,13 +182,16 @@ class Bridge:
             if not self._out:
                 continue
             batch, self._out = self._out, []
-            if not self.clients:
-                continue  # nothing listening; a fresh client gets a full snapshot
-            try:
-                data = json.dumps(batch, default=str)
-            except (TypeError, ValueError) as e:
-                logging.warning(f"bridge: undeliverable batch dropped: {e}")
-                continue
-            await asyncio.gather(
-                *(c.send(data) for c in tuple(self.clients)), return_exceptions=True
-            )
+            # Nothing listening sends nothing; a fresh client gets a full snapshot.
+            sends = []
+            for c in tuple(self.clients):
+                mine = [m for to, m in batch if to is None or to is c]
+                if not mine:
+                    continue
+                try:
+                    data = json.dumps(mine, default=str)
+                except (TypeError, ValueError) as e:
+                    logging.warning(f"bridge: undeliverable batch dropped: {e}")
+                    continue
+                sends.append(c.send(data))
+            await asyncio.gather(*sends, return_exceptions=True)

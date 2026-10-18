@@ -100,7 +100,9 @@
         <code>app.example.com</code>, <code>.*\.example\.com</code>. Leave it empty to
         capture every host, which is the default. To capture <em>nothing</em> and let all
         traffic straight through — what the old Passthrough mode did — use a pattern that
-        matches no host, such as <code>^$</code>.
+        matches no host, such as <code>^$</code>. Patterns are matched against
+        <code>host:port</code>, so an end anchor needs the port:
+        <code>^app\.example\.com:443$</code>.
       </p>
       <textarea id="hosts-list" rows="4" spellcheck="false" autocomplete="off"
                 placeholder="app.example.com&#10;api.example.com"></textarea>

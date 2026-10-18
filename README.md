@@ -138,7 +138,11 @@ api.example.com          # or one line:  .*\.example\.com
   shown, and never stopped in Intercept. This is not a security boundary.
 - Nothing off the list is ever **held**, either. A list that hid a host from the table
   while Intercept still paused its requests would stall the browser against a queue whose
-  rows were filtered out — so the list is folded into the pause filter as well.
+  rows were filtered out — so one check decides both: what is not shown is released the
+  moment Intercept catches it.
+- Patterns are matched against `host:port`, the way mitmproxy's own `allow_hosts` matches
+  them, so an end anchor needs the port: `^app\.example\.com:443$`, not
+  `^app\.example\.com$` (which matches nothing).
 - To capture **nothing** — what Passthrough used to do — use a pattern that matches no
   host, such as `^$`. Verified equivalent: both leave zero flows captured while the
   request still returns 200.
@@ -755,7 +759,7 @@ Also:
 
 ```bash
 .venv/bin/python spike/spike.py --chrome --net    # browser + network reality   4/4
-.venv/bin/python spike/check.py                   # units + end-to-end        70/70
+.venv/bin/python spike/check.py                   # units + end-to-end        79/79
 ```
 
 Both are safe to run while a real instance is up — separate ports (`18xxx`/`19000`), their
@@ -780,10 +784,12 @@ included, each counted exactly once so a long-lived socket stays O(1) per frame 
 than O(n²)), the streaming cutoff, WebSocket frame editing, truncation refusal and
 injection, a socket being classified from its handshake rather than its upgrade (and an
 `h2c` upgrade not being dragged in with it), body and header rewrite rules, the host list
-(validation, and that it covers HTTP, HTTPS and WebSocket alike and reaches the pause
-filter), the scope filter (every argument-less filter usable as a scope, an OR scope still
-grouped so the noise and host terms cannot land on one branch, and rules syntax in the
-filter box still refused), the repeater, session save/open including a
+(validation, that it covers HTTP, HTTPS and WebSocket alike, and that storing and holding
+agree on it — a `\d` pattern's hosts held, an off-list flow or frame released, a raw TCP
+or UDP message never caught, since nothing here could release one), the scope
+filter (every argument-less filter usable as a scope, an OR scope still grouped so the
+noise term cannot land on one branch, and rules syntax in the filter box still refused),
+the repeater, session save/open including a
 full-restart round trip, file modes at creation time under a permissive umask, and the
 loopback guard — every entry path including `--mode` specs, without ever opening a public
 socket to prove it.
@@ -797,10 +803,19 @@ everything; **content views** producing a rendering *beside* the exact bytes wit
 and `raw` untouched; **copy as curl** producing a command carrying method, URL, header and
 body; and the **one-shot reply hold** arming, holding exactly one reply, and disarming.
 
-Four units also run shipped frontend functions under `node`: the rule form's compose/parse
+And the fixes from a review, one check each: a **fault rule never rewriting a flow loaded
+from a session**; a **closed WebSocket** going to disk, leaving RAM and summarised as closed;
+**storing a flow never walking the whole store**; **replies reaching only the client that
+sent the command**, with two real clients on a real bridge; **HAR export streaming** — no
+more than a couple of flows alive at once, and the event loop running meanwhile; a rule's
+**replacement containing the separator** without changing the rule; and a **URL regex
+meaning what it says** — `(1|2)`, `\.`, `$` — in rules and faults alike.
+
+Five units also run shipped frontend functions under `node`: the rule form's compose/parse
 pair from `ui/rules.js` (every spec it generates is fed to mitmproxy's real
-`parse_modify_spec`), the row filter from `ui/table.js` (text, regex, case-insensitivity,
-invalid-regex fallback), the editor's pretty-printer from `ui/util.js` and `ui/detail.js`
+`parse_modify_spec`), the row filter and the row sync from `ui/table.js` (text, regex,
+case-insensitivity, invalid-regex fallback; a row that stays on screen is never detached,
+which is what lost clicks under traffic), the editor's pretty-printer from `ui/util.js` and `ui/detail.js`
 (headers byte-identical, non-JSON and CRLF bodies untouched, and a blank line inside a
 body never mistaken for the header separator), and the repeater's burst clamp from
 `ui/detail.js` (negatives, blanks, junk and absurd numbers all landing somewhere sane, and

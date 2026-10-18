@@ -29,7 +29,10 @@ export function renderDetail() {
   if (h) key = `edit:${h.id}:${h.direction}`;
   else if (f && ui.which === "frames") key = `frames:${f.id}`;
   else if (f && ui.which === "repeat") key = `repeat:${f.id}`;
-  if (key && box.dataset.key === key) {
+  else if (f) key = messageKey(f);
+  // The Request/Response view's data is a detail object, replaced whole on refetch.
+  const d = f && !h ? details.get(`${f.id}:${ui.which}`) : undefined;
+  if (key && box.dataset.key === key && box.detail === d) {
     if (key.startsWith("frames:")) appendNewFrames(box, f);
     // Same reasoning as frames: the send history grows while the editor above it
     // is being typed into, so it is refreshed on its own rather than by rebuilding
@@ -38,6 +41,7 @@ export function renderDetail() {
     return;
   }
   box.dataset.key = key;
+  box.detail = d;
   box.dataset.lastSeq = "-1";
   box.textContent = "";
   // The editing layout makes the pane a flex column that does not scroll; every
@@ -48,6 +52,15 @@ export function renderDetail() {
   if (ui.which === "frames") return renderFrames(box, f);
   if (ui.which === "repeat") return renderRepeat(box, f);
   renderMessage(box, f);
+}
+
+// Everything the Request/Response view draws besides the detail object, so it is
+// rebuilt only when one of them changes. Rebuilt on every tick, it wiped any text
+// selection in a body within a quarter of a second while traffic flowed.
+function messageKey(f) {
+  const o = f.replay_of ? getFlow(f.replay_of) : null;
+  return `msg:${f.id}:${ui.which}:${f.faulted || ""}:`
+    + [f.status, f.resp_bytes, f.ms, o?.status, o?.resp_bytes, o?.ms].join(",");
 }
 
 function renderMessage(box, f) {
