@@ -1,0 +1,30 @@
+name: check
+
+# push only for main: a push to a PR branch already runs as pull_request, and
+# triggering on both ran every check twice.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    # The suite takes ~20s and bounds its own waits; this only stops a wedged run
+    # from holding the check open for GitHub's default six hours.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      # The README's setup, verbatim. 3.13 exactly: mitmproxy 12.2.3 has no 3.14 wheels.
+      - run: uv venv --python 3.13 .venv && uv pip install --python .venv/bin/python -r requirements.txt
+      # Offline: loopback ports only, plus the node and curl both images ship.
+      # spike/spike.py is deliberately absent -- it needs Chrome and the internet.
+      - run: .venv/bin/python spike/check.py
