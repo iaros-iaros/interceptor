@@ -1,6 +1,11 @@
 name: check
 
-on: [push, pull_request]
+# push only for main: a push to a PR branch already runs as pull_request, and
+# triggering on both ran every check twice.
+on:
+  push:
+    branches: [main]
+  pull_request:
 
 permissions:
   contents: read
