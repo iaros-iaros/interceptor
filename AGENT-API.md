@@ -98,7 +98,8 @@ class Client:
 ### 2. There are no correlation IDs, and `state` is also pushed on a timer
 
 Nothing echoes back a request id. You match replies by `type`, and for flow-specific
-replies by the `id` field inside them.
+replies by the `id` field inside them. Replies come to you alone, but `state` goes to
+every client — see [who receives what](#messages-from-the-server).
 
 `state` is the trap: it is pushed after most commands **and** once a second whenever
 traffic is flowing. "The next `state` I see" is not "the reply to my command" — it may
@@ -164,7 +165,7 @@ not close the connection.
 
 | Command | Payload | Effect |
 |---|---|---|
-| `hello` | — | Server replies `snapshot` + `state`. Send it first, and again any time you want a fresh snapshot. |
+| `hello` | — | Server replies `snapshot` (to you) + `state`. Send it first, and again any time you want a fresh snapshot. |
 | `clear` | — | Wipe the store. Replies `cleared` + `state`. Also resets the noise and auto-forward counters. |
 
 ### Mode and scope
@@ -345,7 +346,7 @@ client under test waits forever.
 
 | Command | Payload | Effect |
 |---|---|---|
-| `hosts.set` | `hosts`: list of regexes | Capture only these. `[]` captures everything. No double quotes in a pattern. |
+| `hosts.set` | `hosts`: list of regexes | Capture only these. `[]` captures everything. Patterns match `host:port`, so an end anchor needs the port: `^api\.example\.com:443$`. |
 | `opt.set` | `intercept_responses`: bool, `hide_noise`: bool | Either or both. |
 | `session.save` | — | Dump the capture to `sessions/<timestamp>.mitm`. Replies `saved`. |
 | `session.load` | `name` | Replace the capture with a saved one. Replies `loaded`. |
@@ -377,6 +378,15 @@ token-gated, so serving a capture there would publish it to any page the user ha
 | `export` | Reply to `export` | `id`, `format`, `text` |
 | `har` / `saved` / `loaded` / `sessions` / `cleared` | their commands | `name`, `bytes`, `flows`, `items`, `dir` |
 | `error` | Anything rejected | `message`, sometimes `id` |
+
+**Who receives what.** Replies — `snapshot`, `body`, `frames`, `results`, `export`,
+`sessions`, `saved`, `har` and `error` — go only to the client whose command caused
+them, so an agent's `hello` or `export` never reaches the human's tab. Everything else
+is the shared picture and goes to every connected client: `flow`, `flow.paused`,
+`ws.message`, `state`, `cleared` and `loaded`. Two consequences: `state` moves when
+*another* client changes something, and any client's `hello` re-sends `flow.paused` to
+everyone for what is still held — treat a repeat for an id you already hold as a
+refresh, not a new hold.
 
 **`state`** is the whole control-panel picture and the thing to poll for confirmation:
 `mode`, `scope`, `queue` (what is held right now, with `id`/`direction`/`host`/`path`),
