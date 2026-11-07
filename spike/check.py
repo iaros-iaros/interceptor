@@ -3171,6 +3171,41 @@ def units_row_sync() -> None:
           "; ".join(bad) or f"{len(cases)} cases: prepend and no-op detach nothing")
 
 
+async def units_har_import() -> None:
+    """A HAR exported here (or from devtools) opens as a session: the suffix is
+    accepted, traversal is still refused, and FlowReader round-trips the flow."""
+    import tempfile
+    import interceptor as I
+    from mitmproxy import io as mitm_io
+    from mitmproxy.addons import savehar
+    from mitmproxy.test import taddons, tflow
+    from exporters import write_har
+
+    addon = I.Interceptor()
+    notes = []
+    saved = I.SESSIONS
+    with tempfile.TemporaryDirectory() as tmp, taddons.context(addon, savehar.SaveHar()):
+        d = Path(tmp)
+        f = tflow.tflow(resp=True)
+        f.request.path = "/api/x"
+        name, _ = await write_har([f], d, I._open_private)
+        I.SESSIONS = d
+        try:
+            if addon._session_path(name) is None:
+                notes.append(f".har name {name!r} was rejected by _session_path")
+            if addon._session_path("../escape.har") is not None:
+                notes.append("a traversal .har path was accepted")
+            with (d / name).open("rb") as fh:
+                flows = list(mitm_io.FlowReader(fh).stream())
+            paths = [getattr(fl, "request", None) and fl.request.path for fl in flows]
+            if "/api/x" not in paths:
+                notes.append(f"HAR did not round-trip the flow: {paths}")
+        finally:
+            I.SESSIONS = saved
+    check("a HAR file opens as a session", not notes,
+          "; ".join(notes) or "suffix accepted, traversal refused, flow round-tripped")
+
+
 async def units_har_stream() -> None:
     """HAR export has to stream. It built the whole store into one list, one dict
     and one JSON string -- several GB at the default 2GB cap -- while the proxy's
@@ -3280,6 +3315,7 @@ async def main() -> int:
     await units_clear_keeps_held()
     await units_reply_routing()
     await units_har_stream()
+    await units_har_import()
     await integration()
     await restart_and_load()
     cleanup_saved_session()

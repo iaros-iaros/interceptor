@@ -596,7 +596,9 @@ findings.
 
 **Save session** writes every flow the engine still has stored — which can be more than
 the rows on screen — to `sessions/<timestamp>.mitm`. **Open session** lists that folder and
-loads one back, replacing what is on screen.
+loads one back, replacing what is on screen. The list includes **`.har`** files too — a
+HAR exported here or captured in another tool's devtools opens straight into the table and
+the Repeater, because mitmproxy reads HAR as readily as its own format.
 
 No session is ever written for you. The `sessions/` folder isn't created until your first
 save, and closing Interceptor mid-session discards the capture — a fresh instance always

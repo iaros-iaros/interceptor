@@ -1235,14 +1235,19 @@ class Interceptor:
         if not name or "/" in name or "\\" in name or name.startswith("."):
             return None
         path = (SESSIONS / name).resolve()
-        if not path.is_relative_to(SESSIONS.resolve()) or path.suffix != ".mitm":
+        # .har too: FlowReader sniffs a HAR by its leading `{` and reads it, so a
+        # devtools capture -- or one this tool exported into the same folder --
+        # reopens here. Our own HAR exports land in sessions/, so they show up in
+        # the picker alongside .mitm dumps.
+        if not path.is_relative_to(SESSIONS.resolve()) or path.suffix not in (".mitm", ".har"):
             return None
         return path
 
     def _push_sessions(self) -> None:
         items = []
         if SESSIONS.is_dir():
-            for path in sorted(SESSIONS.glob("*.mitm"), reverse=True):
+            both = [*SESSIONS.glob("*.mitm"), *SESSIONS.glob("*.har")]
+            for path in sorted(both, key=lambda p: p.stat().st_mtime, reverse=True):
                 stat = path.stat()
                 items.append({"name": path.name, "bytes": stat.st_size,
                               "mtime": stat.st_mtime})

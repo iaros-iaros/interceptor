@@ -362,7 +362,7 @@ client under test waits forever.
 | `hosts.set` | `hosts`: list of regexes | Capture only these. `[]` captures everything. Patterns match `host:port`, so an end anchor needs the port: `^api\.example\.com:443$`. |
 | `opt.set` | `intercept_responses`: bool, `hide_noise`: bool | Either or both. |
 | `session.save` | — | Dump the capture to `sessions/<timestamp>.mitm`. Replies `saved`. |
-| `session.load` | `name` | Replace the capture with a saved one. Replies `loaded`. |
+| `session.load` | `name` | Replace the capture with a saved `.mitm` or `.har` file from `sessions/`. Replies `loaded`. |
 | `sessions.list` | — | Replies `sessions`. |
 | `har.save` | — | Write the whole capture as HAR into `sessions/`. Replies `har`. |
 | `browser.launch` | — | Launch throwaway-profile Chrome wired to the proxy. Rarely what a headless agent wants. |
