@@ -9,7 +9,7 @@ process. See README.md.
 **If you are here to *use* Interceptor rather than change it — to capture, rewrite, fault
 or intercept traffic from a script or an agent — read [AGENT-API.md](AGENT-API.md)
 first.** It is the whole control protocol: how to start headless, how to authenticate,
-the twenty commands, the payload shapes, and the five behaviours that will otherwise cost
+the commands, the payload shapes, and the behaviours that will otherwise cost
 you an hour each. Do not reverse-engineer the protocol from `ui/`.
 
 Start: `IC_OPEN_UI=false interceptor`, read the token from `.ui-url`, connect to

@@ -735,7 +735,7 @@ Repeat is hidden for WebSocket flows — mitmproxy's client replay refuses them.
 
 Everything above is reachable from a script or an AI agent — the UI has no privileged
 path, it is a WebSocket client like any other. Start with `IC_OPEN_UI=false`, read the
-token from `.ui-url`, and speak the same twenty commands the browser does.
+token from `.ui-url`, and speak the same commands the browser does.
 
 The protocol, the payloads, and the traps are in **[AGENT-API.md](AGENT-API.md)**.
 
@@ -903,7 +903,7 @@ Also:
 
 ```bash
 .venv/bin/python spike/spike.py --chrome --net    # browser + network reality   4/4
-.venv/bin/python spike/check.py                   # units + end-to-end        79/79
+.venv/bin/python spike/check.py                   # units + end-to-end      103/103
 ```
 
 Both are safe to run while a real instance is up — separate ports (`18xxx`/`19000`), their

@@ -1,7 +1,7 @@
 # Driving Interceptor from an agent
 
 Everything the UI can do, an agent can do. There is no privileged path: the browser
-UI is a WebSocket client like any other, and the twenty commands below are the whole
+UI is a WebSocket client like any other, and the commands below are the whole
 surface. This document is that surface, written for a program rather than a person.
 
 Every command and payload here was exercised against a running instance — see
