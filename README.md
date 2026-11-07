@@ -447,6 +447,9 @@ On forward:
 - A multipart body comes back byte-for-byte when you edit only the headers — its CRLFs
   are what make the boundaries valid. Editing the **body** of a CRLF message does convert
   them to LF: a browser textarea cannot hold a CRLF. The editor warns when that applies.
+- A flow you forward with an edit is tagged **`edited`** in the table (on the method) and
+  noted in the detail pane, so a hand-tampered request is never later mistaken for one the
+  server or the app produced. A plain forward is not tagged.
 
 **Stop replies is off by default.** Left off, only the request stops and the reply
 comes back untouched. Turned on, the reply stops as well on its way to the browser, so a

@@ -212,6 +212,11 @@ function fillRow(tr, f) {
   });
   if (f.streamed) tr.children[5].append(el("span", "tag tag-streamed", "streamed"));
   if (f.replay_of || f.is_replay) tr.children[0].append(el("span", "tag tag-replay", "replay"));
+  if (f.edited?.length) {
+    const tag = el("span", "tag tag-edited", "edited");
+    tag.title = `You edited this by hand: ${f.edited.join(", ")}`;
+    tr.children[0].append(tag);
+  }
   // Never silent: an unlabelled injected failure is an hour of debugging a rule
   // you armed yourself.
   if (f.faulted) {

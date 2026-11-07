@@ -2611,6 +2611,64 @@ def units_export() -> None:
           "; ".join(notes) or f"{len(cmd)}B command with method, url, header and body")
 
 
+def units_edited_tag() -> None:
+    """A flow you edited by hand carries an `edited` tag, so a tester has an audit
+    trail of what was tampered with. A plain forward does not, a rejected edit does
+    not, and a repeater edit tags only the copy."""
+    import interceptor as I
+    from mitmproxy.test import taddons, tflow
+
+    addon = I.Interceptor()
+    notes = []
+    with taddons.context(addon):
+        addon.bridge = _Collect()
+        addon._push_state = lambda: None
+
+        def held_request():
+            f = tflow.tflow()
+            f.intercept()
+            addon.store.put(f, 1, I.summary(f), 10 * 1024 * 1024)
+            addon.paused[f.id] = ("request", f)
+            return f
+
+        # Forward with an edit → tagged.
+        a = held_request()
+        addon._resume(a.id, raw=I.raw_text(a, "request"))
+        if I.summary(a)["edited"] != ["request"]:
+            notes.append(f"edited forward not tagged: {I.summary(a)['edited']}")
+
+        # Forward with no raw → not tagged.
+        b = held_request()
+        addon._resume(b.id)
+        if I.summary(b)["edited"] is not None:
+            notes.append(f"plain forward tagged: {I.summary(b)['edited']}")
+
+        # A rejected edit leaves no tag (and the flow stays held).
+        c = held_request()
+        addon._resume(c.id, raw="GET /x HTTP/1.1\nnot-a-header-line\n\n")
+        if I.summary(c)["edited"] is not None:
+            notes.append(f"rejected edit tagged: {I.summary(c)['edited']}")
+        if c.id not in addon.paused:
+            notes.append("a rejected edit released the flow")
+
+        # Repeat tags the copy only, and inherited tags are dropped first.
+        captured = []
+        import mitmproxy.ctx as _ctx
+        _ctx.master.commands.call = lambda name, args: captured.extend(args)
+        orig = tflow.tflow(resp=True)
+        orig.metadata["edited"] = ["request"]      # as if it had been edited live
+        addon.store.put(orig, 1, I.summary(orig), 10 * 1024 * 1024)
+        addon.repeat(orig.id, raw=I.raw_text(orig, "request"))
+        clone = captured[0] if captured else None
+        if clone is None or I.summary(clone)["edited"] != ["request"]:
+            notes.append(f"repeat copy not tagged from its own edit: {clone and I.summary(clone)['edited']}")
+        if I.summary(orig)["edited"] != ["request"]:
+            notes.append("repeat mutated the original's edited tag")
+        addon.store.close()
+    check("hand-edited flows are tagged, plain and rejected ones are not", not notes,
+          "; ".join(notes) or "edit tagged, plain/rejected clean, repeat tags the copy only")
+
+
 async def units_annotations() -> None:
     """Mark and comment use mitmproxy's own flow fields, so `~marked`/`~comment`
     work as scopes and a saved session keeps them; and they survive the round trip
@@ -3171,6 +3229,7 @@ async def main() -> int:
     units_export()
     units_stop_reply()
     await units_diff()
+    units_edited_tag()
     await units_annotations()
     await units_clear_keeps_held()
     await units_reply_routing()

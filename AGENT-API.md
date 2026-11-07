@@ -416,7 +416,12 @@ because nothing was connected, or an edit was too large and closed the socket.
 **Summary** fields, on every row: `id`, `method`, `scheme`, `host`, `port`, `path`,
 `http_version`, `status`, `ctype`, `req_bytes`, `resp_bytes`, `start`, `ms`, `ws`,
 `ws_frames`, `ws_open`, `streamed`, `intercepted`, `killed`, `replay_of`, `is_replay`,
-`faulted`, `label`, `findings`, `marked`, `comment`.
+`faulted`, `label`, `findings`, `marked`, `comment`, `edited`.
+
+`edited` is a list naming the sides a human rewrote by hand before forwarding
+(`"request"`, `"response"`, or `"frame #N"`) — an audit trail, so a tampered flow is
+never mistaken for one the server produced. A replay's copy is tagged only for an edit
+made in the repeater, never for one it inherited from the original.
 
 `marked` (bool) and `comment` (string) are mitmproxy's own flow fields, set by
 `flow.mark` / `flow.comment`. Because they are the engine's own, `~marked` and

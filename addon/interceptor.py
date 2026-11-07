@@ -177,6 +177,9 @@ def summary(flow: http.HTTPFlow) -> dict:
         # and a saved session keeps them.
         "marked": bool(flow.marked),
         "comment": flow.comment,
+        # Which sides a human rewrote by hand before forwarding -- an audit trail,
+        # so a tampered flow is never mistaken for one the server produced.
+        "edited": flow.metadata.get("edited"),
     }
 
 
@@ -845,6 +848,7 @@ class Interceptor:
                     raise ValueError(f"binary frame must stay valid hex: {e}") from e
             else:
                 target.content = raw.encode()
+            flow.metadata.setdefault("edited", []).append(f"frame #{idx}")
             return
 
         which = "response" if direction == "response" else "request"
@@ -893,6 +897,9 @@ class Interceptor:
         for name, value in headers:
             msg.headers.add(name, value)
         msg.text = body
+        # Only reached when every step above succeeded -- a rejected edit raises
+        # before here, so a flow is tagged edited exactly when it really was.
+        flow.metadata.setdefault("edited", []).append(which)
 
     def _resume(self, fid: str | None, drop: bool = False, seq: int | None = None,
                 raw: str | None = None, stop_reply: bool = False) -> None:
@@ -1394,6 +1401,9 @@ class Interceptor:
             return
         clone = flow.copy()
         clone.metadata["replay_of"] = fid
+        # A copy inherits metadata, but "edited" on a replay must mean edited in the
+        # repeater, not something the original carried.
+        clone.metadata.pop("edited", None)
         if label:
             clone.metadata["label"] = label[:200]
         if raw:

@@ -80,6 +80,9 @@ function renderMessage(box, f) {
     : `${d.status} ${d.reason}`;
   box.append(el("p", "headline", line));
   if (f.comment) box.append(el("p", "comment-note", f.comment));
+  if (f.edited?.includes(ui.which)) {
+    box.append(el("p", "note", "You edited this by hand before it was forwarded."));
+  }
   if (f.faulted) {
     box.append(el("p", "note",
       `Interceptor produced this on purpose — ${f.faulted}. It did not come from the `
