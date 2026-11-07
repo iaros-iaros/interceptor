@@ -751,10 +751,39 @@ Everything else is a `--set` flag after `interceptor`:
 | `passthrough_hosts` | *(empty)* | The **Don't decrypt** list, also in the Hosts panel: regexes matched against `host:port` (and SNI). A match is tunnelled, never decrypted, and nothing of it is captured — for a certificate-pinned app. Burp's *TLS pass through*. Survives in `config.yaml`. |
 | `ignore_hosts` | *(empty)* | The inverse, and the one thing the Hosts list cannot express: tunnel *these* hosts and capture everything else — mitmproxy's equivalent of Burp's TLS pass through, for a certificate-pinned host that breaks under interception. Command line only; nothing in the UI writes it, so a value set here survives every mode switch. |
 | `intercept_responses` | `false` | Also stop replies. Same as the *Stop replies* toggle. |
+| `faults` | *(empty)* | Fault rules, one JSON object per entry (`{url, delay_ms, status, body, drop}`). Set from the UI or `config.yaml`; a bad one fails startup rather than arming nothing. |
 | `expose` | `false` | Permit binding off loopback. Without it, that is refused outright — see Security. |
 | `ssl_insecure` | `false` | Accept self-signed/expired certs on upstream targets. Commented out in `run.sh`. |
 | `map_local` | *(empty)* | Map-local rules, the **Serve a local file** block: `|url-regex|path` serves that file for a matching URL. Set from the UI or `config.yaml`. |
 | `anticache` | `false` | Strip `If-None-Match`/`If-Modified-Since` so a client cannot 304 out of being captured. Same as the **No cache** toggle. |
+
+### Keeping rules across restarts
+
+Every rule the UI sets is a mitmproxy option, so dropping them in
+`~/.mitmproxy/config.yaml` arms them at every launch — no UI, no scripting:
+
+```yaml
+# ~/.mitmproxy/config.yaml
+allow_hosts:
+  - "^app\\.example\\.com:443$"
+passthrough_hosts:
+  - "^accounts\\.example\\.com:443$"
+modify_body:
+  - "/~s/password/REDACTED"
+modify_headers:
+  - "/~q/x-test/1"
+map_local:
+  - "|/app\\.js|/tmp/patched.js"
+faults:
+  - '{"url": "/checkout", "status": 503}'
+intercept_responses: false
+hide_noise: true
+anticache: false
+```
+
+A malformed rule here fails startup with a clear message rather than coming up armed with
+something you cannot see. The in-UI panels read and write the same options, so a rule set
+in `config.yaml` shows up in the panel and vice versa.
 
 ### Behind a proxy or VPN client
 

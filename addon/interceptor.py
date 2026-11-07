@@ -17,6 +17,7 @@ import base64
 import difflib
 import hashlib
 import ipaddress
+import json
 import logging
 import os
 import re
@@ -27,6 +28,7 @@ import tempfile
 import time
 import webbrowser
 from collections import Counter, OrderedDict
+from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
 
@@ -381,11 +383,16 @@ class Interceptor:
         loader.add_option("expose", bool, False,
                           "Permit binding off loopback. Refused without this: it publishes an "
                           "open MITM proxy and a UI that rewrites traffic to the whole network.")
-        loader.add_option("passthrough_hosts", list, [],
+        loader.add_option("passthrough_hosts", Sequence[str], [],
                           "TLS pass-through list: regexes matched against host:port (and SNI). "
                           "A matching connection is tunnelled, never decrypted -- for a "
                           "certificate-pinned app that breaks under interception. Nothing of it "
                           "is captured. Burp's 'TLS pass through'.")
+        loader.add_option("faults", Sequence[str], [],
+                          "Fault rules, one JSON object per entry in the shape the UI sends "
+                          "({url, delay_ms, status, body, drop}). An option so that "
+                          "~/.mitmproxy/config.yaml and --set carry them across restarts, the "
+                          "way modify_body / modify_headers / allow_hosts already do.")
 
     def configure(self, updated) -> None:
         # Startup passes every option through here, so this fires before the UI
@@ -401,6 +408,15 @@ class Interceptor:
                     re.compile(pat)
                 except re.error as e:
                     raise exceptions.OptionsError(f"bad passthrough host {pat!r}: {e}")
+        if "faults" in updated:
+            # The option is the source of truth, so config.yaml and --set install
+            # rules the same way the UI does -- a bad one fails startup loudly
+            # rather than arming nothing in silence.
+            try:
+                specs = [json.loads(s) for s in ctx.options.faults]
+                self.faults = faultlib.parse_all(specs)
+            except (ValueError, TypeError, json.JSONDecodeError) as e:
+                raise exceptions.OptionsError(f"bad fault rule: {e}")
 
     @staticmethod
     def _check_bind() -> None:
@@ -1464,9 +1480,12 @@ class Interceptor:
             # than none, because you would be testing against rules you cannot see.
             self.bridge.push("error", message=str(e))
             return
-        self.faults = parsed
-        logging.log(ALERT, f"{len(parsed)} fault rule(s) active"
-                           + (f": {'; '.join(f.describe() for f in parsed)}" if parsed else ""))
+        # Persist through the option, so a rule set in the UI survives a restart in
+        # config.yaml exactly as a command-line one does; configure() re-parses it
+        # into self.faults. Round-trip through to_spec() to drop any stray fields.
+        ctx.options.update(faults=[json.dumps(f.to_spec()) for f in parsed])
+        logging.log(ALERT, f"{len(self.faults)} fault rule(s) active"
+                           + (f": {'; '.join(f.describe() for f in self.faults)}" if self.faults else ""))
         self._push_state()
 
     # ------------------------------------------------------------ repeater

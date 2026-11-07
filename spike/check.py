@@ -1407,6 +1407,55 @@ async def restart_and_load() -> None:
         (ROOT / URL_FILE).unlink(missing_ok=True)
 
 
+async def faults_persist() -> None:
+    """A fresh instance started with a config.yaml comes up with the fault and the
+    header rule already armed -- the persistence the option exists for."""
+    import tempfile
+    for _ in range(20):
+        if all(port_free(p) for p in (PROXY_PORT, UI_PORT)):
+            break
+        await asyncio.sleep(0.5)
+    (ROOT / URL_FILE).unlink(missing_ok=True)
+    confdir = tempfile.TemporaryDirectory(prefix="interceptor-test-conf-")
+    (Path(confdir.name) / "config.yaml").write_text(
+        'faults:\n'
+        '- \'{"url": "/pay", "status": 503}\'\n'
+        'modify_headers:\n'
+        '- \'/~q/x-persist/yes\'\n'
+    )
+    proc = subprocess.Popen(
+        ["./run.sh", "--set", f"confdir={confdir.name}"], cwd=ROOT,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+        env={**os.environ, "IC_LISTEN_PORT": str(PROXY_PORT),
+             "IC_UI_PORT": str(UI_PORT), "IC_URL_FILE": URL_FILE, "IC_OPEN_UI": "false"},
+    )
+    try:
+        url = await wait_url(time.monotonic() + 30)
+        if not url:
+            return check("a config.yaml carries fault and rewrite rules across a restart",
+                         False, "instance with a config.yaml never came up")
+        token = url.split("#token=", 1)[1]
+        async with websockets.connect(
+            f"ws://127.0.0.1:{UI_PORT}/ws?token={token}", origin=UI, open_timeout=10
+        ) as conn:
+            await say(conn, type="hello")
+            st = await recv_until(conn, lambda m: m.get("type") == "state")
+            faults = (st or {}).get("faults", [])
+            headers = (st or {}).get("rules_headers", [])
+            ok = (any(f.get("url") == "/pay" and f.get("status") == 503 for f in faults)
+                  and any("x-persist" in h for h in headers))
+            check("a config.yaml carries fault and rewrite rules across a restart", ok,
+                  f"faults={faults}, header rules={headers}")
+    finally:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        confdir.cleanup()
+        (ROOT / URL_FILE).unlink(missing_ok=True)
+
+
 def guard_refuses() -> None:
     """run.sh must refuse before exec'ing mitmdump. Safe to run for real: a pass
     means no process started, and the addon-level guard cannot help here -- the
@@ -2347,6 +2396,42 @@ async def units_replay_label() -> None:
     check("a replay carries its label on the copy only", ok,
           f"copy label={I.summary(clone)['label']!r}, original label={I.summary(f)['label']!r}"
           if clone else "replay.client never called")
+
+
+def units_faults_option() -> None:
+    """Faults live in a mitmproxy option, so config.yaml and --set carry them across
+    restarts. configure() installs from the option and refuses a bad one; _set_faults
+    writes it back."""
+    import interceptor as I
+    from mitmproxy import ctx as mctx
+    from mitmproxy import exceptions
+    from mitmproxy.test import taddons
+
+    addon = I.Interceptor()
+    notes = []
+    with taddons.context(addon) as tctx:
+        addon.bridge = _Collect()
+        addon._push_state = lambda: None
+
+        # The config.yaml / --set path: configure installs from the option value.
+        tctx.configure(addon, faults=['{"url": "/pay", "status": 503}'])
+        if len(addon.faults) != 1 or addon.faults[0].status != 503:
+            notes.append(f"configure did not install the fault: {addon.faults}")
+
+        # A rule that does nothing, and non-JSON, both fail at configure.
+        for bad in (['{"url": "/x"}'], ["not json"]):
+            try:
+                tctx.configure(addon, faults=bad)
+                notes.append(f"a bad fault option was accepted: {bad}")
+            except exceptions.OptionsError:
+                pass
+
+        # _set_faults (the UI path) writes the option back as JSON strings.
+        addon._set_faults([{"url": "/c", "delay_ms": 100}])
+        if not mctx.options.faults or '"/c"' not in mctx.options.faults[0]:
+            notes.append(f"_set_faults did not persist to the option: {list(mctx.options.faults)}")
+    check("fault rules persist as an option and a bad one fails at configure", not notes,
+          "; ".join(notes) or "configure installs, bad rules refused, _set_faults writes back")
 
 
 async def units_faults() -> None:
@@ -3469,6 +3554,7 @@ async def main() -> int:
     units_repeat_burst()
     units_payloads()
     await units_replay_label()
+    units_faults_option()
     await units_faults()
     await units_fault_loaded()
     units_findings()
@@ -3488,6 +3574,7 @@ async def main() -> int:
     await units_har_import()
     await integration()
     await restart_and_load()
+    await faults_persist()
     cleanup_saved_session()
     print()
     width = max(len(n) for n, _, _ in RESULTS)

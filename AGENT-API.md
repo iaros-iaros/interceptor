@@ -132,7 +132,10 @@ is connected, Intercept holds nothing at all: flows sail through and are counted
 
 `rules.set`, `faults.set`, `hosts.set`, `mode.set` and `opt.set` live on the server.
 They survive your disconnect and apply to whatever connects next — including the human's
-browser. An agent that sets a 503 fault and crashes leaves that fault armed.
+browser. An agent that sets a 503 fault and crashes leaves that fault armed. Several of
+them (`modify_body`, `modify_headers`, `map_local`, `allow_hosts`, `passthrough_hosts`,
+`faults`, `anticache`, `intercept_responses`) are mitmproxy options, so a value in
+`~/.mitmproxy/config.yaml` is armed at startup before any client connects.
 
 Reset what you set, in a `finally`:
 
