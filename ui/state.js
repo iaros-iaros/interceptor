@@ -44,6 +44,9 @@ export const ui = {
   // code -> one-line explanation, from the snapshot. The engine owns the text so
   // the table and detail pane never hard-code it.
   findingsDoc: {},
+  // Comparer: a flow id picked to compare against, and the last diff reply.
+  compareBase: null,
+  diff: null,        // {a, b, which, text} from the server
   // Flow ids open in the repeater strip, most recent last.
   repeatTabs: [],
   // Repeater burst settings. Global rather than per-flow: sending the same

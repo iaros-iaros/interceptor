@@ -5,7 +5,7 @@
 // that is already four labelled groups deep -- and "select the row, then find the
 // control" was the shape of every action in this UI until now.
 
-import { $, copy, el } from "./util.js";
+import { $, copy, el, note } from "./util.js";
 import { openRepeatTab, ui } from "./state.js";
 import { select, send } from "./transport.js";
 import { refresh } from "./bus.js";
@@ -62,6 +62,23 @@ export function openMenu(x, y, f) {
   }
   item("Copy URL", () => copy(urlOf(f), "URL"));
   sep();
+  // Comparer: mark one flow, then diff a second against it. A dedicated mark
+  // rather than "the selected flow" because right-clicking a row selects it, so
+  // "selected" would always be this row by the time the menu opens.
+  if (!f.ws) {
+    item("Mark for compare", () => {
+      ui.compareBase = f.id;
+      note("Marked. Right-click another flow → “Compare with marked flow”.", true);
+    }, "Pick this flow as one side of a diff");
+    if (ui.compareBase && ui.compareBase !== f.id) {
+      item("Compare with marked flow", () => {
+        select(f.id);
+        ui.which = "response";
+        send({ type: "diff", a: ui.compareBase, b: f.id, which: "response" });
+      }, "Diff this flow's response against the marked one");
+    }
+    sep();
+  }
   item("Filter rows to this host", () => {
     // Through the box rather than table.js: menu.js importing table.js would be
     // the import cycle bus.js exists to prevent. Body search matches on bodies,

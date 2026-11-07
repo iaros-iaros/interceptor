@@ -59,7 +59,8 @@ export function renderDetail() {
 // selection in a body within a quarter of a second while traffic flowed.
 function messageKey(f) {
   const o = f.replay_of ? getFlow(f.replay_of) : null;
-  return `msg:${f.id}:${ui.which}:${f.faulted || ""}:`
+  const diff = ui.diff && ui.diff.b === f.id ? `D${ui.diff.which}${ui.diff.text.length}` : "";
+  return `msg:${f.id}:${ui.which}:${f.faulted || ""}:${diff}:`
     + [f.status, f.resp_bytes, f.ms, o?.status, o?.resp_bytes, o?.ms].join(",");
 }
 
@@ -92,6 +93,11 @@ function renderMessage(box, f) {
     kv.append(tr);
   }
   box.append(el("p", "section", "headers"), kv);
+
+  // A diff takes the place of the body view for the flow and tab it was asked for.
+  if (ui.diff && ui.diff.b === f.id && ui.diff.which === ui.which) {
+    return renderDiff(box);
+  }
 
   if (d.encoding === "streamed") {
     box.append(el("p", "note",
@@ -637,6 +643,30 @@ function renderReplayDelta(box, f) {
     `replay · status ${bit(orig.status, f.status)}` +
     ` · body ${bit(fmtBytes(orig.resp_bytes || 0), fmtBytes(f.resp_bytes || 0))}` +
     ` · ${bit(orig.ms == null ? null : orig.ms + "ms", f.ms == null ? null : f.ms + "ms")}`));
+  // Status/size/time say *that* they differ; this says *how*.
+  const b = btn(`Diff ${ui.which} vs original`,
+    () => send({ type: "diff", a: f.replay_of, b: f.id, which: ui.which }));
+  b.title = "A line-by-line diff of this replay against the request it was copied from";
+  box.append(b);
+}
+
+// A unified diff in place of the body, one span per line so additions and
+// deletions can be coloured. The text is server-built; this only paints it.
+function renderDiff(box) {
+  const d = ui.diff;
+  const head = el("div", "editor-head");
+  head.append(el("p", "section",
+    `diff · ${d.which} · ${d.a.slice(0, 8)} → ${d.b.slice(0, 8)}`));
+  head.append(btn("Hide diff", () => { ui.diff = null; box.dataset.key = ""; refresh(); }));
+  box.append(head);
+  const pre = el("pre", "diff");
+  for (const line of d.text.split("\n")) {
+    const cls = line.startsWith("+") && !line.startsWith("+++") ? "add"
+      : line.startsWith("-") && !line.startsWith("---") ? "del"
+      : line.startsWith("@@") ? "hunk" : "";
+    pre.append(el("span", `diff-line ${cls}`, line + "\n"));
+  }
+  box.append(pre);
 }
 
 // -------------------------------------------------------------------- frames

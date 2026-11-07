@@ -2562,6 +2562,47 @@ def units_export() -> None:
           "; ".join(notes) or f"{len(cmd)}B command with method, url, header and body")
 
 
+async def units_diff() -> None:
+    """Comparer: a unified diff between two flows' responses, pushed as a reply."""
+    import interceptor as I
+    from mitmproxy.test import taddons, tflow
+
+    addon = I.Interceptor()
+    notes = []
+    with taddons.context(addon):
+        addon.bridge = _Collect()
+        addon._push_state = lambda: None
+        a = tflow.tflow(resp=True)
+        a.response.headers["content-type"] = "application/json"
+        a.response.content = b'{"amount":100}'
+        b = tflow.tflow(resp=True)
+        b.response.headers["content-type"] = "application/json"
+        b.response.content = b'{"amount":1}'
+        for f in (a, b):
+            addon.store.put(f, 1, I.summary(f), 10 * 1024 * 1024)
+
+        await addon._on_message({"type": "diff", "a": a.id, "b": b.id, "which": "response"})
+        pushed = [m for m in addon.bridge.sent if m["type"] == "diff"]
+        if not pushed:
+            notes.append("no diff pushed")
+        else:
+            text = pushed[-1]["text"]
+            minus = [ln for ln in text.splitlines() if ln.startswith("-") and not ln.startswith("---")]
+            plus = [ln for ln in text.splitlines() if ln.startswith("+") and not ln.startswith("+++")]
+            if not any('"amount": 100' in ln for ln in minus):
+                notes.append(f"no '-' line with the old value: {minus}")
+            if not any('"amount": 1' in ln and "100" not in ln for ln in plus):
+                notes.append(f"no '+' line with the new value: {plus}")
+
+        addon.bridge.sent.clear()
+        await addon._on_message({"type": "diff", "a": a.id, "b": "nope", "which": "response"})
+        if not any(m["type"] == "error" for m in addon.bridge.sent):
+            notes.append("a missing flow did not error")
+        addon.store.close()
+    check("diff compares two flows and reports a unified diff", not notes,
+          "; ".join(notes) or "response bodies diffed, missing flow errors")
+
+
 def units_stop_reply() -> None:
     """The per-request reply hold: one reply, then disarmed.
 
@@ -3036,6 +3077,7 @@ async def main() -> int:
     units_contentview()
     units_export()
     units_stop_reply()
+    await units_diff()
     await units_clear_keeps_held()
     await units_reply_routing()
     await units_har_stream()

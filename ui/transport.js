@@ -133,6 +133,11 @@ function handle(m) {
     case "export":
       copy(m.text, m.format === "curl" ? "curl command" : m.format);
       break;
+    case "diff":
+      ui.diff = m;
+      // The detail object did not change, so force renderDetail to rebuild.
+      if (m.b === ui.sel) $("#detail-body").dataset.key = "";
+      break;
     case "har":
       note(`HAR written to ${m.dir}/${m.name}`, true);
       break;

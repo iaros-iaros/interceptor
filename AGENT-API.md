@@ -252,6 +252,7 @@ other than the line endings.
 | `frames.get` | `id` | `frames` — the full WebSocket frame history |
 | `search` | `q` | `results` — flows whose URL, headers or bodies contain `q` |
 | `export` | `id`, `format`: `curl` \| `httpie` \| `raw_request` \| `raw` | `export` with `text` |
+| `diff` | `a`, `b` (flow ids), `which`: `"request"` \| `"response"` | `diff` with a unified-diff `text` |
 
 `snapshot` and `flow` pushes carry **summaries only**. Bodies never arrive unasked —
 call `body.get` for the flow you care about. Held flows are the exception: `flow.paused`
@@ -259,6 +260,12 @@ already includes `detail`, so no round trip is needed to edit one.
 
 `search` is a substring scan over URL, headers and both bodies, capped at 2000 results.
 It is the only way to ask "which response carried this token".
+
+`diff` compares two flows and replies with a unified diff of the chosen side, built from
+start line, headers and the prettified body — so a one-line JSON reply diffs field by
+field. It is the Comparer: `status`/`resp_bytes` deltas in the summaries say *that* two
+responses differ; this says *how*. A flow that is streamed or too large to render as text
+is refused with an `error`.
 
 ### Rewrite rules — no pausing
 
@@ -382,6 +389,7 @@ token-gated, so serving a capture there would publish it to any page the user ha
 | `frames` | Reply to `frames.get` | `id`, `frames` |
 | `results` | Reply to `search` | `q`, `flows` |
 | `export` | Reply to `export` | `id`, `format`, `text` |
+| `diff` | Reply to `diff` | `a`, `b`, `which`, `text` |
 | `har` / `saved` / `loaded` / `sessions` / `cleared` | their commands | `name`, `bytes`, `flows`, `items`, `dir` |
 | `error` | Anything rejected | `message`, sometimes `id` |
 

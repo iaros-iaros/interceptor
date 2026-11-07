@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import difflib
 import hashlib
 import ipaddress
 import logging
@@ -1123,6 +1124,8 @@ class Interceptor:
                              flows=self.store.search(msg.get("q", "")))
         elif kind == "export":
             self._export(msg.get("id"), msg.get("format", "curl"))
+        elif kind == "diff":
+            self._diff(msg.get("a"), msg.get("b"), msg.get("which", "response"))
         elif kind == "har.save":
             await self._save_har()
         elif kind == "faults.set":
@@ -1274,6 +1277,39 @@ class Interceptor:
             self.bridge.push("error", message=f"export failed: {e}")
             return
         self.bridge.push("export", id=fid, format=fmt, text=text)
+
+    @staticmethod
+    def _diff_text(flow: http.HTTPFlow, which: str) -> list[str] | None:
+        """One message as lines for diffing: start line, headers, blank, body --
+        the prettified body when there is one, so a one-line JSON reply diffs field
+        by field rather than as a single changed line. None when there is nothing
+        to show."""
+        d = detail(flow, which)
+        if d is None or d.get("encoding") in ("streamed", "too-large"):
+            return None
+        head = [d.get("method", "") + " " + d.get("url", "") + " " + d.get("http_version", "")
+                if which == "request"
+                else f"{d.get('status', '')} {d.get('reason', '')}"]
+        head += [f"{k}: {v}" for k, v in d["headers"]]
+        body = d.get("pretty") or d.get("body") or ""
+        return head + [""] + body.splitlines()
+
+    def _diff(self, a: str | None, b: str | None, which: str) -> None:
+        """A unified diff between two flows, pushed as a reply. The Comparer the
+        repeater's send list was asking for -- status/size deltas say *that* two
+        responses differ; this says *how*."""
+        fa, fb = self.store.get(a), self.store.get(b)
+        if not isinstance(fa, http.HTTPFlow) or not isinstance(fb, http.HTTPFlow):
+            self.bridge.push("error", message="one of those flows is no longer in the store")
+            return
+        la, lb = self._diff_text(fa, which), self._diff_text(fb, which)
+        if la is None or lb is None:
+            self.bridge.push("error",
+                             message=f"that {which} cannot be shown as text (streamed or too large)")
+            return
+        text = "\n".join(difflib.unified_diff(
+            la, lb, fromfile=f"{a[:8]} {which}", tofile=f"{b[:8]} {which}", lineterm=""))
+        self.bridge.push("diff", a=a, b=b, which=which, text=text or "(identical)")
 
     async def _save_har(self) -> None:
         """Every captured flow as a HAR file in sessions/.

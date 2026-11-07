@@ -583,6 +583,11 @@ td.c-n { color: var(--fg-dim); }
 .finding { display: flex; gap: 10px; align-items: baseline; }
 .finding-code { color: var(--warn); min-width: 170px; }
 .finding-why { color: var(--fg-dim); }
+
+pre.diff { white-space: pre-wrap; word-break: break-word; }
+.diff-line.add { color: var(--ok); background: var(--ok-bg); display: block; }
+.diff-line.del { color: var(--bad); background: var(--bad-bg); display: block; }
+.diff-line.hunk { color: var(--fg-faint); display: block; }
 #flows tbody tr.faulted td:first-child { box-shadow: inset 2px 0 0 var(--bad); }
 
 #truncated { padding: 9px var(--pad); font-size: 12.5px; }

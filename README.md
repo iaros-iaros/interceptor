@@ -643,6 +643,15 @@ scan is milliseconds.
 Loaded flows can be edited and re-sent through the Repeater, so yesterday's request can
 be replayed today.
 
+### Comparer
+
+**Compare with marked flow** (row menu) diffs two flows line by line: right-click one and
+**Mark for compare**, then right-click another and **Compare with marked flow**. A replay
+also carries a **Diff vs original** button in its detail pane, which is the common case —
+*what exactly did my edit change in the response?* The diff is built from the start line,
+the headers and the prettified body, so a one-line JSON reply shows its changed fields
+rather than one long changed line. It replaces the body view until you press **Hide diff**.
+
 ### WebSockets
 
 Sockets live under the **WebSocket** tab of the flow table, separate from HTTP. Select one
