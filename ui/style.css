@@ -643,6 +643,9 @@ pre {
 textarea.editor { min-height: 300px; border-color: var(--warn); }
 textarea.editor:focus { border-color: var(--accent); }
 textarea.inject-input { min-height: 0; }
+/* Beats `textarea.editor`'s 300px: the payload list is a few lines, not a body. */
+textarea.editor.payloads-input { min-height: 72px; border-color: var(--line); }
+textarea.editor.payloads-input:focus { border-color: var(--accent); }
 /* A host list is short. Full-width on a wide screen it reads as a void. */
 #hosts-list { max-width: 560px; }
 /* The Apply row sat flush against the notes below it, so the button read as part
@@ -1061,6 +1064,8 @@ pre.anatomy b { color: var(--accent); }
 }
 .send-row:hover { background: var(--bg-hover); border-color: var(--line); }
 .send-status { min-width: 58px; }
+/* The payload that produced this send, pushed to the right end of the row. */
+.send-label { margin-left: auto; color: var(--accent); max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* A number field wants to be narrow: at the shared min-width it left a fault row
    wrapping onto two lines for the sake of four digits. */

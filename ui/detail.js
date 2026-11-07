@@ -333,10 +333,25 @@ function renderRepeat(box, f) {
     ta,
   );
 
+  // Intruder-lite: wrap one spot in §…§, paste a list, and each line is sent in
+  // turn with that spot replaced. One position only — sniper, not cluster bomb.
+  const payKey = `payloads:${f.id}`;
+  const payTa = document.createElement("textarea");
+  payTa.className = "editor payloads-input";
+  payTa.spellcheck = false;
+  payTa.placeholder = "payloads — one per line; each is substituted into §…§";
+  payTa.value = drafts.get(payKey) ?? "";
+  payTa.oninput = () => drafts.set(payKey, payTa.value);
+  const markBtn = btn("§ mark selection", () => markSelection(ta, key), "");
+  markBtn.title = "Wrap the selected request text in §…§ so each payload is substituted there";
+  const payHead = el("div", "editor-head");
+  payHead.append(el("p", "section", "payloads"), markBtn);
+  box.append(payHead, payTa);
+
   const actions = el("div", "actions");
   const sendBtn = btn("Send", null, "primary");
   const countIn = numField(ui.repeatCount, "1", 62,
-    "How many times to send it. 1 is a single send.");
+    "How many times to send it. 1 is a single send. Ignored when payloads are set.");
   const delayIn = numField(ui.repeatDelay, "0", 76,
     "How long to wait after each reply before sending the next. Sends never overlap: "
     + "each one waits for its own reply first, so 0 means back-to-back, not all at once.");
@@ -346,7 +361,8 @@ function renderRepeat(box, f) {
     if (running && running.id === f.id) return stopRepeat();
     ui.repeatCount = Number(countIn.value) || 1;
     ui.repeatDelay = Number(delayIn.value) || 0;
-    runRepeat(f, ta.value, sendBtn, progress);
+    const payloads = payTa.value.split("\n").map((s) => s.trim()).filter(Boolean);
+    runRepeat(f, ta.value, sendBtn, progress, payloads);
   };
 
   actions.append(
@@ -389,6 +405,14 @@ function numField(value, placeholder, width, title) {
 export const MAX_REPEAT_SENDS = 1000;
 export const MAX_REPEAT_DELAY = 60_000;
 
+// §…§ marks the one payload position. Every marker takes the same payload — Burp's
+// sniper with a single position set. A function replacer, so a payload that
+// contains $& or $1 lands verbatim rather than being expanded by replace().
+export function expandPayloads(raw, payloads) {
+  if (!/§[^§]*§/.test(raw)) return [];
+  return payloads.map((p) => raw.replace(/§[^§]*§/g, () => p));
+}
+
 // Pure, so it can be checked without a DOM -- the clamping is the only part of
 // this feature with logic in it.
 export function clampRepeat(count, delay) {
@@ -423,20 +447,55 @@ function stopRepeat() {
   if (running) running.stop = true;
 }
 
-async function runRepeat(f, raw, sendBtn, progress) {
+// Wrap the editor's current selection in §…§. No selection → an empty marker at
+// the caret, which the user then types into.
+function markSelection(ta, key) {
+  const s = ta.selectionStart, e = ta.selectionEnd;
+  ta.value = `${ta.value.slice(0, s)}§${ta.value.slice(s, e)}§${ta.value.slice(e)}`;
+  drafts.set(key, ta.value);
+  ta.focus();
+  ta.setSelectionRange(s, e + 2);
+}
+
+async function runRepeat(f, raw, sendBtn, progress, payloads = []) {
   if (running) return note("A repeat run is already going — stop it first.");
-  const { count, delay, notes } = clampRepeat(ui.repeatCount, ui.repeatDelay);
-  if (notes.length) note(notes.join("; "));
 
-  // A single send keeps the old behaviour exactly: fire and forget, no Stop
-  // button appearing and vanishing for something that is already over.
-  if (count === 1) return send({ type: "replay", id: f.id, raw });
+  // Payloads and a §…§ marker only mean anything together: a marker with no
+  // payloads would put a literal § on the wire, and payloads with no marker would
+  // send the same request N times under different labels and read as broken.
+  const hasMarkers = /§[^§]*§/.test(raw);
+  if (payloads.length && !hasMarkers) {
+    return note("Add a §…§ marker where a payload should go (select text, “§ mark selection”).");
+  }
+  if (hasMarkers && !payloads.length) {
+    return note("This request has a §…§ marker but no payloads — add one per line, or remove the marker.");
+  }
 
-  running = { id: f.id, stop: false, sent: 0, total: count };
+  let jobs, delay, noun;
+  if (payloads.length) {
+    const c = clampRepeat(payloads.length, ui.repeatDelay);
+    if (c.notes.length) note(c.notes.join("; "));
+    delay = c.delay;
+    noun = "payloads sent";
+    jobs = expandPayloads(raw, payloads).slice(0, MAX_REPEAT_SENDS)
+      .map((r, i) => ({ raw: r, label: payloads[i] }));
+  } else {
+    const c = clampRepeat(ui.repeatCount, ui.repeatDelay);
+    if (c.notes.length) note(c.notes.join("; "));
+    // A single send keeps the old behaviour exactly: fire and forget, no Stop
+    // button appearing and vanishing for something that is already over.
+    if (c.count === 1) return send({ type: "replay", id: f.id, raw });
+    delay = c.delay;
+    noun = "sent";
+    jobs = Array.from({ length: c.count }, () => ({ raw, label: "" }));
+  }
+
+  const total = jobs.length;
+  running = { id: f.id, stop: false, sent: 0, total };
   markRunning(sendBtn, progress);
   let failure = "";
   try {
-    for (let i = 0; i < count; i++) {
+    for (let i = 0; i < total; i++) {
       if (running.stop) break;
       if (!isOpen()) {
         failure = "the bridge disconnected";
@@ -445,9 +504,9 @@ async function runRepeat(f, raw, sendBtn, progress) {
       // Count the sends already on record, so the wait below can tell *this*
       // reply from one that was already there.
       const before = sendHistory(f.id).length;
-      send({ type: "replay", id: f.id, raw });
+      send({ type: "replay", id: f.id, raw: jobs[i].raw, label: jobs[i].label });
       running.sent = i + 1;
-      progress.textContent = `${running.sent} / ${count} · waiting for reply`;
+      progress.textContent = `${running.sent} / ${total} · waiting for reply`;
 
       // Sequential, deliberately: this is a repeat with a delay, not a fixed-rate
       // burst. Firing on a timer without waiting lets sends overlap whenever the
@@ -458,14 +517,14 @@ async function runRepeat(f, raw, sendBtn, progress) {
         break;
       }
       if (running.stop) break;
-      progress.textContent = `${running.sent} / ${count} done`;
+      progress.textContent = `${running.sent} / ${total} done`;
       // Skipped after the last one: a trailing wait leaves the button saying Stop
       // for a run that has already finished.
-      if (delay && i < count - 1) await sleep(delay);
+      if (delay && i < total - 1) await sleep(delay);
     }
-    const stopped = running.stop || running.sent < count || failure;
+    const stopped = running.stop || running.sent < total || failure;
     const why = failure ? ` — ${failure}` : running.stop ? " — stopped" : "";
-    note(`${running.sent} of ${count} sent${why}`, !stopped);
+    note(`${running.sent} of ${total} ${noun}${why}`, !stopped);
   } finally {
     running = null;
     sendBtn.textContent = "Send";
@@ -549,6 +608,7 @@ function refreshRepeatHistory(box, f) {
       el("span", `send-status ${statusClass(s)}`, statusText(s)),
       el("span", "dim", fmtBytes(s.resp_bytes || 0)),
       el("span", "dim", s.ms == null ? "—" : `${s.ms}ms`),
+      el("span", "send-label", s.label || ""),
     );
     list.append(rowEl);
   }

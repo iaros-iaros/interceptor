@@ -167,6 +167,8 @@ def summary(flow: http.HTTPFlow) -> dict:
         # Never omit it: an unlabelled fault is an hour spent debugging your own
         # rule, which is the one way this feature can cost more than it gives.
         "faulted": flow.metadata.get("faulted"),
+        # A repeater payload, so the send list can name which value produced a row.
+        "label": flow.metadata.get("label"),
     }
 
 
@@ -1129,7 +1131,7 @@ class Interceptor:
         elif kind == "session.load":
             await self._load_session(msg.get("name", ""))
         elif kind == "replay":
-            self.repeat(msg.get("id"), msg.get("raw") or "")
+            self.repeat(msg.get("id"), msg.get("raw") or "", msg.get("label") or "")
         elif kind == "rules.set":
             self._set_rules(list(msg.get("body") or []), list(msg.get("headers") or []))
         elif kind == "hosts.set":
@@ -1278,12 +1280,16 @@ class Interceptor:
     # ------------------------------------------------------------ repeater
 
     @command.command("interceptor.repeat")
-    def repeat(self, fid: str, raw: str = "") -> None:
+    def repeat(self, fid: str, raw: str = "", label: str = "") -> None:
         """Repeater: resend a captured request, optionally edited first.
 
         Always replays a *copy* -- `replay.client` mutates the flow it is given
         (clears response and error, sets is_replay), so replaying the original
         would blank the row you were comparing against.
+
+        `label` tags the copy with the payload that produced it (intruder-lite),
+        so a run of substitutions reads as a list naming each value rather than a
+        pile of identical-looking rows.
         """
         # These are `@command.command`s: mitmproxy asserts the return value against
         # the annotation (command.py), so a `-> None` command must return nothing
@@ -1294,6 +1300,8 @@ class Interceptor:
             return
         clone = flow.copy()
         clone.metadata["replay_of"] = fid
+        if label:
+            clone.metadata["label"] = label[:200]
         if raw:
             try:
                 self._apply_edits(clone, "request", raw)

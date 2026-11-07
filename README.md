@@ -387,6 +387,16 @@ into load. A delay of `0` therefore means back-to-back, one at a time — not al
   use. These are foot-gun guards, not policy: a mistyped `1000` in a field meant for `10`
   is a thousand real requests at a real service.
 
+**Payloads (intruder-lite).** Below the editor is a payload list. Select a spot in the
+request, press **§ mark selection** to wrap it in `§…§`, then paste one value per line:
+each is substituted into the marker and sent in turn, and every send is listed with the
+value that produced it. It is Burp's sniper with a single position set — one marker, one
+list. The run is sequential and honours the delay, exactly like a plain repeat, so it is a
+labelled sweep rather than a flood; the send cap (1000) and the delay cap (60s) still
+apply, and a marker with no payloads, or payloads with no marker, is refused rather than
+putting a literal `§` on the wire. Cluster-bomb and multi-position sweeps are deliberately
+not built — they are a different tool, and the §-marker keeps this one a one-liner.
+
 One caveat that is the browser's and not this tool's: a **backgrounded tab** has its timers
 clamped to roughly one second, so a run left in a hidden tab paces itself at about 1s per
 step regardless of the delay you set. Keep the tab visible if the interval matters.

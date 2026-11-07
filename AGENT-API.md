@@ -308,12 +308,18 @@ from a real one.
 ### Repeater
 
 ```json
-{"type": "replay", "id": "<flow id>", "raw": "<edited request, or omitted>"}
+{"type": "replay", "id": "<flow id>", "raw": "<edited request, or omitted>",
+ "label": "<optional payload tag>"}
 ```
 
 Replays a **copy**, so the original row is preserved for comparison. The new flow's
 summary carries `replay_of: "<original id>"` and `is_replay: true`. There is no reply
 message — watch for the new `flow` push, or search for it.
+
+`label` (optional, ≤200 chars) tags the copy in its `label` summary field, so a sweep of
+substituted values reads as a list that names each one. This is how the UI's payload
+sweep (intruder-lite) labels its sends; a scripted client does the same by sending one
+`replay` per payload with the value in `label` and the substitution already made in `raw`.
 
 Rejected for WebSocket flows: mitmproxy's client replay refuses them.
 
@@ -400,7 +406,7 @@ because nothing was connected, or an edit was too large and closed the socket.
 **Summary** fields, on every row: `id`, `method`, `scheme`, `host`, `port`, `path`,
 `http_version`, `status`, `ctype`, `req_bytes`, `resp_bytes`, `start`, `ms`, `ws`,
 `ws_frames`, `ws_open`, `streamed`, `intercepted`, `killed`, `replay_of`, `is_replay`,
-`faulted`.
+`faulted`, `label`.
 
 **Detail** fields: `headers` (list of `[name, value]` pairs, duplicates preserved),
 `body`, `encoding`, `size`, `body_crlf`, `raw`, plus `method`/`url`/`http_version` on a

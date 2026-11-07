@@ -2185,6 +2185,77 @@ def units_repeat_burst() -> None:
           f"8 inputs clamped correctly; caps {got['caps'][0]} sends / {got['caps'][1]}ms")
 
 
+def units_payloads() -> None:
+    """The repeater's payload expansion: one position set, same payload into every
+    marker, and a payload inserted verbatim (never as a regex replacement)."""
+    import json as _json
+
+    harness = r"""
+      import { readFileSync } from "node:fs";
+      const src = readFileSync("ui/detail.js", "utf8");
+      const i = src.indexOf("export function expandPayloads(");
+      if (i < 0) throw new Error("missing expandPayloads");
+      let depth = 0, j = src.indexOf("{", i), end = -1;
+      for (let k = j; k < src.length; k++) {
+        if (src[k] === "{") depth++;
+        else if (src[k] === "}" && --depth === 0) { end = k + 1; break; }
+      }
+      const fn = new Function(src.slice(i, end).replace("export ", "") + "; return expandPayloads;")();
+      const cases = JSON.parse(process.env.CASES);
+      console.log(JSON.stringify(cases.map(([raw, p]) => fn(raw, p))));
+    """
+    cases = [
+        ["GET /u?id=§x§ HTTP/1.1", ["1", "2"]],              # one marker
+        ["a=§p§&b=§p§", ["Z"]],                     # two markers, same payload
+        ["x=§p§", ["$&!"]],                                    # verbatim, not a regex repl
+        ["no markers here", ["1", "2"]],                                # nothing to do
+        ["x=§p§", []],                                         # no payloads
+    ]
+    want = [
+        ["GET /u?id=1 HTTP/1.1", "GET /u?id=2 HTTP/1.1"],
+        ["a=Z&b=Z"],
+        ["x=$&!"],
+        [],
+        [],
+    ]
+    out = subprocess.run(["node", "--input-type=module", "-e", harness], cwd=ROOT,
+                         capture_output=True, text=True, timeout=60,
+                         env={**os.environ, "CASES": _json.dumps(cases)})
+    if out.returncode != 0:
+        return check("the repeater expands one payload position", False,
+                     f"node failed: {out.stderr.strip()[:200]}")
+    got = _json.loads(out.stdout)
+    bad = [f"case {i}: {g} want {w}" for i, (g, w) in enumerate(zip(got, want)) if g != w]
+    check("the repeater expands one payload position", not bad,
+          "; ".join(bad) or "one marker, two markers, verbatim payload, no-marker and no-payload all correct")
+
+
+async def units_replay_label() -> None:
+    """A labelled replay carries the label on the copy only, so the send list can
+    name which payload produced each row."""
+    import interceptor as I
+    from mitmproxy.test import taddons, tflow
+
+    addon = I.Interceptor()
+    seen = []
+    with taddons.context(addon) as tctx:
+        # repeat() calls commands.call("replay.client", [clone]); record the clone
+        # rather than registering a typed command just to catch it.
+        tctx.master.commands.call = lambda name, args: seen.extend(args)
+        addon.bridge = _Collect()
+        f = tflow.tflow(resp=True)
+        addon.store.put(f, 1, I.summary(f), 10 * 1024 * 1024)
+        addon.repeat(f.id, "", label="admin' --")
+        clone = seen[0] if seen else None
+        ok = (clone is not None
+              and I.summary(clone)["label"] == "admin' --"
+              and I.summary(f)["label"] is None)
+        addon.store.close()
+    check("a replay carries its label on the copy only", ok,
+          f"copy label={I.summary(clone)['label']!r}, original label={I.summary(f)['label']!r}"
+          if clone else "replay.client never called")
+
+
 async def units_faults() -> None:
     """Fault rules: validation, first-match-wins, and the three effects.
 
@@ -2852,6 +2923,8 @@ async def main() -> int:
     await units_host_predicate()
     units_scope_atoms()
     units_repeat_burst()
+    units_payloads()
+    await units_replay_label()
     await units_faults()
     await units_fault_loaded()
     units_search()
