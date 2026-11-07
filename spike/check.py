@@ -1336,6 +1336,17 @@ async def integration() -> None:
             await say(conn, type="rules.set", body=[], headers=[], local=[])
             await recv_until(conn, lambda m: m.get("type") == "state" and not m.get("rules_local"))
 
+            # --- mitm.it is served through the proxy, so any client can fetch the CA
+            def _mitm_it():
+                r = subprocess.run(
+                    ["curl", "-s", "--max-time", "15", "-x", PROXY, "http://mitm.it/"],
+                    capture_output=True, text=True)
+                return r.returncode, r.stdout
+            rc_m, body_m = await asyncio.to_thread(_mitm_it)
+            check("mitm.it serves the CA-install page through the proxy",
+                  rc_m == 0 and "mitmproxy" in body_m.lower(),
+                  f"rc={rc_m}, {len(body_m)}B, mentions mitmproxy: {'mitmproxy' in body_m.lower()}")
+
             # --- UI vanishes with a flow still held
             await arm(conn, "~u /hold")
             fut = asyncio.create_task(asyncio.to_thread(curl, "/hold-orphan", 20))

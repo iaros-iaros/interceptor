@@ -96,6 +96,23 @@ outright (`SIGKILL`, a crash), check your temp directory for a leftover
 To use your own client instead, point it at `http://127.0.0.1:8080` and trust
 `~/.mitmproxy/mitmproxy-ca-cert.pem`.
 
+### Other clients — phones, curl, Electron
+
+Anything you can point at an HTTP proxy works, not just the launched Chrome:
+
+- **Point the client at the proxy.** `http://127.0.0.1:8080` on this machine, or the
+  machine's LAN IP from a phone (which needs `--set expose=true` and a firewall — see
+  Security).
+- **Install the CA in that client.** Open **`http://mitm.it`** *through the proxy* — the
+  proxy serves a page with the certificate and per-platform instructions (iOS, Android,
+  Firefox, curl…). This is mitmproxy's own onboarding page; nothing of yours is uploaded.
+- **Mind the two silent bypasses.** Every HTTP client skips the proxy for `localhost`
+  (curl ≥7.86 needs `--noproxy ""`, Node reads `NO_PROXY`), and Chrome bypasses it over
+  QUIC (`--disable-quic`). A request that just never appears is almost always one of these.
+
+The isolated-Chrome launcher exists so you don't have to do any of this for a quick look;
+`mitm.it` is the path for everything else.
+
 ## The UI
 
 The toolbar is grouped and labelled: the mode buttons, then **Stop flows matching**
