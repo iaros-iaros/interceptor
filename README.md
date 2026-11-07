@@ -819,8 +819,9 @@ more than a couple of flows alive at once, and the event loop running meanwhile;
 **replacement containing the separator** without changing the rule; and a **URL regex
 meaning what it says** — `(1|2)`, `\.`, `$` — in rules and faults alike.
 
-Five units also run shipped frontend functions under `node`: the rule form's compose/parse
-pair from `ui/rules.js` (every spec it generates is fed to mitmproxy's real
+Six units also run shipped frontend functions under `node`: the row menu's host pattern
+from `ui/menu.js` (built in JS, then matched in Python exactly as the addon does), the
+rule form's compose/parse pair from `ui/rules.js` (every spec it generates is fed to mitmproxy's real
 `parse_modify_spec`), the row filter and the row sync from `ui/table.js` (text, regex,
 case-insensitivity, invalid-regex fallback; a row that stays on screen is never detached,
 which is what lost clicks under traffic), the editor's pretty-printer from `ui/util.js` and `ui/detail.js`
@@ -829,9 +830,15 @@ body never mistaken for the header separator), and the repeater's burst clamp fr
 `ui/detail.js` (negatives, blanks, junk and absurd numbers all landing somewhere sane, and
 a count that can never clamp to zero — a Send that sends nothing reads as broken).
 
-**Not covered:** anything needing a DOM — `index.html`, `style.css` and every rendering
-path across the `ui/` modules; `node --check` is syntax-only. Also the `error`-hook queue
-cleanup, the noise counter, `launch_chrome`'s flags, and concurrent held flows.
+**In a real browser:** `check.py` also launches headless Chrome against the live
+instance and drives it over the DevTools protocol — the page loads under its CSP, the
+bridge connects, a captured row renders, a click opens the detail pane, and the console
+stays clean. Breaking `app.js` with a duplicate `const` fails it, which is the bug that
+motivated it. Skipped when Chrome is not installed; both CI images have it.
+
+**Not covered:** layout, dragging, keyboard shortcuts and every rendering path the smoke
+test does not click through; the `error`-hook queue cleanup; the noise counter;
+`launch_chrome`'s flags; concurrent held flows.
 
 Neither suite talks to the internet through a real browser, and that gap has cost real
 bugs: a WebSocket handshake showing under HTTP until it upgraded, and Chrome's own cache

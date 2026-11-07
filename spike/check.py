@@ -767,6 +767,141 @@ async def forward_until_done(conn, fut, first_drop: bool = False) -> None:
         await asyncio.sleep(0.1)
 
 
+# ------------------------------------------------------------- browser smoke
+
+
+async def ui_smoke(url: str) -> None:
+    """The real page in headless Chrome, driven over CDP: the modules import, the
+    socket connects, a row renders, a click opens the pane, and nothing errors.
+
+    The Python suite is blind to all of that -- a duplicate `const` once took the
+    whole page down while every check stayed green. CDP is spoken over the
+    `websockets` client the project already depends on, so this costs no
+    browser-automation framework. Chrome absent (a bare CI box) is a SKIP.
+    """
+    import shutil
+    import tempfile
+
+    import interceptor as I
+
+    exe = next((c for c in I.CHROME_PATHS if Path(c).exists() or shutil.which(c)), None)
+    if exe is None:
+        return check("the UI renders in a real browser (3 checks)", None, "Chrome not found")
+    exe = exe if Path(exe).exists() else shutil.which(exe)
+    errors: list[str] = []
+
+    with tempfile.TemporaryDirectory(prefix="interceptor-smoke-") as prof:
+        proc = subprocess.Popen(
+            [exe, "--headless=new", "--disable-gpu", "--no-sandbox", "--no-first-run",
+             # The page is fetched directly, never through a proxy -- not the one
+             # under test, and not whatever system proxy this machine has.
+             "--no-proxy-server",
+             "--disable-background-networking", "--disable-component-update",
+             f"--user-data-dir={prof}", "--remote-debugging-port=0", "about:blank"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        try:
+            # Chrome publishes the port it picked, then the browser endpoint path.
+            active = Path(prof) / "DevToolsActivePort"
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline and not active.exists():
+                await asyncio.sleep(0.1)
+            if not active.exists():
+                return check("the UI renders a captured row in a real browser", False,
+                             "Chrome never published DevToolsActivePort")
+            port, path = active.read_text().split()[:2]
+
+            async with websockets.connect(f"ws://127.0.0.1:{port}{path}",
+                                          max_size=16 * 1024 * 1024) as cdp:
+                nid = 0
+
+                def saw(m: dict) -> None:
+                    """Every error the page would have shown in its console."""
+                    p = m.get("params") or {}
+                    if m.get("method") == "Runtime.exceptionThrown":
+                        d = p.get("exceptionDetails") or {}
+                        desc = (d.get("exception") or {}).get("description", "")
+                        errors.append(f"exception: {d.get('text', '')} {desc}"[:200])
+                    elif m.get("method") == "Runtime.consoleAPICalled" and p.get("type") == "error":
+                        args = " ".join(str(a.get("value", a.get("description", "")))
+                                        for a in p.get("args", []))
+                        errors.append(f"console.error: {args}"[:200])
+                    elif m.get("method") == "Log.entryAdded":
+                        e = p.get("entry") or {}
+                        if e.get("level") == "error":
+                            errors.append(f"log: {e.get('text', '')} {e.get('url', '')}"[:200])
+
+                async def call(method: str, params: dict | None = None, session: str | None = None):
+                    nonlocal nid
+                    nid += 1
+                    msg = {"id": nid, "method": method, "params": params or {}}
+                    if session:
+                        msg["sessionId"] = session
+                    await cdp.send(json.dumps(msg))
+                    while True:  # events interleave with the reply; keep the errors
+                        m = json.loads(await asyncio.wait_for(cdp.recv(), 15))
+                        if m.get("id") == nid:
+                            if "error" in m:
+                                raise RuntimeError(f"{method}: {m['error']}")
+                            return m.get("result") or {}
+                        saw(m)
+
+                target = await call("Target.createTarget", {"url": "about:blank"})
+                sid = (await call("Target.attachToTarget",
+                                  {"targetId": target["targetId"], "flatten": True}))["sessionId"]
+                await call("Runtime.enable", session=sid)
+                await call("Log.enable", session=sid)
+                await call("Page.navigate", {"url": url}, session=sid)
+
+                async def evaluate(expr: str):
+                    r = await call("Runtime.evaluate",
+                                   {"expression": expr, "returnByValue": True}, session=sid)
+                    return (r.get("result") or {}).get("value")
+
+                rows, badge = 0, ""
+                deadline = time.monotonic() + 20
+                while time.monotonic() < deadline:
+                    v = await evaluate(
+                        "JSON.stringify({rows: document.querySelectorAll('#flows tbody tr').length,"
+                        " badge: document.querySelector('#conn')?.textContent || ''})")
+                    d = json.loads(v or "{}")
+                    rows, badge = d.get("rows", 0), d.get("badge", "")
+                    if rows > 0:
+                        break
+                    await asyncio.sleep(0.25)
+                check("the UI renders a captured row in a real browser", rows > 0,
+                      f"{rows} row(s) drawn, bridge badge {badge!r}")
+
+                await evaluate("document.querySelector('#flows tbody tr')?.click()")
+                headline = ""
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    headline = await evaluate(
+                        "document.querySelector('#detail-body .headline')?.textContent || ''") or ""
+                    if headline:
+                        break
+                    await asyncio.sleep(0.25)
+                check("clicking a row opens the detail pane", bool(headline),
+                      headline[:80] or "no headline rendered")
+
+                await evaluate("1")  # one more round trip drains queued events
+                check("no console or page errors while rendering", not errors,
+                      "; ".join(errors)[:300] or "clean console")
+                try:
+                    await call("Browser.close")
+                except Exception:
+                    pass
+        finally:
+            # Gone for good before the next check: the bridge must see this client
+            # leave, or "closing the UI force-forwards" below waits on a browser
+            # that is still attached.
+            proc.kill()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
+
+
 # --------------------------------------------------------------- integration
 
 
@@ -1147,6 +1282,9 @@ async def integration() -> None:
                   got[1:] == ["injected-frame"] and "injected-frame" not in WS_RECEIVED,
                   f"client received {got}, server never saw it: "
                   f"{'injected-frame' not in WS_RECEIVED}")
+
+            # --- the real page, in a real browser, with all of the above on screen
+            await ui_smoke(url)
 
             # --- UI vanishes with a flow still held
             await arm(conn, "~u /hold")
