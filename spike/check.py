@@ -2334,6 +2334,110 @@ async def units_faults() -> None:
           f"(~250 means awaited, ~750 means the loop was blocked)")
 
 
+def units_findings() -> None:
+    """Passive findings: each rule fires on a crafted flow and nowhere else, and
+    the addon's first-sight dedup reports a repeat only once."""
+    import base64 as _b64
+    import findings
+    from mitmproxy.test import tflow
+
+    def mk(scheme="https", host="ex.com", path="/p", method="GET", query="",
+           req_headers=None, status=200, resp_headers=None, body=b"x"):
+        f = tflow.tflow(resp=True)
+        f.request.scheme = scheme
+        f.request.host = host
+        f.request.path = path + ("?" + query if query else "")
+        f.request.method = method
+        f.request.headers.clear()
+        for k, v in (req_headers or {}).items():
+            f.request.headers[k] = v
+        f.response.status_code = status
+        f.response.headers.clear()
+        for k, v in (resp_headers or {}).items():
+            f.response.headers[k] = v
+        f.response.content = body
+        return f
+
+    def codes(**kw):
+        return sorted(c for c, _k in findings.passive(mk(**kw)))
+
+    # Headers that suppress every *other* response rule, so each case isolates one.
+    quiet = {"strict-transport-security": "max-age=1",
+             "x-content-type-options": "nosniff",
+             "content-type": "application/json"}
+    none_jwt = "eyJhbGciOiJub25lIn0." + _b64.urlsafe_b64encode(b'{"u":1}').decode().rstrip("=") + "."
+
+    cases = {
+        "missing-hsts": dict(scheme="https", resp_headers={
+            "x-content-type-options": "nosniff", "content-type": "application/json"}),
+        "missing-csp": dict(scheme="https", resp_headers={
+            **quiet, "content-type": "text/html", "x-frame-options": "DENY"}, body=b"<html>"),
+        "missing-frame-protection": dict(scheme="https", resp_headers={
+            **quiet, "content-type": "text/html",
+            "content-security-policy": "default-src 'self'"}, body=b"<html>"),
+        "missing-nosniff": dict(scheme="https", resp_headers={
+            "strict-transport-security": "max-age=1", "content-type": "application/json"}),
+        "cookie-insecure": dict(scheme="https", resp_headers={
+            **quiet, "set-cookie": "sid=x; HttpOnly; SameSite=Lax"}),
+        "cookie-no-httponly": dict(scheme="https", resp_headers={
+            **quiet, "set-cookie": "sid=x; Secure; SameSite=Lax"}),
+        "cookie-no-samesite": dict(scheme="https", resp_headers={
+            **quiet, "set-cookie": "sid=x; Secure; HttpOnly"}),
+        "cors-wildcard-credentials": dict(scheme="https", resp_headers={
+            **quiet, "access-control-allow-origin": "*",
+            "access-control-allow-credentials": "true"}),
+        "cors-origin-reflected": dict(scheme="https",
+            req_headers={"origin": "https://evil.test"}, resp_headers={
+            **quiet, "access-control-allow-origin": "https://evil.test",
+            "access-control-allow-credentials": "true"}),
+        "jwt-alg-none": dict(scheme="https",
+            req_headers={"authorization": "Bearer " + none_jwt}, resp_headers=quiet),
+        "secret-in-url": dict(scheme="https", query="access_token=abc", resp_headers=quiet),
+        "basic-auth": dict(scheme="https",
+            req_headers={"authorization": "Basic dXNlcjpwYXNz"}, resp_headers=quiet),
+        "plain-http-auth": dict(scheme="http",
+            req_headers={"cookie": "sid=x"}, resp_headers={
+            "x-content-type-options": "nosniff", "content-type": "application/json"}),
+        "server-version": dict(scheme="https", resp_headers={
+            **quiet, "server": "nginx/1.25.3"}),
+        "directory-listing": dict(scheme="https", resp_headers={
+            **quiet, "content-type": "text/html",
+            "content-security-policy": "default-src 'self'; frame-ancestors 'none'",
+            "x-frame-options": "DENY"}, body=b"<h1>Index of /uploads</h1>"),
+    }
+
+    notes = []
+    for code, kw in cases.items():
+        got = codes(**kw)
+        if got != [code]:
+            notes.append(f"{code}: got {got}")
+    # Every code has an explanation, and nothing explains a code that cannot fire.
+    if set(findings.EXPLAIN) != set(cases):
+        notes.append(f"EXPLAIN/rules mismatch: {set(findings.EXPLAIN) ^ set(cases)}")
+
+    # First-sight dedup: the same missing header on a second flow from one host is
+    # not reported again, but a different host still is.
+    seen: set = set()
+    def fresh(f):
+        return [c for c, k in findings.passive(f)
+                if (c, k) not in seen and not seen.add((c, k))]
+    f1 = mk(scheme="https", host="a.test", resp_headers={
+        "x-content-type-options": "nosniff", "content-type": "application/json"})
+    f2 = mk(scheme="https", host="a.test", resp_headers={
+        "x-content-type-options": "nosniff", "content-type": "application/json"})
+    f3 = mk(scheme="https", host="b.test", resp_headers={
+        "x-content-type-options": "nosniff", "content-type": "application/json"})
+    if fresh(f1) != ["missing-hsts"]:
+        notes.append(f"first host: {fresh(f1)}")
+    if fresh(f2) != []:
+        notes.append(f"repeat not deduped: {fresh(f2)}")
+    if fresh(f3) != ["missing-hsts"]:
+        notes.append(f"new host suppressed: {fresh(f3)}")
+
+    check("passive findings fire per rule and dedupe on first sight", not notes,
+          "; ".join(notes) or f"{len(cases)} rules isolated, dedup by host and host:cookie")
+
+
 def units_search() -> None:
     """Body search has to see what the row never showed: headers and bodies."""
     import interceptor as I
@@ -2927,6 +3031,7 @@ async def main() -> int:
     await units_replay_label()
     await units_faults()
     await units_fault_loaded()
+    units_findings()
     units_search()
     units_contentview()
     units_export()

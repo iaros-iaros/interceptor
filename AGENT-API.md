@@ -374,7 +374,7 @@ token-gated, so serving a capture there would publish it to any page the user ha
 
 | Type | When | Key fields |
 |---|---|---|
-| `snapshot` | After `hello` | `flows` — up to 2000 newest summaries, oldest first |
+| `snapshot` | After `hello` | `flows` — up to 2000 newest summaries, oldest first; `findings_doc` — the finding code → explanation map |
 | `state` | After most commands, and once a second under traffic | see below |
 | `flow` | A flow was recorded or updated | the summary fields, inline |
 | `flow.paused` | A flow is held | `id`, `direction`, `summary`, and `detail` (HTTP) or `frame` (WebSocket) |
@@ -406,7 +406,12 @@ because nothing was connected, or an edit was too large and closed the socket.
 **Summary** fields, on every row: `id`, `method`, `scheme`, `host`, `port`, `path`,
 `http_version`, `status`, `ctype`, `req_bytes`, `resp_bytes`, `start`, `ms`, `ws`,
 `ws_frames`, `ws_open`, `streamed`, `intercepted`, `killed`, `replay_of`, `is_replay`,
-`faulted`, `label`.
+`faulted`, `label`, `findings`.
+
+`findings` is a list of passive-finding codes seen on that flow for the first time (see
+the `snapshot` reply's `findings_doc` for the code → explanation map). `state` carries a
+`findings` **count** of distinct findings across the capture. A code is also matchable as
+a scope with `~meta <code>`, e.g. `~meta cors-wildcard-credentials`.
 
 **Detail** fields: `headers` (list of `[name, value]` pairs, duplicates preserved),
 `body`, `encoding`, `size`, `body_crlf`, `raw`, plus `method`/`url`/`http_version` on a

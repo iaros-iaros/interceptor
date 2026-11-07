@@ -19,7 +19,11 @@ function matchesRow(f) {
   if (!ui.rowFilter) return true;
   // Everything the row shows, so what you see is what you search.
   const port = f.port && f.port !== 80 && f.port !== 443 ? ":" + f.port : "";
-  const hay = `${f.method} ${f.status ?? ""} ${f.host}${port} ${f.path} ${f.ctype || ""}`;
+  // Findings (and, later, a comment) are part of what you hunt for, so the word
+  // "finding" plus the codes join the haystack even though no column shows them.
+  const extra = [(f.findings || []).join(" "), f.findings?.length ? "finding" : "",
+                 f.comment || "", (f.edited || []).length ? "edited" : ""].join(" ");
+  const hay = `${f.method} ${f.status ?? ""} ${f.host}${port} ${f.path} ${f.ctype || ""} ${extra}`;
   return ui.rowFilterRe
     ? ui.rowFilterRe.test(hay)
     : hay.toLowerCase().includes(ui.rowFilter.toLowerCase());
@@ -159,7 +163,8 @@ const rowEls = new Map();
 // object, so identity alone cannot say whether a row changed.
 const rowSig = (f) => [f.method, statusText(f), statusClass(f), f.host, f.port, f.path,
   f.ws, f.ws_frames, f.ctype, f.resp_bytes, f.req_bytes, f.ms, f.streamed, f.replay_of,
-  f.is_replay, f.faulted, f.http_version].join("\u0001");
+  f.is_replay, f.faulted, f.http_version, (f.findings || []).join(","),
+  f.marked, f.comment, (f.edited || []).join(",")].join("\u0001");
 
 function rowFor(f) {
   let tr = rowEls.get(f.id);
@@ -215,6 +220,14 @@ function fillRow(tr, f) {
   }
   if (f.http_version && f.http_version.includes("2")) {
     tr.children[4].append(el("span", "tag tag-h2", "h2"));
+  }
+  // Passive smells, on the status cell: a count with the detail in the tooltip,
+  // so the table stays readable and the row still says there is something to read.
+  if (f.findings?.length) {
+    const tag = el("span", "tag tag-finding",
+      `${f.findings.length} finding${f.findings.length === 1 ? "" : "s"}`);
+    tag.title = f.findings.map((c) => `${c} — ${ui.findingsDoc[c] || c}`).join("\n");
+    tr.children[1].append(tag);
   }
 }
 

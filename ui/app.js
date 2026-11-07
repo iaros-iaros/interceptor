@@ -130,6 +130,8 @@ function renderStats() {
   if (n) bits.push(`${n} rule${n === 1 ? "" : "s"} active`);
   const faults = (state.faults || []).length;
   if (faults) bits.push(`${faults} fault${faults === 1 ? "" : "s"} active`);
+  const findings = state.findings || 0;
+  if (findings) bits.push(`${findings} finding${findings === 1 ? "" : "s"}`);
   // A forgotten allowlist reads as "the tool stopped capturing", so it is never
   // silent -- it says so here and again in the mode hint below the toolbar.
   const allow = (state.allow_hosts || []).length;

@@ -36,6 +36,7 @@ from mitmproxy.proxy.mode_specs import ProxyMode
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import faults as faultlib  # noqa: E402
+import findings as findingslib  # noqa: E402
 import views  # noqa: E402
 from bridge import Bridge  # noqa: E402
 from exporters import FORMATS as EXPORT_FORMATS, export_text, write_har  # noqa: E402
@@ -169,6 +170,8 @@ def summary(flow: http.HTTPFlow) -> dict:
         "faulted": flow.metadata.get("faulted"),
         # A repeater payload, so the send list can name which value produced a row.
         "label": flow.metadata.get("label"),
+        # Passive security smells seen on this flow -- see findings.py.
+        "findings": flow.metadata.get("findings"),
     }
 
 
@@ -299,6 +302,9 @@ class Interceptor:
         # turning on the global toggle that makes every matching flow stop twice.
         self.stop_reply: set[str] = set()
         self.faults: list[faultlib.Fault] = []
+        # (code, key) pairs already surfaced, so a finding is tagged on first sight
+        # and not on all 300 flows of a page load -- see findings.py.
+        self.findings_seen: set[tuple[str, str]] = set()
         self.mode = "capture"
         self.scope = ""
         self.url_file: Path | None = None
@@ -655,10 +661,29 @@ class Interceptor:
         self._push_flow(flow)
 
     def response(self, flow: http.HTTPFlow) -> None:
+        self._note_findings(flow)
         if self._remember(flow):
             self._push_flow(flow)
             self._push_state_soon()
         self._maybe_pause(flow, "response")
+
+    def _note_findings(self, flow: http.HTTPFlow) -> None:
+        """Tag a flow with the passive smells seen on it for the first time. Set
+        before _remember, so the stored summary carries them. Skipped for noise,
+        off-list and our own faulted responses -- a finding on a reply we
+        synthesised is noise about ourselves."""
+        if (not isinstance(flow, http.HTTPFlow) or flow.response is None
+                or self._is_noise(flow) or self._off_list(flow)
+                or flow.metadata.get("faulted")):
+            return
+        new = []
+        for code, key in findingslib.passive(flow):
+            tag = (code, key)
+            if tag not in self.findings_seen:
+                self.findings_seen.add(tag)
+                new.append(code)
+        if new:
+            flow.metadata["findings"] = new
 
     def websocket_start(self, flow: http.HTTPFlow) -> None:
         if self._remember(flow):
@@ -1035,6 +1060,7 @@ class Interceptor:
             rules_body=list(ctx.options.modify_body),
             rules_headers=list(ctx.options.modify_headers),
             faults=[f.to_spec() for f in self.faults],
+            findings=len(self.findings_seen),
             allow_hosts=list(ctx.options.allow_hosts),
             proxy=f"{ctx.options.listen_host or '127.0.0.1'}:{ctx.options.listen_port}",
             # So the UI can explain a 502 before the user has to ask anyone.
@@ -1046,7 +1072,10 @@ class Interceptor:
         # Summaries come off disk already built, and only the newest page of them:
         # the store is no longer bounded by memory, but a snapshot still has to fit
         # in one message and the browser caps its own table anyway.
-        self.bridge.push("snapshot", flows=self.store.summaries())
+        # findings_doc is the code -> explanation map, sent once per hello (never in
+        # state): the UI shows it on a tagged flow and never has to hard-code it.
+        self.bridge.push("snapshot", flows=self.store.summaries(),
+                         findings_doc=findingslib.EXPLAIN)
         for direction, flow in self.paused.values():
             self.bridge.push("flow.paused", **self._paused_payload(direction, flow))
         self._push_state()
@@ -1106,6 +1135,7 @@ class Interceptor:
             # this behind showed "12 auto-forwarded" above an empty capture.
             self.auto_forwarded = 0
             self.stop_reply.clear()
+            self.findings_seen.clear()
             # A held flow is still waiting on a decision, so it cannot go with the
             # table: wiping it left a queue entry pointing at a row the table could
             # not show. Put the held ones back, and re-send their holds after
@@ -1207,6 +1237,7 @@ class Interceptor:
         self.store.clear()
         self.ws_seen.clear()
         self.noise_hidden = 0
+        self.findings_seen.clear()
         self.bridge.push("cleared")
 
         count = 0

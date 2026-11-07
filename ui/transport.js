@@ -64,6 +64,7 @@ function handle(m) {
   switch (m.type) {
     case "snapshot":
       forgetAll();
+      if (m.findings_doc) ui.findingsDoc = m.findings_doc;
       for (const f of m.flows) flows.set(f.id, f);
       break;
     case "flow": {

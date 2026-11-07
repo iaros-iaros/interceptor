@@ -82,6 +82,7 @@ function renderMessage(box, f) {
       + "server. Clear the rule in Tools → Rules to stop it."));
   }
   if (f.replay_of) renderReplayDelta(box, f);
+  if (f.findings?.length) renderFindings(box, f);
 
   const kv = document.createElement("table");
   kv.className = "kv";
@@ -612,6 +613,20 @@ function refreshRepeatHistory(box, f) {
     );
     list.append(rowEl);
   }
+}
+
+// Passive smells, flow-level, so shown on either tab. The explanation text comes
+// from the engine (ui.findingsDoc), never hard-coded here.
+function renderFindings(box, f) {
+  box.append(el("p", "section", `findings · ${f.findings.length}`));
+  const list = el("div", "findings-list");
+  for (const code of f.findings) {
+    const row = el("div", "finding");
+    row.append(el("span", "finding-code", code),
+               el("span", "finding-why", ui.findingsDoc[code] || ""));
+    list.append(row);
+  }
+  box.append(list);
 }
 
 function renderReplayDelta(box, f) {

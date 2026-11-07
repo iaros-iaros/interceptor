@@ -550,6 +550,28 @@ error rather than an HTTP status. A synthesized reply is JSON with an
 Deliberately not built: truncated bodies and probabilistic firing. Both are real, neither
 has been asked for, and each costs a column in a row that currently reads as a sentence.
 
+### Passive findings
+
+Interceptor reads the obvious security smells off traffic as it goes past and tags the
+row — a count on the status cell, `2 findings`, with the detail in the tooltip and spelled
+out in the detail pane. It is **passive**: nothing is sent that the application did not
+already send, so it is always safe to leave on. There is no active scanner, and that is a
+deliberate line — a scanner probes and can break a target, which is a different tool.
+
+What it flags: missing `Strict-Transport-Security`, `Content-Security-Policy`, frame
+protection or `X-Content-Type-Options`; cookies set without `Secure`, `HttpOnly` or
+`SameSite`; `Access-Control-Allow-Origin: *` or a reflected origin together with
+credentials; a JWT with `alg:none`; a credential-looking query parameter in the URL;
+HTTP Basic auth, or any credential sent over plain `http`; a `Server`/`X-Powered-By`
+version banner; and an auto-generated directory listing.
+
+**Each finding is reported once.** The key is the thing at fault — the host for a missing
+header, the specific cookie for a cookie flag — so the same smell on all 300 flows of a
+page load is surfaced on the first and not repeated on the rest. A genuinely new one (a
+different host, a different cookie) still shows. The finding travels in the flow's
+metadata, so **`~meta missing-hsts`** is a valid scope and a saved session keeps its
+findings.
+
 ### Sessions
 
 **Save session** writes every flow the engine still has stored — which can be more than

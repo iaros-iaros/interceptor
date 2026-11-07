@@ -575,6 +575,14 @@ td.c-n { color: var(--fg-dim); }
 /* An injected failure looks exactly like a real one. It must never be quiet:
    this is the difference between a test and an hour lost to your own rule. */
 .tag-fault { color: var(--bad); border-color: var(--bad); background: var(--bad-bg); }
+.tag-finding { color: var(--warn); border-color: var(--warn); }
+.tag-edited { color: var(--warn); border-color: var(--warn); }
+.tag-comment { color: var(--fg-dim); border-color: var(--line); }
+
+.findings-list { display: flex; flex-direction: column; gap: 4px; margin: 2px 0 10px; }
+.finding { display: flex; gap: 10px; align-items: baseline; }
+.finding-code { color: var(--warn); min-width: 170px; }
+.finding-why { color: var(--fg-dim); }
 #flows tbody tr.faulted td:first-child { box-shadow: inset 2px 0 0 var(--bad); }
 
 #truncated { padding: 9px var(--pad); font-size: 12.5px; }

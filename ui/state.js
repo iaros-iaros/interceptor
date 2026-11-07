@@ -41,6 +41,9 @@ export const ui = {
   searchBodies: false,
   searchResults: null,  // array of summaries, or null when not in a search
   searchQuery: "",
+  // code -> one-line explanation, from the snapshot. The engine owns the text so
+  // the table and detail pane never hard-code it.
+  findingsDoc: {},
   // Flow ids open in the repeater strip, most recent last.
   repeatTabs: [],
   // Repeater burst settings. Global rather than per-flow: sending the same
