@@ -5,12 +5,21 @@
 // that is already four labelled groups deep -- and "select the row, then find the
 // control" was the shape of every action in this UI until now.
 
-import { copy, el } from "./util.js";
+import { $, copy, el } from "./util.js";
 import { openRepeatTab, ui } from "./state.js";
 import { select, send } from "./transport.js";
 import { refresh } from "./bus.js";
 
 let menu = null;
+
+const esc = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+// Anchored and escaped. A bare hostname is a regex in which every dot matches
+// anything, so `api.example.com` also captured `api-example.com` and any host
+// with that name inside it. The list matches host:port, hence the port.
+export function hostPattern(f) {
+  return `^${esc(f.host)}:${f.port}$`;
+}
 
 function close() {
   menu?.remove();
@@ -53,7 +62,16 @@ export function openMenu(x, y, f) {
   }
   item("Copy URL", () => copy(urlOf(f), "URL"));
   sep();
-  item("Capture only this host", () => send({ type: "hosts.set", hosts: [f.host] }),
+  item("Filter rows to this host", () => {
+    // Through the box rather than table.js: menu.js importing table.js would be
+    // the import cycle bus.js exists to prevent. Body search matches on bodies,
+    // not on the row, so it is switched off first.
+    if (ui.searchBodies) $("#search-bodies").click();
+    const box = $("#row-filter");
+    box.value = `\\s${esc(f.host)}(:\\d+)?\\s`;
+    box.dispatchEvent(new Event("input"));
+  }, "Hide every row from any other host — view only, nothing stops");
+  item("Capture only this host", () => send({ type: "hosts.set", hosts: [hostPattern(f)] }),
        "Replaces the host list with this one host — everything else stops being captured");
   sep();
   item("Export everything as HAR…", () => send({ type: "har.save" }),

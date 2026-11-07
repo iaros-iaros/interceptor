@@ -291,7 +291,8 @@ the toolbar has not grown a button for any of it:
 | **Copy as curl** | A runnable command, straight to the clipboard |
 | **Copy as raw request** | The request as raw text |
 | **Copy URL** | Just the URL |
-| **Capture only this host** | Replaces the Hosts list with this one host |
+| **Filter rows to this host** | Sets the row filter to this host — view only, nothing stops |
+| **Capture only this host** | Replaces the Hosts list with this one host, anchored with its port |
 | **Export everything as HAR…** | Writes the whole capture to `sessions/<timestamp>.har` |
 
 **Copy as curl** is the handoff: a captured request becomes something a developer can run,

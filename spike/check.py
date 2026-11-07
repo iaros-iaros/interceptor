@@ -1321,6 +1321,55 @@ def units_row_filter() -> None:
           not bad, "; ".join(bad) or f"{len(patterns)} patterns correct, bad regex falls back")
 
 
+def units_host_pattern() -> None:
+    """"Capture only this host" used to send the bare hostname, i.e. a regex in
+    which every dot matches anything and nothing is anchored. The pattern is
+    built by the UI and matched by the addon, so the check crosses that line:
+    node builds it, Python matches it the way _off_list does."""
+    import json as _json
+    import re
+
+    harness = r"""
+      import { readFileSync } from "node:fs";
+      const src = readFileSync("ui/menu.js", "utf8");
+      const i = src.indexOf("function hostPattern(");
+      if (i < 0) throw new Error("missing hostPattern");
+      let depth = 0, j = src.indexOf("{", i), end = -1;
+      for (let k = j; k < src.length; k++) {
+        if (src[k] === "{") depth++;
+        else if (src[k] === "}" && --depth === 0) { end = k + 1; break; }
+      }
+      // `esc` is a module-level helper the function leans on; take it along.
+      const esc = src.match(/const esc = [\s\S]*?;\n/)[0];
+      const fn = new Function(esc + src.slice(i, end) + "; return hostPattern;")();
+      console.log(JSON.stringify(JSON.parse(process.env.ROWS).map(fn)));
+    """
+    rows = [{"host": "api.example.com", "port": 443}, {"host": "10.0.0.1", "port": 8080}]
+    out = subprocess.run(["node", "--input-type=module", "-e", harness], cwd=ROOT,
+                         capture_output=True, text=True, timeout=60,
+                         env={**os.environ, "ROWS": _json.dumps(rows)})
+    if out.returncode != 0:
+        return check("the row menu's host pattern is anchored and escaped", False,
+                     f"node failed: {out.stderr.strip()[:200]}")
+    p0, p1 = _json.loads(out.stdout)
+    hit = lambda p, t: bool(re.search(p, t, re.IGNORECASE))  # noqa: E731
+    notes = []
+    if not hit(p0, "api.example.com:443"):
+        notes.append("misses its own host")
+    if hit(p0, "api-example.com:443"):
+        notes.append("a dot matched a dash")
+    if hit(p0, "api.example.com.evil.net:443"):
+        notes.append("not anchored at the end")
+    if hit(p0, "xapi.example.com:443"):
+        notes.append("not anchored at the start")
+    if hit(p0, "api.example.com:8443"):
+        notes.append("the port is not anchored")
+    if not hit(p1, "10.0.0.1:8080") or hit(p1, "10x0y0z1:8080"):
+        notes.append("an IP is not escaped")
+    check("the row menu's host pattern is anchored and escaped", not notes,
+          "; ".join(notes) or f"{p0}  {p1}")
+
+
 def units_ws_classification() -> None:
     """A socket must read as a socket from its handshake, not from its upgrade.
 
@@ -2606,6 +2655,7 @@ async def main() -> int:
     units_chain_flag()
     units_rule_builder()
     units_row_filter()
+    units_host_pattern()
     units_row_sync()
     units_pretty_body()
     units_ws_classification()
