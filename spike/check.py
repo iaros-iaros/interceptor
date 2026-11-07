@@ -28,7 +28,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "spike"))
 sys.path.insert(0, str(ROOT / "addon"))
 
-from spike import WS_RECEIVED, start_http, ws_echo  # noqa: E402
+from spike import WS_RECEIVED, selfsigned, start_http, ws_echo  # noqa: E402
 
 
 def _port(env: str, default: int) -> int:
@@ -42,6 +42,7 @@ PROXY_PORT = _port("IC_TEST_PROXY_PORT", 18080)
 UI_PORT = _port("IC_TEST_UI_PORT", 19000)
 TARGET = ("127.0.0.1", _port("IC_TEST_TARGET_PORT", 18081))
 WS_TARGET = ("127.0.0.1", _port("IC_TEST_WS_PORT", 18082))
+TLS_TARGET = ("127.0.0.1", _port("IC_TEST_TLS_PORT", 18083))
 URL_FILE = ".ui-url.test"
 
 UI = f"http://127.0.0.1:{UI_PORT}"
@@ -704,6 +705,14 @@ def curl(path: str, timeout: int = 25) -> tuple[int, float]:
     return rc, secs
 
 
+def curl_https_code(port: int, timeout: int = 20) -> str:
+    """HTTPS through the proxy, accepting any cert (-k). Returns the status code as
+    a string, or '000' when curl could not complete (a reset, a timeout)."""
+    cmd = ["curl", "-s", "-k", "--max-time", str(timeout), "--noproxy", "", "-x", PROXY,
+           "-o", os.devnull, "-w", "%{http_code}", f"https://127.0.0.1:{port}/"]
+    return subprocess.run(cmd, capture_output=True, text=True).stdout.strip() or "000"
+
+
 async def arm(conn, scope: str, responses: bool | None = None) -> None:
     """Put the proxy in intercept mode with a scope, and wait until it took."""
     if responses is not None:
@@ -909,7 +918,8 @@ async def integration() -> None:
     busy = {
         name: port
         for name, port in (("proxy", PROXY_PORT), ("ui", UI_PORT),
-                           ("target", TARGET[1]), ("ws-target", WS_TARGET[1]))
+                           ("target", TARGET[1]), ("ws-target", WS_TARGET[1]),
+                           ("tls-target", TLS_TARGET[1]))
         if not port_free(port)
     }
     if busy:
@@ -922,6 +932,10 @@ async def integration() -> None:
     (ROOT / URL_FILE).unlink(missing_ok=True)
     start_http(*TARGET)
     ws_srv = await websockets.serve(ws_echo, *WS_TARGET)
+    # A self-signed HTTPS target, to prove TLS pass-through tunnels it undecrypted.
+    import tempfile as _tempfile
+    certdir = _tempfile.TemporaryDirectory(prefix="interceptor-test-tls-")
+    start_http(*TLS_TARGET, tls=selfsigned(Path(certdir.name)))
 
     proc = subprocess.Popen(
         # No --chain: chaining is opt-in, so an instance booted plainly always goes
@@ -1286,6 +1300,30 @@ async def integration() -> None:
             # --- the real page, in a real browser, with all of the above on screen
             await ui_smoke(url)
 
+            # --- TLS pass-through: a listed host is tunnelled, never decrypted
+            # Decrypted first: the proxy terminates TLS to a self-signed upstream
+            # with no ssl_insecure, so it cannot complete -- a 502 (or a reset).
+            decrypted = await asyncio.to_thread(curl_https_code, TLS_TARGET[1])
+            await say(conn, type="hosts.set", hosts=[],
+                      passthrough=[rf"^127\.0\.0\.1:{TLS_TARGET[1]}$"])
+            await recv_until(conn, lambda m: m.get("type") == "state"
+                             and m.get("passthrough_hosts"))
+            await say(conn, type="clear")
+            await recv_until(conn, lambda m: m.get("type") == "cleared")
+            # Tunnelled now: the proxy never opens the connection, so curl -k talks
+            # straight to the self-signed server and gets its 200 -- and nothing of
+            # it is captured.
+            tunnelled = await asyncio.to_thread(curl_https_code, TLS_TARGET[1])
+            await say(conn, type="hello")
+            snap = await recv_until(conn, lambda m: m.get("type") == "snapshot")
+            captured = [f for f in (snap or {}).get("flows", []) if f.get("port") == TLS_TARGET[1]]
+            check("TLS pass-through tunnels a listed host without decrypting it",
+                  tunnelled == "200" and not captured,
+                  f"decrypted→{decrypted}, tunnelled→{tunnelled}, captured {len(captured)}")
+            await say(conn, type="hosts.set", hosts=[], passthrough=[])
+            await recv_until(conn, lambda m: m.get("type") == "state"
+                             and not m.get("passthrough_hosts"))
+
             # --- UI vanishes with a flow still held
             await arm(conn, "~u /hold")
             fut = asyncio.create_task(asyncio.to_thread(curl, "/hold-orphan", 20))
@@ -1302,6 +1340,7 @@ async def integration() -> None:
         except subprocess.TimeoutExpired:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         ws_srv.close()
+        certdir.cleanup()
         (ROOT / URL_FILE).unlink(missing_ok=True)
 
 
@@ -2986,6 +3025,35 @@ def units_remember_cost() -> None:
           "; ".join(notes) or "0 store walks for 5 flows; eviction still drops cursors")
 
 
+def units_passthrough() -> None:
+    """The TLS pass-through list: a connection is tunnelled (never decrypted) when
+    its SNI or its address matches, and a bad pattern is refused at configure."""
+    import interceptor as I
+    from mitmproxy import exceptions
+    from mitmproxy.test import taddons
+
+    addon = I.Interceptor()
+    notes = []
+    with taddons.context(addon) as tctx:
+        tctx.configure(addon, passthrough_hosts=[r"^pinned\.example:443$"])
+        if not addon._passthrough("pinned.example", ("1.2.3.4", 443)):
+            notes.append("did not match on SNI")
+        if addon._passthrough("other.example", ("1.2.3.4", 443)):
+            notes.append("matched a host it should not")
+        if not addon._passthrough(None, ("pinned.example", 443)):
+            notes.append("did not fall back to the address when there is no SNI")
+        tctx.configure(addon, passthrough_hosts=[])
+        if addon._passthrough("pinned.example", ("1.2.3.4", 443)):
+            notes.append("an empty list still matched")
+        try:
+            tctx.configure(addon, passthrough_hosts=["("])
+            notes.append("a bad regex was accepted")
+        except exceptions.OptionsError:
+            pass
+    check("the TLS pass-through list matches SNI or address and rejects a bad pattern",
+          not notes, "; ".join(notes) or "SNI, address fallback, empty and bad-regex all correct")
+
+
 async def units_host_predicate() -> None:
     """Storing and holding must agree on what is on the Hosts list. Quoting the
     patterns into a `~d` filter stripped their backslashes and matched the host
@@ -3295,6 +3363,7 @@ async def main() -> int:
     units_remember_cost()
     units_host_uniform()
     units_host_scope()
+    units_passthrough()
     await units_host_predicate()
     units_scope_atoms()
     units_repeat_burst()

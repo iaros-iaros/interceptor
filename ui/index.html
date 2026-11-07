@@ -107,6 +107,14 @@
       </p>
       <textarea id="hosts-list" rows="4" spellcheck="false" autocomplete="off"
                 placeholder="app.example.com&#10;api.example.com"></textarea>
+      <p class="hint pt-head">
+        <b>Don't decrypt these hosts</b> — a certificate-pinned app that breaks under
+        interception. A matching connection is <em>tunnelled</em>: not decrypted, not
+        shown, nothing of it captured. This is Burp's <em>TLS pass through</em>. Matches
+        <code>host:port</code> (and the SNI), one per line; it applies to new connections.
+      </p>
+      <textarea id="passthrough-list" rows="2" spellcheck="false" autocomplete="off"
+                placeholder="^accounts\.example\.com:443$"></textarea>
       <div class="actions">
         <button id="hosts-apply" class="primary">Apply</button>
         <span id="hosts-status" class="hint"></span>

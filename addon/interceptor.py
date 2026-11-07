@@ -30,7 +30,7 @@ from collections import Counter, OrderedDict
 from datetime import datetime
 from pathlib import Path
 
-from mitmproxy import command, ctx, exceptions, flowfilter, http
+from mitmproxy import command, ctx, exceptions, flowfilter, http, tls
 from mitmproxy.addons import intercept
 from mitmproxy.log import ALERT
 from mitmproxy.proxy.mode_specs import ProxyMode
@@ -381,6 +381,11 @@ class Interceptor:
         loader.add_option("expose", bool, False,
                           "Permit binding off loopback. Refused without this: it publishes an "
                           "open MITM proxy and a UI that rewrites traffic to the whole network.")
+        loader.add_option("passthrough_hosts", list, [],
+                          "TLS pass-through list: regexes matched against host:port (and SNI). "
+                          "A matching connection is tunnelled, never decrypted -- for a "
+                          "certificate-pinned app that breaks under interception. Nothing of it "
+                          "is captured. Burp's 'TLS pass through'.")
 
     def configure(self, updated) -> None:
         # Startup passes every option through here, so this fires before the UI
@@ -389,6 +394,13 @@ class Interceptor:
         # addon even loads -- that is run.sh's job, see the note there.
         if {"listen_host", "ui_host", "mode", "expose"} & set(updated):
             self._check_bind()
+        if "passthrough_hosts" in updated:
+            # Fail loudly at set time rather than silently never matching later.
+            for pat in ctx.options.passthrough_hosts:
+                try:
+                    re.compile(pat)
+                except re.error as e:
+                    raise exceptions.OptionsError(f"bad passthrough host {pat!r}: {e}")
 
     @staticmethod
     def _check_bind() -> None:
@@ -621,6 +633,37 @@ class Interceptor:
             self.bridge.push("flow", **summary(flow))
 
     # ------------------------------------------------------------ hooks
+
+    def tls_clienthello(self, data: tls.ClientHelloData) -> None:
+        """Burp's "TLS pass through": a matching connection is tunnelled, so a
+        certificate-pinned app keeps working and nothing of it is captured.
+
+        This cannot be mitmproxy's own `ignore_hosts`: that option and the Hosts
+        list (`allow_hosts`) are mutually exclusive in next_layer, and an on-list
+        host would win. Deciding it per connection here keeps the two independent --
+        capture *these* hosts, and never decrypt *those*.
+        """
+        try:
+            server = data.context.server
+            if self._passthrough(data.client_hello.sni, server.address):
+                data.ignore_connection = True
+        except Exception as e:  # a bad hook must never wedge the handshake
+            logging.warning(f"interceptor: tls_clienthello: {e!r}")
+
+    @staticmethod
+    def _passthrough(sni: str | None, address) -> bool:
+        """True when this connection should be tunnelled unopened. Matched against
+        `sni:port` and `host:port`, case-insensitive, the way allow_hosts matches."""
+        pats = [p for p in ctx.options.passthrough_hosts if p.strip()]
+        if not pats:
+            return False
+        port = address[1] if address else None
+        targets = []
+        if sni:
+            targets.append(f"{sni}:{port}" if port is not None else sni)
+        if address:
+            targets.append(f"{address[0]}:{address[1]}")
+        return any(re.search(p, t, re.IGNORECASE) for p in pats for t in targets)
 
     def requestheaders(self, flow: http.HTTPFlow) -> None:
         self._maybe_stream(flow.request)
@@ -1108,6 +1151,7 @@ class Interceptor:
             faults=[f.to_spec() for f in self.faults],
             findings=len(self.findings_seen),
             allow_hosts=list(ctx.options.allow_hosts),
+            passthrough_hosts=list(ctx.options.passthrough_hosts),
             proxy=f"{ctx.options.listen_host or '127.0.0.1'}:{ctx.options.listen_port}",
             # So the UI can explain a 502 before the user has to ask anyone.
             env_proxy=self._detected_proxy(),
@@ -1217,7 +1261,7 @@ class Interceptor:
         elif kind == "rules.set":
             self._set_rules(list(msg.get("body") or []), list(msg.get("headers") or []))
         elif kind == "hosts.set":
-            self._set_hosts(list(msg.get("hosts") or []))
+            self._set_hosts(list(msg.get("hosts") or []), msg.get("passthrough"))
         elif kind == "ws.inject":
             self.inject_frame(msg.get("id"), bool(msg.get("to_client")),
                               msg.get("text", ""), bool(msg.get("is_text", True)))
@@ -1488,7 +1532,7 @@ class Interceptor:
 
     # ------------------------------------------------------------ host list
 
-    def _set_hosts(self, hosts: list[str]) -> None:
+    def _set_hosts(self, hosts: list[str], passthrough: list[str] | None = None) -> None:
         """Capture only these hosts. One list, three effects:
 
         * mitmproxy's `allow_hosts` stops terminating TLS for anything else, which
@@ -1519,9 +1563,23 @@ class Interceptor:
                             f"hostname such as  app.example.com  or a regular "
                             f"expression such as  .*\\.example\\.com  -- one per line.")
                 return
+        # Validate the pass-through list too, before touching either option, so a
+        # typo in one never leaves the other half-applied.
+        pt = None
+        if passthrough is not None:
+            pt = [h.strip() for h in passthrough if h.strip()]
+            for pattern in pt:
+                try:
+                    re.compile(pattern)
+                except re.error as e:
+                    self.bridge.push("error",
+                                     message=f"bad pass-through host {pattern!r}: {e}")
+                    return
         previous = list(ctx.options.allow_hosts)
         try:
             ctx.options.update(allow_hosts=cleaned)
+            if pt is not None:
+                ctx.options.update(passthrough_hosts=pt)
         except Exception as e:
             ctx.options.update(allow_hosts=previous)
             self.bridge.push("error", message=f"host list rejected: {e}")

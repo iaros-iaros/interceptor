@@ -359,7 +359,7 @@ client under test waits forever.
 
 | Command | Payload | Effect |
 |---|---|---|
-| `hosts.set` | `hosts`: list of regexes | Capture only these. `[]` captures everything. Patterns match `host:port`, so an end anchor needs the port: `^api\.example\.com:443$`. |
+| `hosts.set` | `hosts`: list of regexes; optional `passthrough`: list of regexes | Capture only `hosts` (`[]` = everything). `passthrough` is the TLS pass-through list: a matching connection is tunnelled, never decrypted or captured. Both match `host:port`, so an end anchor needs the port: `^api\.example\.com:443$`. Omit `passthrough` to leave it unchanged; send `[]` to clear it. |
 | `opt.set` | `intercept_responses`: bool, `hide_noise`: bool | Either or both. |
 | `session.save` | — | Dump the capture to `sessions/<timestamp>.mitm`. Replies `saved`. |
 | `session.load` | `name` | Replace the capture with a saved `.mitm` or `.har` file from `sessions/`. Replies `loaded`. |
@@ -408,7 +408,8 @@ refresh, not a new hold.
 `mode`, `scope`, `queue` (what is held right now, with `id`/`direction`/`host`/`path`),
 `per_host`, `stored`, `bytes`, `evicted`, `noise_hidden`, `hide_noise`,
 `intercept_responses`, `auto_forwarded`, `rules_body`, `rules_headers`, `faults`,
-`allow_hosts`, `proxy`, `env_proxy`, `chained`, `sessions_dir`.
+`findings`, `allow_hosts`, `passthrough_hosts`, `proxy`, `env_proxy`, `chained`,
+`sessions_dir`.
 
 `auto_forwarded` climbing is your signal that flows are escaping unheld — usually
 because nothing was connected, or an edit was too large and closed the socket.

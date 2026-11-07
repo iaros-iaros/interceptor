@@ -151,6 +151,14 @@ api.example.com          # or one line:  .*\.example\.com
 
 It is also **the main speed control**, which is the other half of why it exists.
 
+The panel's second box, **Don't decrypt these hosts**, is the inverse for one specific
+case: a certificate-pinned app that refuses to talk through an intercepting proxy at all.
+A host listed here is **tunnelled** — the connection is passed through without being
+opened, so the app works, but nothing of it is captured or editable. It matches
+`host:port` and the SNI, applies to new connections, and is Burp's *TLS pass through*.
+Unlike the Hosts list, which only ever changes what is *shown*, this changes what is
+*decrypted*.
+
 ### What "capturing" costs
 
 The proxy can only show you an HTTPS request if it breaks the encryption deliberately:
@@ -724,6 +732,7 @@ Everything else is a `--set` flag after `interceptor`:
 | `store_bytes` | `2GB` | Flow store cap **in bytes of captured traffic**. Bodies dominate, so the cap is bytes, not flow count; oldest flows are evicted and the count is shown in the UI. This caps the **store file**, not memory — see Storage. The file runs about half again larger than the cap (serialisation, index and WAL). |
 | `hide_noise` | `true` | Hide browser background chatter (Google telemetry, safebrowsing, gstatic). Counted and reported, never silently dropped. |
 | `allow_hosts` | *(empty)* | The **Hosts** list, presettable from the command line: capture only these. Empty captures everything. |
+| `passthrough_hosts` | *(empty)* | The **Don't decrypt** list, also in the Hosts panel: regexes matched against `host:port` (and SNI). A match is tunnelled, never decrypted, and nothing of it is captured — for a certificate-pinned app. Burp's *TLS pass through*. Survives in `config.yaml`. |
 | `ignore_hosts` | *(empty)* | The inverse, and the one thing the Hosts list cannot express: tunnel *these* hosts and capture everything else — mitmproxy's equivalent of Burp's TLS pass through, for a certificate-pinned host that breaks under interception. Command line only; nothing in the UI writes it, so a value set here survives every mode switch. |
 | `intercept_responses` | `false` | Also stop replies. Same as the *Stop replies* toggle. |
 | `expose` | `false` | Permit binding off loopback. Without it, that is refused outright — see Security. |

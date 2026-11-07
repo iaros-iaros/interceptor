@@ -136,6 +136,8 @@ function renderStats() {
   // silent -- it says so here and again in the mode hint below the toolbar.
   const allow = (state.allow_hosts || []).length;
   if (allow) bits.push(`${allow} host${allow === 1 ? "" : "s"} only`);
+  const nodecrypt = (state.passthrough_hosts || []).length;
+  if (nodecrypt) bits.push(`${nodecrypt} not decrypted`);
   if (state.proxy) {
     // Where traffic actually goes. Chaining is the default now, so the interesting
     // fact is which upstream got adopted -- silence would leave that invisible.
@@ -306,20 +308,26 @@ $("#hosts-toggle").onclick = () => {
   if (!openPanel("#hosts-panel")) return;
   // Show what is actually in force, not what was last typed here.
   $("#hosts-list").value = (ui.state.allow_hosts || []).join("\n");
+  $("#passthrough-list").value = (ui.state.passthrough_hosts || []).join("\n");
   $("#hosts-list").focus();
 };
 $("#hosts-close").onclick = () => openPanel(null);
+const splitLines = (sel) => $(sel).value.split("\n").map((s) => s.trim()).filter(Boolean);
 $("#hosts-apply").onclick = () => {
-  const hosts = $("#hosts-list").value.split("\n").map((s) => s.trim()).filter(Boolean);
-  send({ type: "hosts.set", hosts });
-  $("#hosts-status").textContent = hosts.length
+  const hosts = splitLines("#hosts-list");
+  const passthrough = splitLines("#passthrough-list");
+  send({ type: "hosts.set", hosts, passthrough });
+  const bits = [hosts.length
     ? `capturing ${hosts.length} host(s) only — TLS applies to new connections`
-    : "capturing every host again";
+    : "capturing every host again"];
+  if (passthrough.length) bits.push(`${passthrough.length} not decrypted`);
+  $("#hosts-status").textContent = bits.join(" · ");
   setTimeout(() => ($("#hosts-status").textContent = ""), 6000);
 };
 $("#hosts-clear").onclick = () => {
   $("#hosts-list").value = "";
-  send({ type: "hosts.set", hosts: [] });
+  $("#passthrough-list").value = "";
+  send({ type: "hosts.set", hosts: [], passthrough: [] });
 };
 
 $("#decoder-toggle").onclick = () => {

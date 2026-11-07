@@ -595,6 +595,7 @@ pre.diff { white-space: pre-wrap; word-break: break-word; }
 #flows tbody tr.faulted td:first-child { box-shadow: inset 2px 0 0 var(--bad); }
 #flows tbody tr.marked td:first-child { box-shadow: inset 2px 0 0 var(--accent); }
 .comment-note { color: var(--accent); margin: 2px 0 8px; }
+.pt-head { margin-top: 14px; }
 
 #truncated { padding: 9px var(--pad); font-size: 12.5px; }
 .empty { padding: 26px var(--pad); color: var(--fg-dim); display: grid; gap: 3px; }
