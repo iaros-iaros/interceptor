@@ -34,6 +34,12 @@
         <input id="scope" spellcheck="false" autocomplete="off"
                placeholder="leave empty to stop everything — or narrow it, e.g.  ~u /api/ &amp; ~m POST">
         <button id="scope-help" class="icon" title="What can I type here?" aria-label="Filter syntax help">?</button>
+        <div id="scope-chips" class="chips" aria-label="Scope shortcuts">
+          <button data-scope='!~u "\\.(png|jpe?g|gif|svg|ico|css|js|map|woff2?|ttf)(\\?|$)"'
+                  title="Stop everything except static assets">skip static assets</button>
+          <button data-scope="~u /api/" title="Stop only URLs containing /api/">API only</button>
+          <button data-scope="~m POST" title="Stop only POST requests">POSTs</button>
+        </div>
       </div>
       <!-- Stands in for the scope group's flex:1 while it is hidden, so the
            groups to the right do not jump on every mode change. -->
@@ -45,6 +51,8 @@
                 title="Off: only the request stops, and the reply comes back untouched. On: the reply stops too, on its way to the browser, so you can edit what the app receives. A matching flow then stops twice — once each way.">Stop replies</button>
         <button id="noise" class="toggle"
                 title="Hide the browser's own background chatter from the table. Hidden flows are counted, never dropped.">Hide noise</button>
+        <button id="nocache" class="toggle"
+                title="Strip If-None-Match / If-Modified-Since from requests, so a client other than the launched Chrome cannot 304 its way out of being captured.">No cache</button>
       </div>
 
       <div class="group" role="group" aria-label="Tools">
@@ -52,6 +60,7 @@
         <button id="rules-toggle" title="Rewrite matching traffic automatically, with nothing stopping">Rules</button>
         <button id="hosts-toggle"
                 title="Capture only the hosts you name — everything else is left alone and never appears here. Applies to HTTPS, plain HTTP and WebSockets alike. It is also the main speed control: an unnamed host costs no TLS handshakes, and most of a page's connections are CDNs, fonts and telemetry nobody is testing. Empty means capture every host, which is the default.">Hosts</button>
+        <button id="decoder-toggle" title="Decode base64, URL-encoding, hex and JWTs">Decoder</button>
         <button id="launch" class="go" title="Open a throwaway Chrome already wired to this proxy">Launch Chrome</button>
       </div>
 
@@ -59,7 +68,7 @@
         <span class="group-label">Session</span>
         <button id="save-session" title="Write the captured flows to sessions/ — nothing is ever saved on its own">Save</button>
         <button id="open-session" title="Reopen a saved session, replacing what is on screen">Open</button>
-        <button id="clear" class="danger" title="Empty the table. Does not touch saved sessions.">Clear</button>
+        <button id="clear" class="danger" title="Empty the table. Flows still stopped stay, and so do saved sessions.">Clear</button>
       </div>
     </div>
 
@@ -106,6 +115,14 @@
       </p>
       <textarea id="hosts-list" rows="4" spellcheck="false" autocomplete="off"
                 placeholder="app.example.com&#10;api.example.com"></textarea>
+      <p class="hint pt-head">
+        <b>Don't decrypt these hosts</b> — a certificate-pinned app that breaks under
+        interception. A matching connection is <em>tunnelled</em>: not decrypted, not
+        shown, nothing of it captured. This is Burp's <em>TLS pass through</em>. Matches
+        <code>host:port</code> (and the SNI), one per line; it applies to new connections.
+      </p>
+      <textarea id="passthrough-list" rows="2" spellcheck="false" autocomplete="off"
+                placeholder="^accounts\.example\.com:443$"></textarea>
       <div class="actions">
         <button id="hosts-apply" class="primary">Apply</button>
         <span id="hosts-status" class="hint"></span>
@@ -122,6 +139,20 @@
         core. A host you do not name skips all of that. The speed half applies to
         <b>new connections only</b>; the capture half applies immediately.
       </p>
+    </div>
+  </section>
+
+  <section id="decoder" class="panel" hidden>
+    <div class="panel-head">
+      <b>Decoder</b>
+      <span class="dim">base64, URL-encoding, hex and JWTs — decoded as you type</span>
+      <span class="grow"></span>
+      <button id="decoder-close">Close</button>
+    </div>
+    <div class="panel-body">
+      <textarea id="decoder-input" rows="3" spellcheck="false" autocomplete="off"
+                placeholder="paste a token, a base64/hex/URL-encoded value, or a JWT"></textarea>
+      <div id="decoder-out"></div>
     </div>
   </section>
 
@@ -151,6 +182,16 @@
         </div>
         <div id="header-rules" class="rule-list"></div>
         <button id="add-header-rule">+ Add a header rule</button>
+      </div>
+
+      <div class="rule-block">
+        <div class="rule-block-head">
+          <b>Serve a local file</b>
+          <span class="hint">Return a file from disk for any URL that matches — map-local.
+            The path is read on the machine running Interceptor.</span>
+        </div>
+        <div id="local-rules" class="rule-list"></div>
+        <button id="add-local-rule">+ Add a local-file rule</button>
       </div>
 
       <!-- Same axis as the rules above — change matching traffic automatically,

@@ -96,6 +96,23 @@ outright (`SIGKILL`, a crash), check your temp directory for a leftover
 To use your own client instead, point it at `http://127.0.0.1:8080` and trust
 `~/.mitmproxy/mitmproxy-ca-cert.pem`.
 
+### Other clients — phones, curl, Electron
+
+Anything you can point at an HTTP proxy works, not just the launched Chrome:
+
+- **Point the client at the proxy.** `http://127.0.0.1:8080` on this machine, or the
+  machine's LAN IP from a phone (which needs `--set expose=true` and a firewall — see
+  Security).
+- **Install the CA in that client.** Open **`http://mitm.it`** *through the proxy* — the
+  proxy serves a page with the certificate and per-platform instructions (iOS, Android,
+  Firefox, curl…). This is mitmproxy's own onboarding page; nothing of yours is uploaded.
+- **Mind the two silent bypasses.** Every HTTP client skips the proxy for `localhost`
+  (curl ≥7.86 needs `--noproxy ""`, Node reads `NO_PROXY`), and Chrome bypasses it over
+  QUIC (`--disable-quic`). A request that just never appears is almost always one of these.
+
+The isolated-Chrome launcher exists so you don't have to do any of this for a quick look;
+`mitm.it` is the path for everything else.
+
 ## The UI
 
 The toolbar is grouped and labelled: the mode buttons, then **Stop flows matching**
@@ -151,6 +168,14 @@ api.example.com          # or one line:  .*\.example\.com
 
 It is also **the main speed control**, which is the other half of why it exists.
 
+The panel's second box, **Don't decrypt these hosts**, is the inverse for one specific
+case: a certificate-pinned app that refuses to talk through an intercepting proxy at all.
+A host listed here is **tunnelled** — the connection is passed through without being
+opened, so the app works, but nothing of it is captured or editable. It matches
+`host:port` and the SNI, applies to new connections, and is Burp's *TLS pass through*.
+Unlike the Hosts list, which only ever changes what is *shown*, this changes what is
+*decrypted*.
+
 ### What "capturing" costs
 
 The proxy can only show you an HTTPS request if it breaks the encryption deliberately:
@@ -193,6 +218,11 @@ Three things to know about it:
 - **A bad filter is refused, not stored.** The field turns red, a message says why, and the
   filter that was already working stays in force. Note that filter syntax is *not* rules
   syntax: `~u /api/`, never `|~u /api/` — the leading separator belongs to rewrite rules.
+
+Three **chips** beside the field fill in a common filter with one click: *skip static
+assets* (stop everything except images, CSS, JS and fonts), *API only* (`~u /api/`), and
+*POSTs* (`~m POST`). They set the box and apply it, so the filter is still visible and
+editable afterwards.
 
 The `?` beside the field opens the filter reference.
 
@@ -258,6 +288,8 @@ same kind of hunt.
   far older than the 500 rows the table renders. Toggle it off to go back to hiding rows.
 - **Streamed bodies are never buffered**, so they are not searchable — the same limit that
   makes them uneditable.
+- **WebSocket text frames are searchable once the socket has closed.** A flow goes into
+  the index when it finalises, and an open socket has not yet; binary frames never do.
 - Text is matched literally, `%` and `_` included. This box is a substring search, not a
   regex; the row filter is the one that takes a regex.
 
@@ -291,7 +323,11 @@ the toolbar has not grown a button for any of it:
 | **Copy as curl** | A runnable command, straight to the clipboard |
 | **Copy as raw request** | The request as raw text |
 | **Copy URL** | Just the URL |
-| **Capture only this host** | Replaces the Hosts list with this one host |
+| **Filter rows to this host** | Sets the row filter to this host — view only, nothing stops |
+| **Mark / Unmark** | Flags the flow — matchable as `~marked`, kept in a saved session |
+| **Comment… / Edit comment…** | Attaches a searchable note — matchable as `~comment` |
+| **Mark for compare / Compare with marked flow** | Diffs two flows (see Comparer) |
+| **Capture only this host** | Replaces the Hosts list with this one host, anchored with its port |
 | **Export everything as HAR…** | Writes the whole capture to `sessions/<timestamp>.har` |
 
 **Copy as curl** is the handoff: a captured request becomes something a developer can run,
@@ -320,6 +356,15 @@ you an editor, and it says so — *edits apply to the copy, not the original*. U
 probe the server (change a field, resend, compare `replay · status 200 → 403`); use
 Intercept or a rule to change what the app itself receives.
 
+### Decoder
+
+Two shapes. Any **JWT in a header** — a bearer token, a session cookie — is decoded in
+place under the headers: its algorithm, its expiry (flagged red once past), and its claims,
+without leaving the pane. And a **Decoder panel** (Tools → Decoder) takes anything you
+paste and shows every way it plausibly decodes — base64 or base64url, URL percent-encoding,
+hex, or a JWT — updating as you type. It decodes only; it never verifies a signature, and
+plain text yields nothing rather than a wall of false guesses.
+
 ### Reading a body
 
 Bodies are rendered through mitmproxy's own content views, so what you get is structured
@@ -332,6 +377,11 @@ body · 412B · shown as protobuf
 ```
 
 — and stays silent for plain text, where there is nothing to add.
+
+The **Response** tab also shows a **TLS** section: the negotiated version, cipher, ALPN
+and SNI, and the server's leaf certificate — common name, subject alternative names,
+issuer, validity window (an expired `not after` is flagged red) and SHA-256 fingerprint.
+It is read from the connection to the real server, which is the side you are assessing.
 
 **This is display only, and that distinction matters.** The editor, the Repeater and the
 raw view all still hold the exact bytes off the wire. A protobuf rendering cannot be
@@ -384,6 +434,16 @@ into load. A delay of `0` therefore means back-to-back, one at a time — not al
   use. These are foot-gun guards, not policy: a mistyped `1000` in a field meant for `10`
   is a thousand real requests at a real service.
 
+**Payloads (intruder-lite).** Below the editor is a payload list. Select a spot in the
+request, press **§ mark selection** to wrap it in `§…§`, then paste one value per line:
+each is substituted into the marker and sent in turn, and every send is listed with the
+value that produced it. It is Burp's sniper with a single position set — one marker, one
+list. The run is sequential and honours the delay, exactly like a plain repeat, so it is a
+labelled sweep rather than a flood; the send cap (1000) and the delay cap (60s) still
+apply, and a marker with no payloads, or payloads with no marker, is refused rather than
+putting a literal `§` on the wire. Cluster-bomb and multi-position sweeps are deliberately
+not built — they are a different tool, and the §-marker keeps this one a one-liner.
+
 One caveat that is the browser's and not this tool's: a **backgrounded tab** has its timers
 clamped to roughly one second, so a run left in a hidden tab paces itself at about 1s per
 step regardless of the delay you set. Keep the tab visible if the interval matters.
@@ -422,6 +482,13 @@ On forward:
 - A multipart body comes back byte-for-byte when you edit only the headers — its CRLFs
   are what make the boundaries valid. Editing the **body** of a CRLF message does convert
   them to LF: a browser textarea cannot hold a CRLF. The editor warns when that applies.
+- A flow you forward with an edit is tagged **`edited`** in the table (on the method) and
+  noted in the detail pane, so a hand-tampered request is never later mistaken for one the
+  server or the app produced. A plain forward is not tagged.
+
+**Keyboard, while a flow is held:** `⌘/Ctrl+Enter` forwards, `⌘/Ctrl+Shift+Enter` forwards
+and stops the reply, `⌘/Ctrl+Shift+D` drops. Plain Enter still types a newline in the
+editor, so the modifier is required.
 
 **Stop replies is off by default.** Left off, only the request stops and the reply
 comes back untouched. Turned on, the reply stops as well on its way to the browser, so a
@@ -461,6 +528,13 @@ separator**, so you never type it — press **Show generated syntax** to see wha
 Anything the form cannot express — a status code, a content type, a header condition —
 appears as an **advanced** row holding the raw string, editable as text. Nothing you
 write by hand is ever rewritten into a form.
+
+**Serve a local file.** A third block maps a URL to a file on disk: *when URL matches
+`/app\.js` serve `/tmp/patched.js`*. A matching request is answered from that file instead
+of the server — mitmproxy's map-local, for swapping a script or a response while you work
+on it. The path is read on the machine running Interceptor, the same trust the rewrite
+rules already carry, and a path that does not exist is refused when you press Apply rather
+than served as a silent 404.
 
 **What rules cannot do.** They are mitmproxy's `modify_body` and `modify_headers`, so
 they reach the body text and the headers — nothing else. No changing the method, the URL
@@ -537,11 +611,35 @@ error rather than an HTTP status. A synthesized reply is JSON with an
 Deliberately not built: truncated bodies and probabilistic firing. Both are real, neither
 has been asked for, and each costs a column in a row that currently reads as a sentence.
 
+### Passive findings
+
+Interceptor reads the obvious security smells off traffic as it goes past and tags the
+row — a count on the status cell, `2 findings`, with the detail in the tooltip and spelled
+out in the detail pane. It is **passive**: nothing is sent that the application did not
+already send, so it is always safe to leave on. There is no active scanner, and that is a
+deliberate line — a scanner probes and can break a target, which is a different tool.
+
+What it flags: missing `Strict-Transport-Security`, `Content-Security-Policy`, frame
+protection or `X-Content-Type-Options`; cookies set without `Secure`, `HttpOnly` or
+`SameSite`; `Access-Control-Allow-Origin: *` or a reflected origin together with
+credentials; a JWT with `alg:none`; a credential-looking query parameter in the URL;
+HTTP Basic auth, or any credential sent over plain `http`; a `Server`/`X-Powered-By`
+version banner; and an auto-generated directory listing.
+
+**Each finding is reported once.** The key is the thing at fault — the host for a missing
+header, the specific cookie for a cookie flag — so the same smell on all 300 flows of a
+page load is surfaced on the first and not repeated on the rest. A genuinely new one (a
+different host, a different cookie) still shows. The finding travels in the flow's
+metadata, so **`~meta missing-hsts`** is a valid scope and a saved session keeps its
+findings.
+
 ### Sessions
 
 **Save session** writes every flow the engine still has stored — which can be more than
 the rows on screen — to `sessions/<timestamp>.mitm`. **Open session** lists that folder and
-loads one back, replacing what is on screen.
+loads one back, replacing what is on screen. The list includes **`.har`** files too — a
+HAR exported here or captured in another tool's devtools opens straight into the table and
+the Repeater, because mitmproxy reads HAR as readily as its own format.
 
 No session is ever written for you. The `sessions/` folder isn't created until your first
 save, and closing Interceptor mid-session discards the capture — a fresh instance always
@@ -608,6 +706,15 @@ scan is milliseconds.
 Loaded flows can be edited and re-sent through the Repeater, so yesterday's request can
 be replayed today.
 
+### Comparer
+
+**Compare with marked flow** (row menu) diffs two flows line by line: right-click one and
+**Mark for compare**, then right-click another and **Compare with marked flow**. A replay
+also carries a **Diff vs original** button in its detail pane, which is the common case —
+*what exactly did my edit change in the response?* The diff is built from the start line,
+the headers and the prettified body, so a one-line JSON reply shows its changed fields
+rather than one long changed line. It replaces the body view until you press **Hide diff**.
+
 ### WebSockets
 
 Sockets live under the **WebSocket** tab of the flow table, separate from HTTP. Select one
@@ -628,7 +735,7 @@ Repeat is hidden for WebSocket flows — mitmproxy's client replay refuses them.
 
 Everything above is reachable from a script or an AI agent — the UI has no privileged
 path, it is a WebSocket client like any other. Start with `IC_OPEN_UI=false`, read the
-token from `.ui-url`, and speak the same twenty commands the browser does.
+token from `.ui-url`, and speak the same commands the browser does.
 
 The protocol, the payloads, and the traps are in **[AGENT-API.md](AGENT-API.md)**.
 
@@ -658,10 +765,42 @@ Everything else is a `--set` flag after `interceptor`:
 | `store_bytes` | `2GB` | Flow store cap **in bytes of captured traffic**. Bodies dominate, so the cap is bytes, not flow count; oldest flows are evicted and the count is shown in the UI. This caps the **store file**, not memory — see Storage. The file runs about half again larger than the cap (serialisation, index and WAL). |
 | `hide_noise` | `true` | Hide browser background chatter (Google telemetry, safebrowsing, gstatic). Counted and reported, never silently dropped. |
 | `allow_hosts` | *(empty)* | The **Hosts** list, presettable from the command line: capture only these. Empty captures everything. |
+| `passthrough_hosts` | *(empty)* | The **Don't decrypt** list, also in the Hosts panel: regexes matched against `host:port` (and SNI). A match is tunnelled, never decrypted, and nothing of it is captured — for a certificate-pinned app. Burp's *TLS pass through*. Survives in `config.yaml`. |
 | `ignore_hosts` | *(empty)* | The inverse, and the one thing the Hosts list cannot express: tunnel *these* hosts and capture everything else — mitmproxy's equivalent of Burp's TLS pass through, for a certificate-pinned host that breaks under interception. Command line only; nothing in the UI writes it, so a value set here survives every mode switch. |
 | `intercept_responses` | `false` | Also stop replies. Same as the *Stop replies* toggle. |
+| `faults` | *(empty)* | Fault rules, one JSON object per entry (`{url, delay_ms, status, body, drop}`). Set from the UI or `config.yaml`; a bad one fails startup rather than arming nothing. |
 | `expose` | `false` | Permit binding off loopback. Without it, that is refused outright — see Security. |
 | `ssl_insecure` | `false` | Accept self-signed/expired certs on upstream targets. Commented out in `run.sh`. |
+| `map_local` | *(empty)* | Map-local rules, the **Serve a local file** block: `|url-regex|path` serves that file for a matching URL. Set from the UI or `config.yaml`. |
+| `anticache` | `false` | Strip `If-None-Match`/`If-Modified-Since` so a client cannot 304 out of being captured. Same as the **No cache** toggle. |
+
+### Keeping rules across restarts
+
+Every rule the UI sets is a mitmproxy option, so dropping them in
+`~/.mitmproxy/config.yaml` arms them at every launch — no UI, no scripting:
+
+```yaml
+# ~/.mitmproxy/config.yaml
+allow_hosts:
+  - "^app\\.example\\.com:443$"
+passthrough_hosts:
+  - "^accounts\\.example\\.com:443$"
+modify_body:
+  - "/~s/password/REDACTED"
+modify_headers:
+  - "/~q/x-test/1"
+map_local:
+  - "|/app\\.js|/tmp/patched.js"
+faults:
+  - '{"url": "/checkout", "status": 503}'
+intercept_responses: false
+hide_noise: true
+anticache: false
+```
+
+A malformed rule here fails startup with a clear message rather than coming up armed with
+something you cannot see. The in-UI panels read and write the same options, so a rule set
+in `config.yaml` shows up in the panel and vice versa.
 
 ### Behind a proxy or VPN client
 
@@ -723,6 +862,11 @@ commands that rewrite traffic. It is protected by two independent gates:
    **fragment** (`#token=…`), which is never sent in `Referer` headers and never written
    to server logs.
 
+Behind those, every page is served with a **Content-Security-Policy** that allows no
+inline script, nothing from a foreign origin, and no framing — so even a rendering bug
+that let captured text through as markup could not run anything or phone anywhere. The
+check suite proves the markup has nothing inline for it to block.
+
 Also:
 
 - **Binding off loopback is refused.** The proxy port has no authentication at all, so
@@ -759,7 +903,7 @@ Also:
 
 ```bash
 .venv/bin/python spike/spike.py --chrome --net    # browser + network reality   4/4
-.venv/bin/python spike/check.py                   # units + end-to-end        79/79
+.venv/bin/python spike/check.py                   # units + end-to-end      103/103
 ```
 
 Both are safe to run while a real instance is up — separate ports (`18xxx`/`19000`), their
@@ -811,8 +955,9 @@ more than a couple of flows alive at once, and the event loop running meanwhile;
 **replacement containing the separator** without changing the rule; and a **URL regex
 meaning what it says** — `(1|2)`, `\.`, `$` — in rules and faults alike.
 
-Five units also run shipped frontend functions under `node`: the rule form's compose/parse
-pair from `ui/rules.js` (every spec it generates is fed to mitmproxy's real
+Six units also run shipped frontend functions under `node`: the row menu's host pattern
+from `ui/menu.js` (built in JS, then matched in Python exactly as the addon does), the
+rule form's compose/parse pair from `ui/rules.js` (every spec it generates is fed to mitmproxy's real
 `parse_modify_spec`), the row filter and the row sync from `ui/table.js` (text, regex,
 case-insensitivity, invalid-regex fallback; a row that stays on screen is never detached,
 which is what lost clicks under traffic), the editor's pretty-printer from `ui/util.js` and `ui/detail.js`
@@ -821,9 +966,15 @@ body never mistaken for the header separator), and the repeater's burst clamp fr
 `ui/detail.js` (negatives, blanks, junk and absurd numbers all landing somewhere sane, and
 a count that can never clamp to zero — a Send that sends nothing reads as broken).
 
-**Not covered:** anything needing a DOM — `index.html`, `style.css` and every rendering
-path across the `ui/` modules; `node --check` is syntax-only. Also the `error`-hook queue
-cleanup, the noise counter, `launch_chrome`'s flags, and concurrent held flows.
+**In a real browser:** `check.py` also launches headless Chrome against the live
+instance and drives it over the DevTools protocol — the page loads under its CSP, the
+bridge connects, a captured row renders, a click opens the detail pane, and the console
+stays clean. Breaking `app.js` with a duplicate `const` fails it, which is the bug that
+motivated it. Skipped when Chrome is not installed; both CI images have it.
+
+**Not covered:** layout, dragging, keyboard shortcuts and every rendering path the smoke
+test does not click through; the `error`-hook queue cleanup; the noise counter;
+`launch_chrome`'s flags; concurrent held flows.
 
 Neither suite talks to the internet through a real browser, and that gap has cost real
 bugs: a WebSocket handshake showing under HTTP until it upgraded, and Chrome's own cache
@@ -855,7 +1006,7 @@ ui/
   style.css        # every colour a CSS custom property, defined for both themes
   theme.js         # light/dark, shared by app and docs
   rules-doc.js     # rule reference — one source for the modal and the page
-  rules.html       # renders rules-doc.js standalone
+  rules.html       # renders rules-doc.js standalone, via rules-page.js
   icon.png         # app icon and favicon
 sessions/          # created on first save or HAR export; gitignored, dir 0700, files 0600
 spike/

@@ -5,12 +5,21 @@
 // that is already four labelled groups deep -- and "select the row, then find the
 // control" was the shape of every action in this UI until now.
 
-import { copy, el } from "./util.js";
+import { $, copy, el, note } from "./util.js";
 import { openRepeatTab, ui } from "./state.js";
 import { select, send } from "./transport.js";
 import { refresh } from "./bus.js";
 
 let menu = null;
+
+const esc = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+// Anchored and escaped. A bare hostname is a regex in which every dot matches
+// anything, so `api.example.com` also captured `api-example.com` and any host
+// with that name inside it. The list matches host:port, hence the port.
+export function hostPattern(f) {
+  return `^${esc(f.host)}:${f.port}$`;
+}
 
 function close() {
   menu?.remove();
@@ -53,7 +62,42 @@ export function openMenu(x, y, f) {
   }
   item("Copy URL", () => copy(urlOf(f), "URL"));
   sep();
-  item("Capture only this host", () => send({ type: "hosts.set", hosts: [f.host] }),
+  item(f.marked ? "Unmark" : "Mark", () => send({ type: "flow.mark", id: f.id, marked: !f.marked }),
+       "Flag this flow — matchable in the stop filter as ~marked");
+  item(f.comment ? "Edit comment…" : "Comment…", () => {
+    // prompt is the laziest editor that works for a one-line note, and a comment
+    // is exactly that; it is searchable and kept in a saved session.
+    const text = window.prompt("Comment on this flow:", f.comment || "");
+    if (text !== null) send({ type: "flow.comment", id: f.id, text });
+  }, "Attach a note — searchable, and matchable as ~comment");
+  sep();
+  // Comparer: mark one flow, then diff a second against it. A dedicated mark
+  // rather than "the selected flow" because right-clicking a row selects it, so
+  // "selected" would always be this row by the time the menu opens.
+  if (!f.ws) {
+    item("Mark for compare", () => {
+      ui.compareBase = f.id;
+      note("Marked. Right-click another flow → “Compare with marked flow”.", true);
+    }, "Pick this flow as one side of a diff");
+    if (ui.compareBase && ui.compareBase !== f.id) {
+      item("Compare with marked flow", () => {
+        select(f.id);
+        ui.which = "response";
+        send({ type: "diff", a: ui.compareBase, b: f.id, which: "response" });
+      }, "Diff this flow's response against the marked one");
+    }
+    sep();
+  }
+  item("Filter rows to this host", () => {
+    // Through the box rather than table.js: menu.js importing table.js would be
+    // the import cycle bus.js exists to prevent. Body search matches on bodies,
+    // not on the row, so it is switched off first.
+    if (ui.searchBodies) $("#search-bodies").click();
+    const box = $("#row-filter");
+    box.value = `\\s${esc(f.host)}(:\\d+)?\\s`;
+    box.dispatchEvent(new Event("input"));
+  }, "Hide every row from any other host — view only, nothing stops");
+  item("Capture only this host", () => send({ type: "hosts.set", hosts: [hostPattern(f)] }),
        "Replaces the host list with this one host — everything else stops being captured");
   sep();
   item("Export everything as HAR…", () => send({ type: "har.save" }),

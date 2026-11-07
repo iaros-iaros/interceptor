@@ -64,6 +64,7 @@ function handle(m) {
   switch (m.type) {
     case "snapshot":
       forgetAll();
+      if (m.findings_doc) ui.findingsDoc = m.findings_doc;
       for (const f of m.flows) flows.set(f.id, f);
       break;
     case "flow": {
@@ -132,12 +133,22 @@ function handle(m) {
     case "export":
       copy(m.text, m.format === "curl" ? "curl command" : m.format);
       break;
+    case "diff":
+      ui.diff = m;
+      // The detail object did not change, so force renderDetail to rebuild.
+      if (m.b === ui.sel) $("#detail-body").dataset.key = "";
+      break;
     case "har":
       note(`HAR written to ${m.dir}/${m.name}`, true);
       break;
-    case "cleared":
+    case "cleared": {
+      // The server re-sends every hold right after this, so a half-typed edit on
+      // a held flow must survive the Clear; everything else goes.
+      const keep = [...drafts].filter(([k]) => held.has(k.split(":")[0]));
       forgetAll();
+      for (const [k, v] of keep) drafts.set(k, v);
       break;
+    }
     case "sessions":
       ui.sessions = m.items || [];
       $("#sessions-dir").textContent = m.dir || "";

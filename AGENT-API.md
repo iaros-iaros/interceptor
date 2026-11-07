@@ -1,7 +1,7 @@
 # Driving Interceptor from an agent
 
 Everything the UI can do, an agent can do. There is no privileged path: the browser
-UI is a WebSocket client like any other, and the twenty commands below are the whole
+UI is a WebSocket client like any other, and the commands below are the whole
 surface. This document is that surface, written for a program rather than a person.
 
 Every command and payload here was exercised against a running instance — see
@@ -132,7 +132,10 @@ is connected, Intercept holds nothing at all: flows sail through and are counted
 
 `rules.set`, `faults.set`, `hosts.set`, `mode.set` and `opt.set` live on the server.
 They survive your disconnect and apply to whatever connects next — including the human's
-browser. An agent that sets a 503 fault and crashes leaves that fault armed.
+browser. An agent that sets a 503 fault and crashes leaves that fault armed. Several of
+them (`modify_body`, `modify_headers`, `map_local`, `allow_hosts`, `passthrough_hosts`,
+`faults`, `anticache`, `intercept_responses`) are mitmproxy options, so a value in
+`~/.mitmproxy/config.yaml` is armed at startup before any client connects.
 
 Reset what you set, in a `finally`:
 
@@ -166,7 +169,7 @@ not close the connection.
 | Command | Payload | Effect |
 |---|---|---|
 | `hello` | — | Server replies `snapshot` (to you) + `state`. Send it first, and again any time you want a fresh snapshot. |
-| `clear` | — | Wipe the store. Replies `cleared` + `state`. Also resets the noise and auto-forward counters. |
+| `clear` | — | Wipe the store. Replies `cleared` + `state`. Also resets the noise and auto-forward counters. Flows still held are kept, and their `flow.paused` is re-sent after `cleared`. |
 
 ### Mode and scope
 
@@ -252,6 +255,7 @@ other than the line endings.
 | `frames.get` | `id` | `frames` — the full WebSocket frame history |
 | `search` | `q` | `results` — flows whose URL, headers or bodies contain `q` |
 | `export` | `id`, `format`: `curl` \| `httpie` \| `raw_request` \| `raw` | `export` with `text` |
+| `diff` | `a`, `b` (flow ids), `which`: `"request"` \| `"response"` | `diff` with a unified-diff `text` |
 
 `snapshot` and `flow` pushes carry **summaries only**. Bodies never arrive unasked —
 call `body.get` for the flow you care about. Held flows are the exception: `flow.paused`
@@ -259,6 +263,12 @@ already includes `detail`, so no round trip is needed to edit one.
 
 `search` is a substring scan over URL, headers and both bodies, capped at 2000 results.
 It is the only way to ask "which response carried this token".
+
+`diff` compares two flows and replies with a unified diff of the chosen side, built from
+start line, headers and the prettified body — so a one-line JSON reply diffs field by
+field. It is the Comparer: `status`/`resp_bytes` deltas in the summaries say *that* two
+responses differ; this says *how*. A flow that is streamed or too large to render as text
+is refused with an `error`.
 
 ### Rewrite rules — no pausing
 
@@ -270,6 +280,13 @@ wants: set rules, drive the app, read the results.
  "body":    ["/~u /api/pay/amount/AMT"],
  "headers": ["/~u /api/x-agent/1"]}
 ```
+
+`rules.set` also takes an optional **`local`**: a list of map-local specs
+`<sep><url-regex><sep><file-path>` (separator any character absent from both). A matching
+request is answered from that file instead of the server. The file must exist or the whole
+list is refused with an `error`. Omit `local` to leave the map-local rules unchanged; send
+`[]` to clear them. `opt.set` takes **`anticache`** (bool) to strip conditional-request
+headers. `state` reports `rules_local` and `anticache`.
 
 Spec syntax is `<sep><flow-filter><sep><pattern><sep><replacement>`, where `<sep>` is
 any character absent from the pattern (`/` above). Body patterns are **regexes**; header
@@ -308,12 +325,18 @@ from a real one.
 ### Repeater
 
 ```json
-{"type": "replay", "id": "<flow id>", "raw": "<edited request, or omitted>"}
+{"type": "replay", "id": "<flow id>", "raw": "<edited request, or omitted>",
+ "label": "<optional payload tag>"}
 ```
 
 Replays a **copy**, so the original row is preserved for comparison. The new flow's
 summary carries `replay_of: "<original id>"` and `is_replay: true`. There is no reply
 message — watch for the new `flow` push, or search for it.
+
+`label` (optional, ≤200 chars) tags the copy in its `label` summary field, so a sweep of
+substituted values reads as a list that names each one. This is how the UI's payload
+sweep (intruder-lite) labels its sends; a scripted client does the same by sending one
+`replay` per payload with the value in `label` and the substitution already made in `raw`.
 
 Rejected for WebSocket flows: mitmproxy's client replay refuses them.
 
@@ -346,13 +369,15 @@ client under test waits forever.
 
 | Command | Payload | Effect |
 |---|---|---|
-| `hosts.set` | `hosts`: list of regexes | Capture only these. `[]` captures everything. Patterns match `host:port`, so an end anchor needs the port: `^api\.example\.com:443$`. |
-| `opt.set` | `intercept_responses`: bool, `hide_noise`: bool | Either or both. |
+| `hosts.set` | `hosts`: list of regexes; optional `passthrough`: list of regexes | Capture only `hosts` (`[]` = everything). `passthrough` is the TLS pass-through list: a matching connection is tunnelled, never decrypted or captured. Both match `host:port`, so an end anchor needs the port: `^api\.example\.com:443$`. Omit `passthrough` to leave it unchanged; send `[]` to clear it. |
+| `opt.set` | `intercept_responses`: bool, `hide_noise`: bool, `anticache`: bool | Any of them. `anticache` strips `If-None-Match`/`If-Modified-Since`. |
 | `session.save` | — | Dump the capture to `sessions/<timestamp>.mitm`. Replies `saved`. |
-| `session.load` | `name` | Replace the capture with a saved one. Replies `loaded`. |
+| `session.load` | `name` | Replace the capture with a saved `.mitm` or `.har` file from `sessions/`. Replies `loaded`. |
 | `sessions.list` | — | Replies `sessions`. |
 | `har.save` | — | Write the whole capture as HAR into `sessions/`. Replies `har`. |
 | `browser.launch` | — | Launch throwaway-profile Chrome wired to the proxy. Rarely what a headless agent wants. |
+| `flow.mark` | `id`, `marked`: bool | Flag or unflag a flow. Matchable as `~marked`, kept in a saved session. |
+| `flow.comment` | `id`, `text` | Attach a note (≤2000 chars). Matchable as `~comment <regex>`, kept in a saved session. |
 
 `hosts.set` is not a security control — an unlisted host still reaches the client, it is
 simply not captured. It is a performance and noise control, and a big one: TLS is not
@@ -368,7 +393,7 @@ token-gated, so serving a capture there would publish it to any page the user ha
 
 | Type | When | Key fields |
 |---|---|---|
-| `snapshot` | After `hello` | `flows` — up to 2000 newest summaries, oldest first |
+| `snapshot` | After `hello` | `flows` — up to 2000 newest summaries, oldest first; `findings_doc` — the finding code → explanation map |
 | `state` | After most commands, and once a second under traffic | see below |
 | `flow` | A flow was recorded or updated | the summary fields, inline |
 | `flow.paused` | A flow is held | `id`, `direction`, `summary`, and `detail` (HTTP) or `frame` (WebSocket) |
@@ -376,6 +401,7 @@ token-gated, so serving a capture there would publish it to any page the user ha
 | `frames` | Reply to `frames.get` | `id`, `frames` |
 | `results` | Reply to `search` | `q`, `flows` |
 | `export` | Reply to `export` | `id`, `format`, `text` |
+| `diff` | Reply to `diff` | `a`, `b`, `which`, `text` |
 | `har` / `saved` / `loaded` / `sessions` / `cleared` | their commands | `name`, `bytes`, `flows`, `items`, `dir` |
 | `error` | Anything rejected | `message`, sometimes `id` |
 
@@ -392,7 +418,8 @@ refresh, not a new hold.
 `mode`, `scope`, `queue` (what is held right now, with `id`/`direction`/`host`/`path`),
 `per_host`, `stored`, `bytes`, `evicted`, `noise_hidden`, `hide_noise`,
 `intercept_responses`, `auto_forwarded`, `rules_body`, `rules_headers`, `faults`,
-`allow_hosts`, `proxy`, `env_proxy`, `chained`, `sessions_dir`.
+`findings`, `allow_hosts`, `passthrough_hosts`, `proxy`, `env_proxy`, `chained`,
+`sessions_dir`.
 
 `auto_forwarded` climbing is your signal that flows are escaping unheld — usually
 because nothing was connected, or an edit was too large and closed the socket.
@@ -400,7 +427,21 @@ because nothing was connected, or an edit was too large and closed the socket.
 **Summary** fields, on every row: `id`, `method`, `scheme`, `host`, `port`, `path`,
 `http_version`, `status`, `ctype`, `req_bytes`, `resp_bytes`, `start`, `ms`, `ws`,
 `ws_frames`, `ws_open`, `streamed`, `intercepted`, `killed`, `replay_of`, `is_replay`,
-`faulted`.
+`faulted`, `label`, `findings`, `marked`, `comment`, `edited`.
+
+`edited` is a list naming the sides a human rewrote by hand before forwarding
+(`"request"`, `"response"`, or `"frame #N"`) — an audit trail, so a tampered flow is
+never mistaken for one the server produced. A replay's copy is tagged only for an edit
+made in the repeater, never for one it inherited from the original.
+
+`marked` (bool) and `comment` (string) are mitmproxy's own flow fields, set by
+`flow.mark` / `flow.comment`. Because they are the engine's own, `~marked` and
+`~comment <regex>` are valid scopes, and a saved `.mitm` session preserves them.
+
+`findings` is a list of passive-finding codes seen on that flow for the first time (see
+the `snapshot` reply's `findings_doc` for the code → explanation map). `state` carries a
+`findings` **count** of distinct findings across the capture. A code is also matchable as
+a scope with `~meta <code>`, e.g. `~meta cors-wildcard-credentials`.
 
 **Detail** fields: `headers` (list of `[name, value]` pairs, duplicates preserved),
 `body`, `encoding`, `size`, `body_crlf`, `raw`, plus `method`/`url`/`http_version` on a
@@ -408,6 +449,12 @@ request or `status`/`reason` on a response. `pretty` and `pretty_view` appear wh
 body is something mitmproxy can render structurally — protobuf, gRPC, msgpack, XML,
 GraphQL and a dozen more. **`pretty` is display only and is not round-trippable — never
 send it back as `raw`.**
+
+A **response** detail also carries `tls` when the connection was encrypted: `version`,
+`cipher`, `alpn`, `sni`, and — when the server presented one — a `cert` object with `cn`,
+`altnames`, `issuer`, `not_before`, `not_after` (ISO 8601) and the `sha256` fingerprint.
+It is read from the server side, which is the side under assessment; a plain-http flow has
+no `tls`.
 
 `encoding` is one of `text`, `base64` (bytes that contradict a declared encoding),
 `streamed`, or `too-large`. Only `text` is editable.
@@ -447,9 +494,10 @@ hundred flows, and every one waits on your loop.
 
 ## Known limitations
 
-**`search` does not index WebSocket frames.** The search index is built from URL,
-headers and HTTP bodies. A frame payload is not in it. Find the flow another way — the
-summary's `ws` and `ws_frames` fields — and call `frames.get`.
+**`search` indexes a socket's text frames only once it has closed.** A flow is written
+to the index when it finalises, and an open socket has not. Until then find the flow by
+its summary's `ws` and `ws_frames` fields and call `frames.get`. Binary frames are never
+indexed.
 
 **Streamed bodies are invisible.** Anything over 5 MB streams, which means it is never
 buffered: no `raw`, no rewrite rules, nothing in the search index. `summary.streamed`

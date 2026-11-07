@@ -28,7 +28,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "spike"))
 sys.path.insert(0, str(ROOT / "addon"))
 
-from spike import WS_RECEIVED, start_http, ws_echo  # noqa: E402
+from spike import WS_RECEIVED, selfsigned, start_http, ws_echo  # noqa: E402
 
 
 def _port(env: str, default: int) -> int:
@@ -42,6 +42,7 @@ PROXY_PORT = _port("IC_TEST_PROXY_PORT", 18080)
 UI_PORT = _port("IC_TEST_UI_PORT", 19000)
 TARGET = ("127.0.0.1", _port("IC_TEST_TARGET_PORT", 18081))
 WS_TARGET = ("127.0.0.1", _port("IC_TEST_WS_PORT", 18082))
+TLS_TARGET = ("127.0.0.1", _port("IC_TEST_TLS_PORT", 18083))
 URL_FILE = ".ui-url.test"
 
 UI = f"http://127.0.0.1:{UI_PORT}"
@@ -664,6 +665,16 @@ def http_code(path: str) -> int:
         return 0
 
 
+def http_headers(path: str) -> dict[str, str]:
+    req = urllib.request.Request(UI + path)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(req, timeout=10) as r:
+            return {k.lower(): v for k, v in r.headers.items()}
+    except (urllib.error.HTTPError, OSError):
+        return {}
+
+
 def curl_full(path: str, body: str | None = None, timeout: int = 25):
     """Returns (rc, response_body, status_code, elapsed)."""
     cmd = ["curl", "-s", "--max-time", str(timeout), "--noproxy", "", "-x", PROXY,
@@ -692,6 +703,14 @@ def curl_bytes(path: str, body: str, timeout: int = 25) -> tuple[int, bytes]:
 def curl(path: str, timeout: int = 25) -> tuple[int, float]:
     rc, _out, _code, secs = curl_full(path, None, timeout)
     return rc, secs
+
+
+def curl_https_code(port: int, timeout: int = 20) -> str:
+    """HTTPS through the proxy, accepting any cert (-k). Returns the status code as
+    a string, or '000' when curl could not complete (a reset, a timeout)."""
+    cmd = ["curl", "-s", "-k", "--max-time", str(timeout), "--noproxy", "", "-x", PROXY,
+           "-o", os.devnull, "-w", "%{http_code}", f"https://127.0.0.1:{port}/"]
+    return subprocess.run(cmd, capture_output=True, text=True).stdout.strip() or "000"
 
 
 async def arm(conn, scope: str, responses: bool | None = None) -> None:
@@ -757,6 +776,146 @@ async def forward_until_done(conn, fut, first_drop: bool = False) -> None:
         await asyncio.sleep(0.1)
 
 
+# ------------------------------------------------------------- browser smoke
+
+
+async def ui_smoke(url: str) -> None:
+    """The real page in headless Chrome, driven over CDP: the modules import, the
+    socket connects, a row renders, a click opens the pane, and nothing errors.
+
+    The Python suite is blind to all of that -- a duplicate `const` once took the
+    whole page down while every check stayed green. CDP is spoken over the
+    `websockets` client the project already depends on, so this costs no
+    browser-automation framework. Chrome absent (a bare CI box) is a SKIP.
+    """
+    import shutil
+    import tempfile
+
+    import interceptor as I
+
+    exe = next((c for c in I.CHROME_PATHS if Path(c).exists() or shutil.which(c)), None)
+    if exe is None:
+        return check("the UI renders in a real browser (3 checks)", None, "Chrome not found")
+    exe = exe if Path(exe).exists() else shutil.which(exe)
+    errors: list[str] = []
+
+    # ignore_cleanup_errors: headless Chrome keeps child processes (gpu, zygote)
+    # flushing the profile dir for a moment after the main process is killed, so on
+    # Linux rmtree can race them and raise "Directory not empty" -- after every
+    # check has already run. The dir is a throwaway under /tmp either way.
+    with tempfile.TemporaryDirectory(prefix="interceptor-smoke-",
+                                     ignore_cleanup_errors=True) as prof:
+        proc = subprocess.Popen(
+            [exe, "--headless=new", "--disable-gpu", "--no-sandbox", "--no-first-run",
+             # The page is fetched directly, never through a proxy -- not the one
+             # under test, and not whatever system proxy this machine has.
+             "--no-proxy-server",
+             "--disable-background-networking", "--disable-component-update",
+             f"--user-data-dir={prof}", "--remote-debugging-port=0", "about:blank"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        try:
+            # Chrome publishes the port it picked, then the browser endpoint path.
+            active = Path(prof) / "DevToolsActivePort"
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline and not active.exists():
+                await asyncio.sleep(0.1)
+            if not active.exists():
+                return check("the UI renders a captured row in a real browser", False,
+                             "Chrome never published DevToolsActivePort")
+            port, path = active.read_text().split()[:2]
+
+            async with websockets.connect(f"ws://127.0.0.1:{port}{path}",
+                                          max_size=16 * 1024 * 1024) as cdp:
+                nid = 0
+
+                def saw(m: dict) -> None:
+                    """Every error the page would have shown in its console."""
+                    p = m.get("params") or {}
+                    if m.get("method") == "Runtime.exceptionThrown":
+                        d = p.get("exceptionDetails") or {}
+                        desc = (d.get("exception") or {}).get("description", "")
+                        errors.append(f"exception: {d.get('text', '')} {desc}"[:200])
+                    elif m.get("method") == "Runtime.consoleAPICalled" and p.get("type") == "error":
+                        args = " ".join(str(a.get("value", a.get("description", "")))
+                                        for a in p.get("args", []))
+                        errors.append(f"console.error: {args}"[:200])
+                    elif m.get("method") == "Log.entryAdded":
+                        e = p.get("entry") or {}
+                        if e.get("level") == "error":
+                            errors.append(f"log: {e.get('text', '')} {e.get('url', '')}"[:200])
+
+                async def call(method: str, params: dict | None = None, session: str | None = None):
+                    nonlocal nid
+                    nid += 1
+                    msg = {"id": nid, "method": method, "params": params or {}}
+                    if session:
+                        msg["sessionId"] = session
+                    await cdp.send(json.dumps(msg))
+                    while True:  # events interleave with the reply; keep the errors
+                        m = json.loads(await asyncio.wait_for(cdp.recv(), 15))
+                        if m.get("id") == nid:
+                            if "error" in m:
+                                raise RuntimeError(f"{method}: {m['error']}")
+                            return m.get("result") or {}
+                        saw(m)
+
+                target = await call("Target.createTarget", {"url": "about:blank"})
+                sid = (await call("Target.attachToTarget",
+                                  {"targetId": target["targetId"], "flatten": True}))["sessionId"]
+                await call("Runtime.enable", session=sid)
+                await call("Log.enable", session=sid)
+                await call("Page.navigate", {"url": url}, session=sid)
+
+                async def evaluate(expr: str):
+                    r = await call("Runtime.evaluate",
+                                   {"expression": expr, "returnByValue": True}, session=sid)
+                    return (r.get("result") or {}).get("value")
+
+                rows, badge = 0, ""
+                deadline = time.monotonic() + 20
+                while time.monotonic() < deadline:
+                    v = await evaluate(
+                        "JSON.stringify({rows: document.querySelectorAll('#flows tbody tr').length,"
+                        " badge: document.querySelector('#conn')?.textContent || ''})")
+                    d = json.loads(v or "{}")
+                    rows, badge = d.get("rows", 0), d.get("badge", "")
+                    if rows > 0:
+                        break
+                    await asyncio.sleep(0.25)
+                check("the UI renders a captured row in a real browser", rows > 0,
+                      f"{rows} row(s) drawn, bridge badge {badge!r}")
+
+                await evaluate("document.querySelector('#flows tbody tr')?.click()")
+                headline = ""
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    headline = await evaluate(
+                        "document.querySelector('#detail-body .headline')?.textContent || ''") or ""
+                    if headline:
+                        break
+                    await asyncio.sleep(0.25)
+                check("clicking a row opens the detail pane", bool(headline),
+                      headline[:80] or "no headline rendered")
+
+                await evaluate("1")  # one more round trip drains queued events
+                check("no console or page errors while rendering", not errors,
+                      "; ".join(errors)[:300] or "clean console")
+                try:
+                    await call("Browser.close")
+                except Exception:
+                    pass
+        finally:
+            # Gone for good before the next check: the bridge must see this client
+            # leave, or "closing the UI force-forwards" below waits on a browser
+            # that is still attached.
+            proc.kill()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
+
+
 # --------------------------------------------------------------- integration
 
 
@@ -764,7 +923,8 @@ async def integration() -> None:
     busy = {
         name: port
         for name, port in (("proxy", PROXY_PORT), ("ui", UI_PORT),
-                           ("target", TARGET[1]), ("ws-target", WS_TARGET[1]))
+                           ("target", TARGET[1]), ("ws-target", WS_TARGET[1]),
+                           ("tls-target", TLS_TARGET[1]))
         if not port_free(port)
     }
     if busy:
@@ -777,6 +937,10 @@ async def integration() -> None:
     (ROOT / URL_FILE).unlink(missing_ok=True)
     start_http(*TARGET)
     ws_srv = await websockets.serve(ws_echo, *WS_TARGET)
+    # A self-signed HTTPS target, to prove TLS pass-through tunnels it undecrypted.
+    import tempfile as _tempfile
+    certdir = _tempfile.TemporaryDirectory(prefix="interceptor-test-tls-")
+    start_http(*TLS_TARGET, tls=selfsigned(Path(certdir.name)))
 
     proc = subprocess.Popen(
         # No --chain: chaining is opt-in, so an instance booted plainly always goes
@@ -804,6 +968,7 @@ async def integration() -> None:
             "/rules-doc.js": http_code("/rules-doc.js"),
             "/icon.png": http_code("/icon.png"),
             "/rules.html": http_code("/rules.html"),
+            "/rules-page.js": http_code("/rules-page.js"),
             "/style.css": http_code("/style.css"),
             "/nope": http_code("/nope"),
             "/ws (no token)": http_code("/ws"),
@@ -811,9 +976,19 @@ async def integration() -> None:
         check("static serving + token gate",
               all(codes[k] == 200 for k in ("/", "/app.js", "/theme.js",
                                             "/rules-doc.js", "/icon.png",
-                                            "/rules.html", "/style.css"))
+                                            "/rules.html", "/rules-page.js",
+                                            "/style.css"))
               and codes["/nope"] == 404 and codes["/ws (no token)"] == 403,
               ", ".join(f"{k}={v}" for k, v in codes.items()))
+
+        # Everything the page renders came off the wire from sites under test, and
+        # any page the user visits can reach this origin. The CSP is the second
+        # line behind textContent-only rendering; the markup unit proves there is
+        # nothing inline for it to break.
+        csp = http_headers("/").get("content-security-policy", "")
+        check("the UI is served with a CSP pinned to its own origin",
+              "default-src 'self'" in csp and f"ws://127.0.0.1:{UI_PORT}" in csp
+              and "frame-ancestors 'none'" in csp, csp or "no header")
 
         # Gate 1: Origin. websockets rejects a mismatched Origin for us.
         rejected = False
@@ -1127,6 +1302,56 @@ async def integration() -> None:
                   f"client received {got}, server never saw it: "
                   f"{'injected-frame' not in WS_RECEIVED}")
 
+            # --- the real page, in a real browser, with all of the above on screen
+            await ui_smoke(url)
+
+            # --- TLS pass-through: a listed host is tunnelled, never decrypted
+            # Decrypted first: the proxy terminates TLS to a self-signed upstream
+            # with no ssl_insecure, so it cannot complete -- a 502 (or a reset).
+            decrypted = await asyncio.to_thread(curl_https_code, TLS_TARGET[1])
+            await say(conn, type="hosts.set", hosts=[],
+                      passthrough=[rf"^127\.0\.0\.1:{TLS_TARGET[1]}$"])
+            await recv_until(conn, lambda m: m.get("type") == "state"
+                             and m.get("passthrough_hosts"))
+            await say(conn, type="clear")
+            await recv_until(conn, lambda m: m.get("type") == "cleared")
+            # Tunnelled now: the proxy never opens the connection, so curl -k talks
+            # straight to the self-signed server and gets its 200 -- and nothing of
+            # it is captured.
+            tunnelled = await asyncio.to_thread(curl_https_code, TLS_TARGET[1])
+            await say(conn, type="hello")
+            snap = await recv_until(conn, lambda m: m.get("type") == "snapshot")
+            captured = [f for f in (snap or {}).get("flows", []) if f.get("port") == TLS_TARGET[1]]
+            check("TLS pass-through tunnels a listed host without decrypting it",
+                  tunnelled == "200" and not captured,
+                  f"decrypted→{decrypted}, tunnelled→{tunnelled}, captured {len(captured)}")
+            await say(conn, type="hosts.set", hosts=[], passthrough=[])
+            await recv_until(conn, lambda m: m.get("type") == "state"
+                             and not m.get("passthrough_hosts"))
+
+            # --- map-local: a URL is served from a file on disk
+            served = Path(certdir.name) / "served.txt"
+            served.write_text("served-by-map-local")
+            await say(conn, type="rules.set", body=[], headers=[],
+                      local=[f"|/served-local|{served}"])
+            await recv_until(conn, lambda m: m.get("type") == "state" and m.get("rules_local"))
+            served_body = (await asyncio.to_thread(curl_full, "/served-local"))[1]
+            check("a map-local rule serves a file for a matching URL",
+                  served_body == "served-by-map-local", f"got {served_body!r}")
+            await say(conn, type="rules.set", body=[], headers=[], local=[])
+            await recv_until(conn, lambda m: m.get("type") == "state" and not m.get("rules_local"))
+
+            # --- mitm.it is served through the proxy, so any client can fetch the CA
+            def _mitm_it():
+                r = subprocess.run(
+                    ["curl", "-s", "--max-time", "15", "-x", PROXY, "http://mitm.it/"],
+                    capture_output=True, text=True)
+                return r.returncode, r.stdout
+            rc_m, body_m = await asyncio.to_thread(_mitm_it)
+            check("mitm.it serves the CA-install page through the proxy",
+                  rc_m == 0 and "mitmproxy" in body_m.lower(),
+                  f"rc={rc_m}, {len(body_m)}B, mentions mitmproxy: {'mitmproxy' in body_m.lower()}")
+
             # --- UI vanishes with a flow still held
             await arm(conn, "~u /hold")
             fut = asyncio.create_task(asyncio.to_thread(curl, "/hold-orphan", 20))
@@ -1143,6 +1368,7 @@ async def integration() -> None:
         except subprocess.TimeoutExpired:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         ws_srv.close()
+        certdir.cleanup()
         (ROOT / URL_FILE).unlink(missing_ok=True)
 
 
@@ -1194,6 +1420,55 @@ async def restart_and_load() -> None:
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        (ROOT / URL_FILE).unlink(missing_ok=True)
+
+
+async def faults_persist() -> None:
+    """A fresh instance started with a config.yaml comes up with the fault and the
+    header rule already armed -- the persistence the option exists for."""
+    import tempfile
+    for _ in range(20):
+        if all(port_free(p) for p in (PROXY_PORT, UI_PORT)):
+            break
+        await asyncio.sleep(0.5)
+    (ROOT / URL_FILE).unlink(missing_ok=True)
+    confdir = tempfile.TemporaryDirectory(prefix="interceptor-test-conf-")
+    (Path(confdir.name) / "config.yaml").write_text(
+        'faults:\n'
+        '- \'{"url": "/pay", "status": 503}\'\n'
+        'modify_headers:\n'
+        '- \'/~q/x-persist/yes\'\n'
+    )
+    proc = subprocess.Popen(
+        ["./run.sh", "--set", f"confdir={confdir.name}"], cwd=ROOT,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+        env={**os.environ, "IC_LISTEN_PORT": str(PROXY_PORT),
+             "IC_UI_PORT": str(UI_PORT), "IC_URL_FILE": URL_FILE, "IC_OPEN_UI": "false"},
+    )
+    try:
+        url = await wait_url(time.monotonic() + 30)
+        if not url:
+            return check("a config.yaml carries fault and rewrite rules across a restart",
+                         False, "instance with a config.yaml never came up")
+        token = url.split("#token=", 1)[1]
+        async with websockets.connect(
+            f"ws://127.0.0.1:{UI_PORT}/ws?token={token}", origin=UI, open_timeout=10
+        ) as conn:
+            await say(conn, type="hello")
+            st = await recv_until(conn, lambda m: m.get("type") == "state")
+            faults = (st or {}).get("faults", [])
+            headers = (st or {}).get("rules_headers", [])
+            ok = (any(f.get("url") == "/pay" and f.get("status") == 503 for f in faults)
+                  and any("x-persist" in h for h in headers))
+            check("a config.yaml carries fault and rewrite rules across a restart", ok,
+                  f"faults={faults}, header rules={headers}")
+    finally:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        confdir.cleanup()
         (ROOT / URL_FILE).unlink(missing_ok=True)
 
 
@@ -1319,6 +1594,74 @@ def units_row_filter() -> None:
     bad = [f"{p!r} -> {g} want {w}" for p, g, w in zip(patterns, got, want) if g != w]
     check("the row filter takes text or regex and survives a half-typed one",
           not bad, "; ".join(bad) or f"{len(patterns)} patterns correct, bad regex falls back")
+
+
+def units_host_pattern() -> None:
+    """"Capture only this host" used to send the bare hostname, i.e. a regex in
+    which every dot matches anything and nothing is anchored. The pattern is
+    built by the UI and matched by the addon, so the check crosses that line:
+    node builds it, Python matches it the way _off_list does."""
+    import json as _json
+    import re
+
+    harness = r"""
+      import { readFileSync } from "node:fs";
+      const src = readFileSync("ui/menu.js", "utf8");
+      const i = src.indexOf("function hostPattern(");
+      if (i < 0) throw new Error("missing hostPattern");
+      let depth = 0, j = src.indexOf("{", i), end = -1;
+      for (let k = j; k < src.length; k++) {
+        if (src[k] === "{") depth++;
+        else if (src[k] === "}" && --depth === 0) { end = k + 1; break; }
+      }
+      // `esc` is a module-level helper the function leans on; take it along.
+      const esc = src.match(/const esc = [\s\S]*?;\n/)[0];
+      const fn = new Function(esc + src.slice(i, end) + "; return hostPattern;")();
+      console.log(JSON.stringify(JSON.parse(process.env.ROWS).map(fn)));
+    """
+    rows = [{"host": "api.example.com", "port": 443}, {"host": "10.0.0.1", "port": 8080}]
+    out = subprocess.run(["node", "--input-type=module", "-e", harness], cwd=ROOT,
+                         capture_output=True, text=True, timeout=60,
+                         env={**os.environ, "ROWS": _json.dumps(rows)})
+    if out.returncode != 0:
+        return check("the row menu's host pattern is anchored and escaped", False,
+                     f"node failed: {out.stderr.strip()[:200]}")
+    p0, p1 = _json.loads(out.stdout)
+    hit = lambda p, t: bool(re.search(p, t, re.IGNORECASE))  # noqa: E731
+    notes = []
+    if not hit(p0, "api.example.com:443"):
+        notes.append("misses its own host")
+    if hit(p0, "api-example.com:443"):
+        notes.append("a dot matched a dash")
+    if hit(p0, "api.example.com.evil.net:443"):
+        notes.append("not anchored at the end")
+    if hit(p0, "xapi.example.com:443"):
+        notes.append("not anchored at the start")
+    if hit(p0, "api.example.com:8443"):
+        notes.append("the port is not anchored")
+    if not hit(p1, "10.0.0.1:8080") or hit(p1, "10x0y0z1:8080"):
+        notes.append("an IP is not escaped")
+    check("the row menu's host pattern is anchored and escaped", not notes,
+          "; ".join(notes) or f"{p0}  {p1}")
+
+
+def units_csp_safe_markup() -> None:
+    """A CSP that forbids inline script and style only works if the markup has
+    none. Caught here rather than as a blank page: a browser refuses silently."""
+    import re
+
+    bad = []
+    for name in ("index.html", "rules.html"):
+        html = (ROOT / "ui" / name).read_text()
+        if re.search(r"<script(?![^>]*\bsrc=)", html):
+            bad.append(f"{name}: inline <script>")
+        if re.search(r"\sstyle=|\son\w+=", html):
+            bad.append(f"{name}: inline style or event handler")
+    doc = (ROOT / "ui" / "rules-doc.js").read_text()
+    if re.search(r"<script|\sstyle=|\son\w+=", doc):
+        bad.append("rules-doc.js: inline script, style or handler in the doc HTML")
+    check("the UI markup has nothing a strict CSP would block", not bad,
+          "; ".join(bad) or "no inline script, style or handlers in index.html, rules.html, rules-doc.js")
 
 
 def units_ws_classification() -> None:
@@ -1565,6 +1908,48 @@ def units_host_scope() -> None:
 
 def ctx_opt(tctx, name):
     return getattr(tctx.options, name)
+
+
+def units_scope_chips() -> None:
+    """The scope chips must each compose-parse the way the addon wraps a scope, and
+    the skip-static-assets chip must match what its name claims."""
+    import re as _re
+    import interceptor as I
+    from mitmproxy import flowfilter
+    from mitmproxy.test import tflow
+
+    html = (ROOT / "ui" / "index.html").read_text()
+    raw = _re.findall(r"data-scope=(['\"])(.*?)\1", html)
+    scopes = [s.replace("&amp;", "&").replace("&quot;", '"').replace("&#39;", "'")
+              for _q, s in raw]
+    notes = []
+    if not scopes:
+        notes.append("no scope chips found")
+    for s in scopes:
+        try:
+            flowfilter.parse(f"~http & ({s} )")   # the shape _compose() builds
+        except ValueError as e:
+            notes.append(f"{s!r} does not compose-parse: {e}")
+
+    static = next((s for s in scopes if "png" in s), None)
+    if not static:
+        notes.append("no skip-static-assets chip")
+    else:
+        filt = flowfilter.parse(static)
+
+        def stops(path):
+            f = tflow.tflow()
+            f.request.scheme, f.request.host, f.request.path = "https", "ex.com", path
+            return bool(filt(f))
+
+        for path in ("/a.png?x=1", "/x.js", "/f.woff2"):
+            if stops(path):
+                notes.append(f"static chip still stops {path}")
+        for path in ("/api/users", "/data.json"):
+            if not stops(path):
+                notes.append(f"static chip skips the non-asset {path}")
+    check("the scope chips compose-parse and the static-asset one matches its name",
+          not notes, "; ".join(notes) or f"{len(scopes)} chips parse; static assets skipped, others stopped")
 
 
 def units_scope_atoms() -> None:
@@ -1958,6 +2343,113 @@ def units_repeat_burst() -> None:
           f"8 inputs clamped correctly; caps {got['caps'][0]} sends / {got['caps'][1]}ms")
 
 
+def units_payloads() -> None:
+    """The repeater's payload expansion: one position set, same payload into every
+    marker, and a payload inserted verbatim (never as a regex replacement)."""
+    import json as _json
+
+    harness = r"""
+      import { readFileSync } from "node:fs";
+      const src = readFileSync("ui/detail.js", "utf8");
+      const i = src.indexOf("export function expandPayloads(");
+      if (i < 0) throw new Error("missing expandPayloads");
+      let depth = 0, j = src.indexOf("{", i), end = -1;
+      for (let k = j; k < src.length; k++) {
+        if (src[k] === "{") depth++;
+        else if (src[k] === "}" && --depth === 0) { end = k + 1; break; }
+      }
+      const fn = new Function(src.slice(i, end).replace("export ", "") + "; return expandPayloads;")();
+      const cases = JSON.parse(process.env.CASES);
+      console.log(JSON.stringify(cases.map(([raw, p]) => fn(raw, p))));
+    """
+    cases = [
+        ["GET /u?id=§x§ HTTP/1.1", ["1", "2"]],              # one marker
+        ["a=§p§&b=§p§", ["Z"]],                     # two markers, same payload
+        ["x=§p§", ["$&!"]],                                    # verbatim, not a regex repl
+        ["no markers here", ["1", "2"]],                                # nothing to do
+        ["x=§p§", []],                                         # no payloads
+    ]
+    want = [
+        ["GET /u?id=1 HTTP/1.1", "GET /u?id=2 HTTP/1.1"],
+        ["a=Z&b=Z"],
+        ["x=$&!"],
+        [],
+        [],
+    ]
+    out = subprocess.run(["node", "--input-type=module", "-e", harness], cwd=ROOT,
+                         capture_output=True, text=True, timeout=60,
+                         env={**os.environ, "CASES": _json.dumps(cases)})
+    if out.returncode != 0:
+        return check("the repeater expands one payload position", False,
+                     f"node failed: {out.stderr.strip()[:200]}")
+    got = _json.loads(out.stdout)
+    bad = [f"case {i}: {g} want {w}" for i, (g, w) in enumerate(zip(got, want)) if g != w]
+    check("the repeater expands one payload position", not bad,
+          "; ".join(bad) or "one marker, two markers, verbatim payload, no-marker and no-payload all correct")
+
+
+async def units_replay_label() -> None:
+    """A labelled replay carries the label on the copy only, so the send list can
+    name which payload produced each row."""
+    import interceptor as I
+    from mitmproxy.test import taddons, tflow
+
+    addon = I.Interceptor()
+    seen = []
+    with taddons.context(addon) as tctx:
+        # repeat() calls commands.call("replay.client", [clone]); record the clone
+        # rather than registering a typed command just to catch it.
+        tctx.master.commands.call = lambda name, args: seen.extend(args)
+        addon.bridge = _Collect()
+        f = tflow.tflow(resp=True)
+        addon.store.put(f, 1, I.summary(f), 10 * 1024 * 1024)
+        addon.repeat(f.id, "", label="admin' --")
+        clone = seen[0] if seen else None
+        ok = (clone is not None
+              and I.summary(clone)["label"] == "admin' --"
+              and I.summary(f)["label"] is None)
+        addon.store.close()
+    check("a replay carries its label on the copy only", ok,
+          f"copy label={I.summary(clone)['label']!r}, original label={I.summary(f)['label']!r}"
+          if clone else "replay.client never called")
+
+
+def units_faults_option() -> None:
+    """Faults live in a mitmproxy option, so config.yaml and --set carry them across
+    restarts. configure() installs from the option and refuses a bad one; _set_faults
+    writes it back."""
+    import interceptor as I
+    from mitmproxy import ctx as mctx
+    from mitmproxy import exceptions
+    from mitmproxy.test import taddons
+
+    addon = I.Interceptor()
+    notes = []
+    with taddons.context(addon) as tctx:
+        addon.bridge = _Collect()
+        addon._push_state = lambda: None
+
+        # The config.yaml / --set path: configure installs from the option value.
+        tctx.configure(addon, faults=['{"url": "/pay", "status": 503}'])
+        if len(addon.faults) != 1 or addon.faults[0].status != 503:
+            notes.append(f"configure did not install the fault: {addon.faults}")
+
+        # A rule that does nothing, and non-JSON, both fail at configure.
+        for bad in (['{"url": "/x"}'], ["not json"]):
+            try:
+                tctx.configure(addon, faults=bad)
+                notes.append(f"a bad fault option was accepted: {bad}")
+            except exceptions.OptionsError:
+                pass
+
+        # _set_faults (the UI path) writes the option back as JSON strings.
+        addon._set_faults([{"url": "/c", "delay_ms": 100}])
+        if not mctx.options.faults or '"/c"' not in mctx.options.faults[0]:
+            notes.append(f"_set_faults did not persist to the option: {list(mctx.options.faults)}")
+    check("fault rules persist as an option and a bad one fails at configure", not notes,
+          "; ".join(notes) or "configure installs, bad rules refused, _set_faults writes back")
+
+
 async def units_faults() -> None:
     """Fault rules: validation, first-match-wins, and the three effects.
 
@@ -2036,6 +2528,155 @@ async def units_faults() -> None:
           f"(~250 means awaited, ~750 means the loop was blocked)")
 
 
+def units_findings() -> None:
+    """Passive findings: each rule fires on a crafted flow and nowhere else, and
+    the addon's first-sight dedup reports a repeat only once."""
+    import base64 as _b64
+    import findings
+    from mitmproxy.test import tflow
+
+    def mk(scheme="https", host="ex.com", path="/p", method="GET", query="",
+           req_headers=None, status=200, resp_headers=None, body=b"x"):
+        f = tflow.tflow(resp=True)
+        f.request.scheme = scheme
+        f.request.host = host
+        f.request.path = path + ("?" + query if query else "")
+        f.request.method = method
+        f.request.headers.clear()
+        for k, v in (req_headers or {}).items():
+            f.request.headers[k] = v
+        f.response.status_code = status
+        f.response.headers.clear()
+        for k, v in (resp_headers or {}).items():
+            f.response.headers[k] = v
+        f.response.content = body
+        return f
+
+    def codes(**kw):
+        return sorted(c for c, _k in findings.passive(mk(**kw)))
+
+    # Headers that suppress every *other* response rule, so each case isolates one.
+    quiet = {"strict-transport-security": "max-age=1",
+             "x-content-type-options": "nosniff",
+             "content-type": "application/json"}
+    none_jwt = "eyJhbGciOiJub25lIn0." + _b64.urlsafe_b64encode(b'{"u":1}').decode().rstrip("=") + "."
+
+    cases = {
+        "missing-hsts": dict(scheme="https", resp_headers={
+            "x-content-type-options": "nosniff", "content-type": "application/json"}),
+        "missing-csp": dict(scheme="https", resp_headers={
+            **quiet, "content-type": "text/html", "x-frame-options": "DENY"}, body=b"<html>"),
+        "missing-frame-protection": dict(scheme="https", resp_headers={
+            **quiet, "content-type": "text/html",
+            "content-security-policy": "default-src 'self'"}, body=b"<html>"),
+        "missing-nosniff": dict(scheme="https", resp_headers={
+            "strict-transport-security": "max-age=1", "content-type": "application/json"}),
+        "cookie-insecure": dict(scheme="https", resp_headers={
+            **quiet, "set-cookie": "sid=x; HttpOnly; SameSite=Lax"}),
+        "cookie-no-httponly": dict(scheme="https", resp_headers={
+            **quiet, "set-cookie": "sid=x; Secure; SameSite=Lax"}),
+        "cookie-no-samesite": dict(scheme="https", resp_headers={
+            **quiet, "set-cookie": "sid=x; Secure; HttpOnly"}),
+        "cors-wildcard-credentials": dict(scheme="https", resp_headers={
+            **quiet, "access-control-allow-origin": "*",
+            "access-control-allow-credentials": "true"}),
+        "cors-origin-reflected": dict(scheme="https",
+            req_headers={"origin": "https://evil.test"}, resp_headers={
+            **quiet, "access-control-allow-origin": "https://evil.test",
+            "access-control-allow-credentials": "true"}),
+        "jwt-alg-none": dict(scheme="https",
+            req_headers={"authorization": "Bearer " + none_jwt}, resp_headers=quiet),
+        "secret-in-url": dict(scheme="https", query="access_token=abc", resp_headers=quiet),
+        "basic-auth": dict(scheme="https",
+            req_headers={"authorization": "Basic dXNlcjpwYXNz"}, resp_headers=quiet),
+        "plain-http-auth": dict(scheme="http",
+            req_headers={"cookie": "sid=x"}, resp_headers={
+            "x-content-type-options": "nosniff", "content-type": "application/json"}),
+        "server-version": dict(scheme="https", resp_headers={
+            **quiet, "server": "nginx/1.25.3"}),
+        "directory-listing": dict(scheme="https", resp_headers={
+            **quiet, "content-type": "text/html",
+            "content-security-policy": "default-src 'self'; frame-ancestors 'none'",
+            "x-frame-options": "DENY"}, body=b"<h1>Index of /uploads</h1>"),
+    }
+
+    notes = []
+    for code, kw in cases.items():
+        got = codes(**kw)
+        if got != [code]:
+            notes.append(f"{code}: got {got}")
+    # Every code has an explanation, and nothing explains a code that cannot fire.
+    if set(findings.EXPLAIN) != set(cases):
+        notes.append(f"EXPLAIN/rules mismatch: {set(findings.EXPLAIN) ^ set(cases)}")
+
+    # First-sight dedup: the same missing header on a second flow from one host is
+    # not reported again, but a different host still is.
+    seen: set = set()
+    def fresh(f):
+        return [c for c, k in findings.passive(f)
+                if (c, k) not in seen and not seen.add((c, k))]
+    f1 = mk(scheme="https", host="a.test", resp_headers={
+        "x-content-type-options": "nosniff", "content-type": "application/json"})
+    f2 = mk(scheme="https", host="a.test", resp_headers={
+        "x-content-type-options": "nosniff", "content-type": "application/json"})
+    f3 = mk(scheme="https", host="b.test", resp_headers={
+        "x-content-type-options": "nosniff", "content-type": "application/json"})
+    if fresh(f1) != ["missing-hsts"]:
+        notes.append(f"first host: {fresh(f1)}")
+    if fresh(f2) != []:
+        notes.append(f"repeat not deduped: {fresh(f2)}")
+    if fresh(f3) != ["missing-hsts"]:
+        notes.append(f"new host suppressed: {fresh(f3)}")
+
+    check("passive findings fire per rule and dedupe on first sight", not notes,
+          "; ".join(notes) or f"{len(cases)} rules isolated, dedup by host and host:cookie")
+
+
+async def units_map_local() -> None:
+    """Map-local rules (serve a file for a URL) and the anticache toggle, both
+    plumbed through to mitmproxy's own options."""
+    import tempfile
+    import interceptor as I
+    from mitmproxy import ctx as mctx
+    from mitmproxy.addons import anticache, maplocal, modifybody, modifyheaders
+    from mitmproxy.test import taddons
+
+    addon = I.Interceptor()
+    notes = []
+    with tempfile.TemporaryDirectory() as tmp, taddons.context(
+            addon, modifybody.ModifyBody(), modifyheaders.ModifyHeaders(),
+            maplocal.MapLocal(), anticache.AntiCache()) as tctx:
+        tctx.configure(addon, hide_noise=False)
+        addon.bridge = _Collect()
+        addon._push_state = lambda: None
+        p = Path(tmp) / "served.txt"
+        p.write_text("served-by-map-local")
+        spec = f"|/served|{p}"
+
+        addon._set_rules([], [], local=[spec])
+        if list(mctx.options.map_local) != [spec]:
+            notes.append(f"map_local not set: {list(mctx.options.map_local)}")
+
+        # A missing file is refused, and the working rule is left in place.
+        before = list(mctx.options.map_local)
+        addon.bridge.sent.clear()
+        addon._set_rules([], [], local=[f"|/x|{Path(tmp) / 'nope.txt'}"])
+        if not any(m["type"] == "error" for m in addon.bridge.sent):
+            notes.append("a missing local file was not refused")
+        if list(mctx.options.map_local) != before:
+            notes.append("a bad local rule changed the option anyway")
+
+        # anticache flips its option.
+        await addon._on_message({"type": "opt.set", "anticache": True})
+        if not mctx.options.anticache:
+            notes.append("anticache did not turn on")
+        await addon._on_message({"type": "opt.set", "anticache": False})
+        if mctx.options.anticache:
+            notes.append("anticache did not turn off")
+    check("map-local rules validate and set, and anticache toggles", not notes,
+          "; ".join(notes) or "map_local set, missing file refused, anticache on/off")
+
+
 def units_search() -> None:
     """Body search has to see what the row never showed: headers and bodies."""
     import interceptor as I
@@ -2058,9 +2699,15 @@ def units_search() -> None:
             f.response.headers[name] = value
             store.put(f, len(body), I.summary(f), 10 * 1024 * 1024)
             made.append(f)
+        # A closed socket, frames "hello text" and "it's me": the question
+        # "which socket carried this token" was unanswerable before.
+        wf = tflow.twebsocketflow()
+        store.put(wf, 10, I.summary(wf), 10 * 1024 * 1024)
 
         found = lambda q: sorted(s["path"] for s in store.search(q))  # noqa: E731
         notes = []
+        if found("it's me") != ["/ws"]:
+            notes.append(f"frame match: {found(chr(105) + 't' + chr(39) + 's me')}")
         if found("sekrit-abc123") != ["/api/users"]:
             notes.append(f"body match: {found('sekrit-abc123')}")
         if found("sid=zzz") != ["/api/orders"]:
@@ -2074,7 +2721,101 @@ def units_search() -> None:
             notes.append("a bare % matched everything -- wildcards are not escaped")
         store.close()
     check("body search finds text in bodies, headers and URLs", not notes,
-          "; ".join(notes) or "body, header, URL, miss and a literal % all correct")
+          "; ".join(notes) or "body, header, URL, frame, miss and a literal % all correct")
+
+
+def units_decoder() -> None:
+    """The decoder's pure functions: JWT parsing and the multi-format sniff, run
+    under node against the shipped util.js."""
+    import base64 as _b64
+    import json as _json
+
+    # A JWT with alg:none and an exp in the past.
+    header = _b64.urlsafe_b64encode(b'{"alg":"none","typ":"JWT"}').decode().rstrip("=")
+    payload = _b64.urlsafe_b64encode(b'{"sub":"u1","exp":1000000000}').decode().rstrip("=")
+    jwt = f"{header}.{payload}."
+
+    harness = r"""
+      import { decodeJwt, decodings } from "./ui/util.js";
+      const jwt = process.env.JWT;
+      const j = decodeJwt(jwt);
+      const out = {
+        jwt: j && { alg: j.alg, expired: j.expired, sub: j.payload.sub },
+        twoPart: decodeJwt("a.b"),
+        b64: decodings("aGVsbG8gd29ybGQ="),
+        url: decodings("a%20b%2Fc"),
+        hex: decodings("68656c6c6f"),
+        plain: decodings("hello"),
+      };
+      console.log(JSON.stringify(out));
+    """
+    out = subprocess.run(["node", "--input-type=module", "-e", harness], cwd=ROOT,
+                         capture_output=True, text=True, timeout=60,
+                         env={**os.environ, "JWT": jwt})
+    if out.returncode != 0:
+        return check("the decoder reads JWTs and sniffs base64/url/hex", False,
+                     f"node failed: {out.stderr.strip()[:200]}")
+    r = _json.loads(out.stdout)
+    notes = []
+    if not r["jwt"] or r["jwt"]["alg"] != "none" or not r["jwt"]["expired"] or r["jwt"]["sub"] != "u1":
+        notes.append(f"jwt: {r['jwt']}")
+    if r["twoPart"] is not None:
+        notes.append("a two-part string decoded as a JWT")
+    if not any(d["kind"] == "base64" and d["text"] == "hello world" for d in r["b64"]):
+        notes.append(f"base64: {r['b64']}")
+    if not any(d["kind"] == "url" and d["text"] == "a b/c" for d in r["url"]):
+        notes.append(f"url: {r['url']}")
+    if not any(d["kind"] == "hex" and d["text"] == "hello" for d in r["hex"]):
+        notes.append(f"hex: {r['hex']}")
+    if any(d["kind"] == "base64" for d in r["plain"]):
+        notes.append(f"plain text decoded as base64: {r['plain']}")
+    check("the decoder reads JWTs and sniffs base64/url/hex", not notes,
+          "; ".join(notes) or "jwt alg+exp, base64, url, hex decoded; plain text left alone")
+
+
+def units_tls_detail() -> None:
+    """The Response tab carries the connection's TLS facts and the leaf certificate,
+    read from the server side -- the side a tester is assessing."""
+    import tempfile
+    import interceptor as I
+    from mitmproxy import certs
+    from mitmproxy.test import taddons, tflow
+    from spike import selfsigned
+
+    addon = I.Interceptor()
+    notes = []
+    with taddons.context(addon):
+        f = tflow.tflow(resp=True)   # tserver_conn sets tls_version TLSv1.2, sni "address"
+        d = I.detail(f, "response")
+        tls = d.get("tls")
+        if not tls or tls.get("version") != "TLSv1.2" or tls.get("sni") != "address":
+            notes.append(f"version/sni missing: {tls}")
+        if tls and "cert" in tls:
+            notes.append("a cert appeared with an empty certificate_list")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            selfsigned(Path(tmp))
+            cert = certs.Cert.from_pem((Path(tmp) / "cert.pem").read_bytes())
+            f.server_conn.certificate_list = [cert]
+            c = I.detail(f, "response")["tls"].get("cert")
+            if not c:
+                notes.append("certificate_list set but no cert in detail")
+            else:
+                if c.get("cn") != "127.0.0.1":
+                    notes.append(f"cn: {c.get('cn')}")
+                if "127.0.0.1" not in c.get("altnames", []):
+                    notes.append(f"altnames: {c.get('altnames')}")
+                if not c.get("not_after") or "T" not in c.get("not_after", ""):
+                    notes.append(f"not_after not ISO: {c.get('not_after')}")
+                if len(c.get("sha256", "")) != 64:
+                    notes.append(f"sha256 not 64 hex: {c.get('sha256')!r}")
+
+        # No TLS on the connection → no tls block at all (a plain-http flow).
+        f.server_conn.tls_version = None
+        if "tls" in I.detail(f, "response"):
+            notes.append("a non-TLS connection still reported tls")
+    check("the response tab carries TLS version, cipher and the certificate", not notes,
+          "; ".join(notes) or "version, sni, cert cn/altnames/expiry/sha256, and no-TLS all correct")
 
 
 def units_contentview() -> None:
@@ -2154,6 +2895,148 @@ def units_export() -> None:
           "; ".join(notes) or f"{len(cmd)}B command with method, url, header and body")
 
 
+def units_edited_tag() -> None:
+    """A flow you edited by hand carries an `edited` tag, so a tester has an audit
+    trail of what was tampered with. A plain forward does not, a rejected edit does
+    not, and a repeater edit tags only the copy."""
+    import interceptor as I
+    from mitmproxy.test import taddons, tflow
+
+    addon = I.Interceptor()
+    notes = []
+    with taddons.context(addon):
+        addon.bridge = _Collect()
+        addon._push_state = lambda: None
+
+        def held_request():
+            f = tflow.tflow()
+            f.intercept()
+            addon.store.put(f, 1, I.summary(f), 10 * 1024 * 1024)
+            addon.paused[f.id] = ("request", f)
+            return f
+
+        # Forward with an edit → tagged.
+        a = held_request()
+        addon._resume(a.id, raw=I.raw_text(a, "request"))
+        if I.summary(a)["edited"] != ["request"]:
+            notes.append(f"edited forward not tagged: {I.summary(a)['edited']}")
+
+        # Forward with no raw → not tagged.
+        b = held_request()
+        addon._resume(b.id)
+        if I.summary(b)["edited"] is not None:
+            notes.append(f"plain forward tagged: {I.summary(b)['edited']}")
+
+        # A rejected edit leaves no tag (and the flow stays held).
+        c = held_request()
+        addon._resume(c.id, raw="GET /x HTTP/1.1\nnot-a-header-line\n\n")
+        if I.summary(c)["edited"] is not None:
+            notes.append(f"rejected edit tagged: {I.summary(c)['edited']}")
+        if c.id not in addon.paused:
+            notes.append("a rejected edit released the flow")
+
+        # Repeat tags the copy only, and inherited tags are dropped first.
+        captured = []
+        import mitmproxy.ctx as _ctx
+        _ctx.master.commands.call = lambda name, args: captured.extend(args)
+        orig = tflow.tflow(resp=True)
+        orig.metadata["edited"] = ["request"]      # as if it had been edited live
+        addon.store.put(orig, 1, I.summary(orig), 10 * 1024 * 1024)
+        addon.repeat(orig.id, raw=I.raw_text(orig, "request"))
+        clone = captured[0] if captured else None
+        if clone is None or I.summary(clone)["edited"] != ["request"]:
+            notes.append(f"repeat copy not tagged from its own edit: {clone and I.summary(clone)['edited']}")
+        if I.summary(orig)["edited"] != ["request"]:
+            notes.append("repeat mutated the original's edited tag")
+        addon.store.close()
+    check("hand-edited flows are tagged, plain and rejected ones are not", not notes,
+          "; ".join(notes) or "edit tagged, plain/rejected clean, repeat tags the copy only")
+
+
+async def units_annotations() -> None:
+    """Mark and comment use mitmproxy's own flow fields, so `~marked`/`~comment`
+    work as scopes and a saved session keeps them; and they survive the round trip
+    to disk."""
+    import interceptor as I
+    from mitmproxy import flowfilter
+    from mitmproxy.test import taddons, tflow
+
+    addon = I.Interceptor()
+    notes = []
+    with taddons.context(addon):
+        addon.bridge = _Collect()
+        addon._push_state = lambda: None
+        f = tflow.tflow(resp=True)
+        addon.store.put(f, 1, I.summary(f), 10 * 1024 * 1024)
+
+        await addon._on_message({"type": "flow.mark", "id": f.id, "marked": True})
+        if not I.summary(f)["marked"] or not flowfilter.parse("~marked")(f):
+            notes.append("mark did not take / ~marked did not match")
+
+        await addon._on_message({"type": "flow.comment", "id": f.id, "text": "suspicious value"})
+        if I.summary(f)["comment"] != "suspicious value" or not flowfilter.parse("~comment susp")(f):
+            notes.append(f"comment did not take: {I.summary(f)['comment']!r}")
+
+        # Drop the RAM copies so the next read rehydrates from disk, proving the
+        # annotation was serialised, not just held in memory.
+        addon.store.flush()
+        addon.store._cache.clear()
+        addon.store._live.clear()
+        back = addon.store.get(f.id)
+        if back is None or not back.marked or back.comment != "suspicious value":
+            notes.append(f"annotation lost on the disk round trip: {back and (back.marked, back.comment)}")
+
+        await addon._on_message({"type": "flow.mark", "id": f.id, "marked": False})
+        # Read through the store, not the local object: the cache was dropped above,
+        # so _annotate acted on the rehydrated copy.
+        if I.summary(addon.store.get(f.id))["marked"]:
+            notes.append("unmark did not clear it")
+        addon.store.close()
+    check("mark and comment stick, scope and survive a disk round trip", not notes,
+          "; ".join(notes) or "~marked, ~comment, disk round trip and unmark all correct")
+
+
+async def units_diff() -> None:
+    """Comparer: a unified diff between two flows' responses, pushed as a reply."""
+    import interceptor as I
+    from mitmproxy.test import taddons, tflow
+
+    addon = I.Interceptor()
+    notes = []
+    with taddons.context(addon):
+        addon.bridge = _Collect()
+        addon._push_state = lambda: None
+        a = tflow.tflow(resp=True)
+        a.response.headers["content-type"] = "application/json"
+        a.response.content = b'{"amount":100}'
+        b = tflow.tflow(resp=True)
+        b.response.headers["content-type"] = "application/json"
+        b.response.content = b'{"amount":1}'
+        for f in (a, b):
+            addon.store.put(f, 1, I.summary(f), 10 * 1024 * 1024)
+
+        await addon._on_message({"type": "diff", "a": a.id, "b": b.id, "which": "response"})
+        pushed = [m for m in addon.bridge.sent if m["type"] == "diff"]
+        if not pushed:
+            notes.append("no diff pushed")
+        else:
+            text = pushed[-1]["text"]
+            minus = [ln for ln in text.splitlines() if ln.startswith("-") and not ln.startswith("---")]
+            plus = [ln for ln in text.splitlines() if ln.startswith("+") and not ln.startswith("+++")]
+            if not any('"amount": 100' in ln for ln in minus):
+                notes.append(f"no '-' line with the old value: {minus}")
+            if not any('"amount": 1' in ln and "100" not in ln for ln in plus):
+                notes.append(f"no '+' line with the new value: {plus}")
+
+        addon.bridge.sent.clear()
+        await addon._on_message({"type": "diff", "a": a.id, "b": "nope", "which": "response"})
+        if not any(m["type"] == "error" for m in addon.bridge.sent):
+            notes.append("a missing flow did not error")
+        addon.store.close()
+    check("diff compares two flows and reports a unified diff", not notes,
+          "; ".join(notes) or "response bodies diffed, missing flow errors")
+
+
 def units_stop_reply() -> None:
     """The per-request reply hold: one reply, then disarmed.
 
@@ -2210,6 +3093,35 @@ class _Collect:
 
     def push(self, type_, **payload):
         self.sent.append({"type": type_, **payload})
+
+
+async def units_clear_keeps_held() -> None:
+    """Clear empties the table. A flow still held is still waiting on a decision,
+    so it cannot go with the table: wiping it from the store left a queue entry
+    pointing at a row the table could not show."""
+    import interceptor as I
+    from mitmproxy.addons import modifybody, modifyheaders
+    from mitmproxy.test import taddons, tflow
+
+    addon = I.Interceptor()
+    with taddons.context(addon, modifybody.ModifyBody(), modifyheaders.ModifyHeaders()) as tctx:
+        tctx.configure(addon, hide_noise=False)
+        addon.bridge = _Collect()
+        held = tflow.tflow()            # no response: in flight
+        held.intercept()
+        addon.paused[held.id] = ("request", held)
+        addon._remember(held)
+        done = tflow.tflow(resp=True)
+        addon._remember(done)
+        await addon._on_message({"type": "clear"})
+        kinds = [m["type"] for m in addon.bridge.sent]
+        ok = (held.id in addon.store and done.id not in addon.store
+              and held.id in addon.paused
+              and "flow.paused" in kinds and kinds.index("cleared") < kinds.index("flow.paused"))
+        addon.store.close()
+    check("Clear keeps the flows still held and re-sends their holds", ok,
+          f"held kept: {held.id in addon.store}, finished gone: {done.id not in addon.store}, "
+          f"pushes: {kinds}")
 
 
 async def units_fault_loaded() -> None:
@@ -2311,6 +3223,35 @@ def units_remember_cost() -> None:
         addon.store.close()
     check("storing a flow does not walk the whole store", not notes,
           "; ".join(notes) or "0 store walks for 5 flows; eviction still drops cursors")
+
+
+def units_passthrough() -> None:
+    """The TLS pass-through list: a connection is tunnelled (never decrypted) when
+    its SNI or its address matches, and a bad pattern is refused at configure."""
+    import interceptor as I
+    from mitmproxy import exceptions
+    from mitmproxy.test import taddons
+
+    addon = I.Interceptor()
+    notes = []
+    with taddons.context(addon) as tctx:
+        tctx.configure(addon, passthrough_hosts=[r"^pinned\.example:443$"])
+        if not addon._passthrough("pinned.example", ("1.2.3.4", 443)):
+            notes.append("did not match on SNI")
+        if addon._passthrough("other.example", ("1.2.3.4", 443)):
+            notes.append("matched a host it should not")
+        if not addon._passthrough(None, ("pinned.example", 443)):
+            notes.append("did not fall back to the address when there is no SNI")
+        tctx.configure(addon, passthrough_hosts=[])
+        if addon._passthrough("pinned.example", ("1.2.3.4", 443)):
+            notes.append("an empty list still matched")
+        try:
+            tctx.configure(addon, passthrough_hosts=["("])
+            notes.append("a bad regex was accepted")
+        except exceptions.OptionsError:
+            pass
+    check("the TLS pass-through list matches SNI or address and rejects a bad pattern",
+          not notes, "; ".join(notes) or "SNI, address fallback, empty and bad-regex all correct")
 
 
 async def units_host_predicate() -> None:
@@ -2498,6 +3439,41 @@ def units_row_sync() -> None:
           "; ".join(bad) or f"{len(cases)} cases: prepend and no-op detach nothing")
 
 
+async def units_har_import() -> None:
+    """A HAR exported here (or from devtools) opens as a session: the suffix is
+    accepted, traversal is still refused, and FlowReader round-trips the flow."""
+    import tempfile
+    import interceptor as I
+    from mitmproxy import io as mitm_io
+    from mitmproxy.addons import savehar
+    from mitmproxy.test import taddons, tflow
+    from exporters import write_har
+
+    addon = I.Interceptor()
+    notes = []
+    saved = I.SESSIONS
+    with tempfile.TemporaryDirectory() as tmp, taddons.context(addon, savehar.SaveHar()):
+        d = Path(tmp)
+        f = tflow.tflow(resp=True)
+        f.request.path = "/api/x"
+        name, _ = await write_har([f], d, I._open_private)
+        I.SESSIONS = d
+        try:
+            if addon._session_path(name) is None:
+                notes.append(f".har name {name!r} was rejected by _session_path")
+            if addon._session_path("../escape.har") is not None:
+                notes.append("a traversal .har path was accepted")
+            with (d / name).open("rb") as fh:
+                flows = list(mitm_io.FlowReader(fh).stream())
+            paths = [getattr(fl, "request", None) and fl.request.path for fl in flows]
+            if "/api/x" not in paths:
+                notes.append(f"HAR did not round-trip the flow: {paths}")
+        finally:
+            I.SESSIONS = saved
+    check("a HAR file opens as a session", not notes,
+          "; ".join(notes) or "suffix accepted, traversal refused, flow round-tripped")
+
+
 async def units_har_stream() -> None:
     """HAR export has to stream. It built the whole store into one list, one dict
     and one JSON string -- several GB at the default 2GB cap -- while the proxy's
@@ -2577,6 +3553,8 @@ async def main() -> int:
     units_chain_flag()
     units_rule_builder()
     units_row_filter()
+    units_host_pattern()
+    units_csp_safe_markup()
     units_row_sync()
     units_pretty_body()
     units_ws_classification()
@@ -2585,19 +3563,34 @@ async def main() -> int:
     units_remember_cost()
     units_host_uniform()
     units_host_scope()
+    units_passthrough()
     await units_host_predicate()
     units_scope_atoms()
+    units_scope_chips()
     units_repeat_burst()
+    units_payloads()
+    await units_replay_label()
+    units_faults_option()
     await units_faults()
     await units_fault_loaded()
+    units_findings()
+    await units_map_local()
     units_search()
+    units_decoder()
+    units_tls_detail()
     units_contentview()
     units_export()
     units_stop_reply()
+    await units_diff()
+    units_edited_tag()
+    await units_annotations()
+    await units_clear_keeps_held()
     await units_reply_routing()
     await units_har_stream()
+    await units_har_import()
     await integration()
     await restart_and_load()
+    await faults_persist()
     cleanup_saved_session()
     print()
     width = max(len(n) for n, _, _ in RESULTS)

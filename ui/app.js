@@ -11,7 +11,7 @@
 import { onRender } from "./bus.js";
 import { currentTheme, toggleTheme } from "./theme.js";
 import { RULES_DOC_HTML } from "./rules-doc.js";
-import { $, btn, el, fmtBytes, when } from "./util.js";
+import { $, btn, decodings, el, fmtBytes, when } from "./util.js";
 import { getFlow, ui } from "./state.js";
 import { connect, select, send } from "./transport.js";
 import { passEverything, renderTable, runSearch, setRowFilter, setSearchBodies } from "./table.js";
@@ -32,6 +32,7 @@ function render() {
   }
   $("#resp").classList.toggle("on", !!state.intercept_responses);
   $("#noise").classList.toggle("on", !!state.hide_noise);
+  $("#nocache").classList.toggle("on", !!state.anticache);
   // The filter only decides what Intercept stops, so in Capture it is a control
   // that cannot do anything. Dimming it and captioning it "applies in Intercept
   // mode" was still a box asking to be typed into. Hide it instead; a stored
@@ -126,14 +127,19 @@ function renderStats() {
   if (state.evicted) bits.push(`${state.evicted} evicted`);
   if (state.noise_hidden) bits.push(`${state.noise_hidden} noise hidden`);
   if (state.auto_forwarded) bits.push(`${state.auto_forwarded} auto-forwarded`);
-  const n = (state.rules_body || []).length + (state.rules_headers || []).length;
+  const n = (state.rules_body || []).length + (state.rules_headers || []).length
+    + (state.rules_local || []).length;
   if (n) bits.push(`${n} rule${n === 1 ? "" : "s"} active`);
   const faults = (state.faults || []).length;
   if (faults) bits.push(`${faults} fault${faults === 1 ? "" : "s"} active`);
+  const findings = state.findings || 0;
+  if (findings) bits.push(`${findings} finding${findings === 1 ? "" : "s"}`);
   // A forgotten allowlist reads as "the tool stopped capturing", so it is never
   // silent -- it says so here and again in the mode hint below the toolbar.
   const allow = (state.allow_hosts || []).length;
   if (allow) bits.push(`${allow} host${allow === 1 ? "" : "s"} only`);
+  const nodecrypt = (state.passthrough_hosts || []).length;
+  if (nodecrypt) bits.push(`${nodecrypt} not decrypted`);
   if (state.proxy) {
     // Where traffic actually goes. Chaining is the default now, so the interesting
     // fact is which upstream got adopted -- silence would leave that invisible.
@@ -238,6 +244,13 @@ $("#scope").addEventListener("keydown", (e) => {
 // change fires on blur when the value differs, so clicking away applies it too --
 // pressing Enter was the only way to submit, and nothing said so.
 $("#scope").addEventListener("change", applyScope);
+// Chips fill the scope box and apply it, so a common filter is one click.
+for (const chip of document.querySelectorAll("#scope-chips button")) {
+  chip.onclick = () => {
+    $("#scope").value = chip.dataset.scope;
+    applyScope();
+  };
+}
 $("#theme").onclick = () => {
   toggleTheme();
   $("#theme").title = `Switch to ${currentTheme() === "light" ? "dark" : "light"}`;
@@ -273,6 +286,11 @@ $("#add-header-rule").onclick = () => {
   renderRules();
   $("#header-rules").querySelector(".rule-row:last-child .rule-input")?.focus();
 };
+$("#add-local-rule").onclick = () => {
+  ui.localRules.push({ where: "both", url: "", find: "", repl: "", raw: null });
+  renderRules();
+  $("#local-rules").querySelector(".rule-row:last-child .rule-input")?.focus();
+};
 $("#add-fault-rule").onclick = () => addFaultRule();
 $("#rules-raw-toggle").onclick = () => {
   const pre = $("#rules-raw");
@@ -290,6 +308,7 @@ function openPanel(id) {
   let opened = false;
   for (const [panel, toggle] of [["#hosts-panel", "#hosts-toggle"],
                                  ["#rules", "#rules-toggle"],
+                                 ["#decoder", "#decoder-toggle"],
                                  ["#sessions", "#open-session"]]) {
     const want = panel === id && $(panel).hidden;
     $(panel).hidden = !want;
@@ -303,21 +322,50 @@ $("#hosts-toggle").onclick = () => {
   if (!openPanel("#hosts-panel")) return;
   // Show what is actually in force, not what was last typed here.
   $("#hosts-list").value = (ui.state.allow_hosts || []).join("\n");
+  $("#passthrough-list").value = (ui.state.passthrough_hosts || []).join("\n");
   $("#hosts-list").focus();
 };
 $("#hosts-close").onclick = () => openPanel(null);
+const splitLines = (sel) => $(sel).value.split("\n").map((s) => s.trim()).filter(Boolean);
 $("#hosts-apply").onclick = () => {
-  const hosts = $("#hosts-list").value.split("\n").map((s) => s.trim()).filter(Boolean);
-  send({ type: "hosts.set", hosts });
-  $("#hosts-status").textContent = hosts.length
+  const hosts = splitLines("#hosts-list");
+  const passthrough = splitLines("#passthrough-list");
+  send({ type: "hosts.set", hosts, passthrough });
+  const bits = [hosts.length
     ? `capturing ${hosts.length} host(s) only — TLS applies to new connections`
-    : "capturing every host again";
+    : "capturing every host again"];
+  if (passthrough.length) bits.push(`${passthrough.length} not decrypted`);
+  $("#hosts-status").textContent = bits.join(" · ");
   setTimeout(() => ($("#hosts-status").textContent = ""), 6000);
 };
 $("#hosts-clear").onclick = () => {
   $("#hosts-list").value = "";
-  send({ type: "hosts.set", hosts: [] });
+  $("#passthrough-list").value = "";
+  send({ type: "hosts.set", hosts: [], passthrough: [] });
 };
+
+$("#decoder-toggle").onclick = () => {
+  if (openPanel("#decoder")) $("#decoder-input").focus();
+};
+$("#decoder-close").onclick = () => openPanel(null);
+$("#decoder-input").addEventListener("input", renderDecoder);
+
+function renderDecoder() {
+  const out = $("#decoder-out");
+  out.textContent = "";
+  const results = decodings($("#decoder-input").value);
+  if (!results.length) {
+    out.append(el("p", "hint",
+      "Nothing to decode yet — paste a base64, URL-encoded or hex value, or a JWT."));
+    return;
+  }
+  for (const d of results) {
+    out.append(el("p", "section", d.kind));
+    const pre = document.createElement("pre");
+    pre.textContent = d.text;
+    out.append(pre);
+  }
+}
 
 $("#rules-toggle").onclick = () => {
   if (openPanel("#rules")) loadRulesFromState();
@@ -327,6 +375,7 @@ $("#rules-apply").onclick = applyRules;
 $("#resp").onclick = () =>
   send({ type: "opt.set", intercept_responses: !ui.state.intercept_responses });
 $("#noise").onclick = () => send({ type: "opt.set", hide_noise: !ui.state.hide_noise });
+$("#nocache").onclick = () => send({ type: "opt.set", anticache: !ui.state.anticache });
 $("#save-session").onclick = () => send({ type: "session.save" });
 $("#open-session").onclick = () => {
   if (openPanel("#sessions")) send({ type: "sessions.list" });

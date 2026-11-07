@@ -25,6 +25,7 @@ jobs:
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
       # The README's setup, verbatim. 3.13 exactly: mitmproxy 12.2.3 has no 3.14 wheels.
       - run: uv venv --python 3.13 .venv && uv pip install --python .venv/bin/python -r requirements.txt
-      # Offline: loopback ports only, plus the node and curl both images ship.
-      # spike/spike.py is deliberately absent -- it needs Chrome and the internet.
+      # Offline: loopback ports only, plus the node, curl and Chrome both images ship
+      # (Chrome drives the headless UI smoke test over CDP; absent, it is a SKIP).
+      # spike/spike.py is deliberately absent -- it needs the internet.
       - run: .venv/bin/python spike/check.py

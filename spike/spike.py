@@ -307,6 +307,14 @@ def q4(addon: Spike) -> None:
             continue
         if rc != 0:
             return check(label, False, f"curl rc={rc} {err.strip()[:160]}")
+        # A reachable host can still be having an outage -- httpbin on nghttp2.org
+        # periodically answers 502 from its own gateway. That is an HTML error page,
+        # not our echo, and the docstring's promise is that an outage degrades to
+        # SKIP rather than reading as a regression. A real MITM bug shows as a
+        # *parseable* body with the wrong contents, which is still caught below.
+        if not out.lstrip().startswith("{"):
+            attempts.append(f"{url} returned a non-JSON error page (upstream outage)")
+            continue
         try:
             echoed = json.loads(out).get("json")
         except (json.JSONDecodeError, AttributeError):

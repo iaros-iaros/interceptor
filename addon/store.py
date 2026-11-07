@@ -98,6 +98,11 @@ def _search_text(flow: http.HTTPFlow) -> str:
             parts.append(msg.get_text(strict=False) or "")
         except (ValueError, TypeError):
             pass  # decompression failed; the rest of the flow is still indexed
+    if flow.websocket is not None:
+        # Text frames only -- binary has nothing to substring -- and only once the
+        # socket has closed, which is when a flow is final and this runs at all.
+        parts += [m.content.decode(errors="replace")
+                  for m in flow.websocket.messages if m.is_text]
     return "\n".join(parts)[:SEARCH_TEXT_MAX]
 
 

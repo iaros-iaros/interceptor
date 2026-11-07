@@ -575,7 +575,27 @@ td.c-n { color: var(--fg-dim); }
 /* An injected failure looks exactly like a real one. It must never be quiet:
    this is the difference between a test and an hour lost to your own rule. */
 .tag-fault { color: var(--bad); border-color: var(--bad); background: var(--bad-bg); }
+.tag-finding { color: var(--warn); border-color: var(--warn); }
+.tag-edited { color: var(--warn); border-color: var(--warn); }
+.tag-comment { color: var(--fg-dim); border-color: var(--line); }
+
+.findings-list { display: flex; flex-direction: column; gap: 4px; margin: 2px 0 10px; }
+.finding { display: flex; gap: 10px; align-items: baseline; }
+.finding-code { color: var(--warn); min-width: 170px; }
+.finding-why { color: var(--fg-dim); }
+
+.jwt-meta { color: var(--fg-dim); margin: 2px 0 8px; }
+.jwt-bad { color: var(--bad); }
+#decoder-out pre { margin: 2px 0 10px; }
+
+pre.diff { white-space: pre-wrap; word-break: break-word; }
+.diff-line.add { color: var(--ok); background: var(--ok-bg); display: block; }
+.diff-line.del { color: var(--bad); background: var(--bad-bg); display: block; }
+.diff-line.hunk { color: var(--fg-faint); display: block; }
 #flows tbody tr.faulted td:first-child { box-shadow: inset 2px 0 0 var(--bad); }
+#flows tbody tr.marked td:first-child { box-shadow: inset 2px 0 0 var(--accent); }
+.comment-note { color: var(--accent); margin: 2px 0 8px; }
+.pt-head { margin-top: 14px; }
 
 #truncated { padding: 9px var(--pad); font-size: 12.5px; }
 .empty { padding: 26px var(--pad); color: var(--fg-dim); display: grid; gap: 3px; }
@@ -643,6 +663,9 @@ pre {
 textarea.editor { min-height: 300px; border-color: var(--warn); }
 textarea.editor:focus { border-color: var(--accent); }
 textarea.inject-input { min-height: 0; }
+/* Beats `textarea.editor`'s 300px: the payload list is a few lines, not a body. */
+textarea.editor.payloads-input { min-height: 72px; border-color: var(--line); }
+textarea.editor.payloads-input:focus { border-color: var(--accent); }
 /* A host list is short. Full-width on a wide screen it reads as a void. */
 #hosts-list { max-width: 560px; }
 /* The Apply row sat flush against the notes below it, so the button read as part
@@ -1061,6 +1084,8 @@ pre.anatomy b { color: var(--accent); }
 }
 .send-row:hover { background: var(--bg-hover); border-color: var(--line); }
 .send-status { min-width: 58px; }
+/* The payload that produced this send, pushed to the right end of the row. */
+.send-label { margin-left: auto; color: var(--accent); max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* A number field wants to be narrow: at the shared min-width it left a fault row
    wrapping onto two lines for the sake of four digits. */

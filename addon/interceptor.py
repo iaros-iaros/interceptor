@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import difflib
 import hashlib
 import ipaddress
+import json
 import logging
 import os
 import re
@@ -26,16 +28,18 @@ import tempfile
 import time
 import webbrowser
 from collections import Counter, OrderedDict
+from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
 
-from mitmproxy import command, ctx, exceptions, flowfilter, http
+from mitmproxy import command, ctx, exceptions, flowfilter, http, tls
 from mitmproxy.addons import intercept
 from mitmproxy.log import ALERT
 from mitmproxy.proxy.mode_specs import ProxyMode
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import faults as faultlib  # noqa: E402
+import findings as findingslib  # noqa: E402
 import views  # noqa: E402
 from bridge import Bridge  # noqa: E402
 from exporters import FORMATS as EXPORT_FORMATS, export_text, write_har  # noqa: E402
@@ -167,6 +171,17 @@ def summary(flow: http.HTTPFlow) -> dict:
         # Never omit it: an unlabelled fault is an hour spent debugging your own
         # rule, which is the one way this feature can cost more than it gives.
         "faulted": flow.metadata.get("faulted"),
+        # A repeater payload, so the send list can name which value produced a row.
+        "label": flow.metadata.get("label"),
+        # Passive security smells seen on this flow -- see findings.py.
+        "findings": flow.metadata.get("findings"),
+        # Annotations. mitmproxy's own fields, so `~marked`/`~comment` scope them
+        # and a saved session keeps them.
+        "marked": bool(flow.marked),
+        "comment": flow.comment,
+        # Which sides a human rewrote by hand before forwarding -- an audit trail,
+        # so a tampered flow is never mistaken for one the server produced.
+        "edited": flow.metadata.get("edited"),
     }
 
 
@@ -237,6 +252,36 @@ def parse_raw(text: str) -> tuple[str, list[tuple[str, str]], str]:
     return lines[0].strip(), headers, body
 
 
+def tls_info(flow: http.HTTPFlow) -> dict | None:
+    """The connection's TLS facts and leaf certificate, from the *server* side --
+    the side a tester is assessing. None for a plain-http flow. Never raises: a
+    certificate that will not parse drops the cert block, not the whole response."""
+    sc = getattr(flow, "server_conn", None)
+    if sc is None or not getattr(sc, "tls_version", None):
+        return None
+    out = {
+        "version": sc.tls_version,
+        "cipher": sc.cipher,
+        "alpn": sc.alpn.decode(errors="replace") if sc.alpn else None,
+        "sni": sc.sni,
+    }
+    certs = getattr(sc, "certificate_list", None)
+    if certs:
+        c = certs[0]
+        try:
+            out["cert"] = {
+                "cn": c.cn,
+                "altnames": [str(getattr(n, "value", n)) for n in c.altnames][:8],
+                "issuer": ", ".join(f"{k}={v}" for k, v in c.issuer),
+                "not_before": c.notbefore.isoformat(),
+                "not_after": c.notafter.isoformat(),
+                "sha256": c.fingerprint().hex(),
+            }
+        except Exception as e:  # a malformed cert is a missing block, not a failure
+            logging.debug(f"interceptor: certificate parse failed: {e}")
+    return out
+
+
 def detail(flow: http.HTTPFlow, which: str) -> dict | None:
     msg = flow.request if which == "request" else flow.response
     if msg is None:
@@ -276,6 +321,10 @@ def detail(flow: http.HTTPFlow, which: str) -> dict | None:
         out |= {"method": msg.method, "url": msg.url, "http_version": msg.http_version}
     else:
         out |= {"status": msg.status_code, "reason": msg.reason}
+        # TLS is a fact of the connection, shown on the response side only.
+        tls = tls_info(flow)
+        if tls:
+            out["tls"] = tls
     return out
 
 
@@ -297,6 +346,9 @@ class Interceptor:
         # turning on the global toggle that makes every matching flow stop twice.
         self.stop_reply: set[str] = set()
         self.faults: list[faultlib.Fault] = []
+        # (code, key) pairs already surfaced, so a finding is tagged on first sight
+        # and not on all 300 flows of a page load -- see findings.py.
+        self.findings_seen: set[tuple[str, str]] = set()
         self.mode = "capture"
         self.scope = ""
         self.url_file: Path | None = None
@@ -331,6 +383,16 @@ class Interceptor:
         loader.add_option("expose", bool, False,
                           "Permit binding off loopback. Refused without this: it publishes an "
                           "open MITM proxy and a UI that rewrites traffic to the whole network.")
+        loader.add_option("passthrough_hosts", Sequence[str], [],
+                          "TLS pass-through list: regexes matched against host:port (and SNI). "
+                          "A matching connection is tunnelled, never decrypted -- for a "
+                          "certificate-pinned app that breaks under interception. Nothing of it "
+                          "is captured. Burp's 'TLS pass through'.")
+        loader.add_option("faults", Sequence[str], [],
+                          "Fault rules, one JSON object per entry in the shape the UI sends "
+                          "({url, delay_ms, status, body, drop}). An option so that "
+                          "~/.mitmproxy/config.yaml and --set carry them across restarts, the "
+                          "way modify_body / modify_headers / allow_hosts already do.")
 
     def configure(self, updated) -> None:
         # Startup passes every option through here, so this fires before the UI
@@ -339,6 +401,22 @@ class Interceptor:
         # addon even loads -- that is run.sh's job, see the note there.
         if {"listen_host", "ui_host", "mode", "expose"} & set(updated):
             self._check_bind()
+        if "passthrough_hosts" in updated:
+            # Fail loudly at set time rather than silently never matching later.
+            for pat in ctx.options.passthrough_hosts:
+                try:
+                    re.compile(pat)
+                except re.error as e:
+                    raise exceptions.OptionsError(f"bad passthrough host {pat!r}: {e}")
+        if "faults" in updated:
+            # The option is the source of truth, so config.yaml and --set install
+            # rules the same way the UI does -- a bad one fails startup loudly
+            # rather than arming nothing in silence.
+            try:
+                specs = [json.loads(s) for s in ctx.options.faults]
+                self.faults = faultlib.parse_all(specs)
+            except (ValueError, TypeError, json.JSONDecodeError) as e:
+                raise exceptions.OptionsError(f"bad fault rule: {e}")
 
     @staticmethod
     def _check_bind() -> None:
@@ -572,6 +650,37 @@ class Interceptor:
 
     # ------------------------------------------------------------ hooks
 
+    def tls_clienthello(self, data: tls.ClientHelloData) -> None:
+        """Burp's "TLS pass through": a matching connection is tunnelled, so a
+        certificate-pinned app keeps working and nothing of it is captured.
+
+        This cannot be mitmproxy's own `ignore_hosts`: that option and the Hosts
+        list (`allow_hosts`) are mutually exclusive in next_layer, and an on-list
+        host would win. Deciding it per connection here keeps the two independent --
+        capture *these* hosts, and never decrypt *those*.
+        """
+        try:
+            server = data.context.server
+            if self._passthrough(data.client_hello.sni, server.address):
+                data.ignore_connection = True
+        except Exception as e:  # a bad hook must never wedge the handshake
+            logging.warning(f"interceptor: tls_clienthello: {e!r}")
+
+    @staticmethod
+    def _passthrough(sni: str | None, address) -> bool:
+        """True when this connection should be tunnelled unopened. Matched against
+        `sni:port` and `host:port`, case-insensitive, the way allow_hosts matches."""
+        pats = [p for p in ctx.options.passthrough_hosts if p.strip()]
+        if not pats:
+            return False
+        port = address[1] if address else None
+        targets = []
+        if sni:
+            targets.append(f"{sni}:{port}" if port is not None else sni)
+        if address:
+            targets.append(f"{address[0]}:{address[1]}")
+        return any(re.search(p, t, re.IGNORECASE) for p in pats for t in targets)
+
     def requestheaders(self, flow: http.HTTPFlow) -> None:
         self._maybe_stream(flow.request)
 
@@ -653,10 +762,29 @@ class Interceptor:
         self._push_flow(flow)
 
     def response(self, flow: http.HTTPFlow) -> None:
+        self._note_findings(flow)
         if self._remember(flow):
             self._push_flow(flow)
             self._push_state_soon()
         self._maybe_pause(flow, "response")
+
+    def _note_findings(self, flow: http.HTTPFlow) -> None:
+        """Tag a flow with the passive smells seen on it for the first time. Set
+        before _remember, so the stored summary carries them. Skipped for noise,
+        off-list and our own faulted responses -- a finding on a reply we
+        synthesised is noise about ourselves."""
+        if (not isinstance(flow, http.HTTPFlow) or flow.response is None
+                or self._is_noise(flow) or self._off_list(flow)
+                or flow.metadata.get("faulted")):
+            return
+        new = []
+        for code, key in findingslib.passive(flow):
+            tag = (code, key)
+            if tag not in self.findings_seen:
+                self.findings_seen.add(tag)
+                new.append(code)
+        if new:
+            flow.metadata["findings"] = new
 
     def websocket_start(self, flow: http.HTTPFlow) -> None:
         if self._remember(flow):
@@ -813,6 +941,7 @@ class Interceptor:
                     raise ValueError(f"binary frame must stay valid hex: {e}") from e
             else:
                 target.content = raw.encode()
+            flow.metadata.setdefault("edited", []).append(f"frame #{idx}")
             return
 
         which = "response" if direction == "response" else "request"
@@ -861,6 +990,9 @@ class Interceptor:
         for name, value in headers:
             msg.headers.add(name, value)
         msg.text = body
+        # Only reached when every step above succeeded -- a rejected edit raises
+        # before here, so a flow is tagged edited exactly when it really was.
+        flow.metadata.setdefault("edited", []).append(which)
 
     def _resume(self, fid: str | None, drop: bool = False, seq: int | None = None,
                 raw: str | None = None, stop_reply: bool = False) -> None:
@@ -1032,8 +1164,12 @@ class Interceptor:
             sessions_dir=str(SESSIONS),
             rules_body=list(ctx.options.modify_body),
             rules_headers=list(ctx.options.modify_headers),
+            rules_local=list(getattr(ctx.options, "map_local", [])),
+            anticache=bool(getattr(ctx.options, "anticache", False)),
             faults=[f.to_spec() for f in self.faults],
+            findings=len(self.findings_seen),
             allow_hosts=list(ctx.options.allow_hosts),
+            passthrough_hosts=list(ctx.options.passthrough_hosts),
             proxy=f"{ctx.options.listen_host or '127.0.0.1'}:{ctx.options.listen_port}",
             # So the UI can explain a 502 before the user has to ask anyone.
             env_proxy=self._detected_proxy(),
@@ -1044,7 +1180,10 @@ class Interceptor:
         # Summaries come off disk already built, and only the newest page of them:
         # the store is no longer bounded by memory, but a snapshot still has to fit
         # in one message and the browser caps its own table anyway.
-        self.bridge.push("snapshot", flows=self.store.summaries())
+        # findings_doc is the code -> explanation map, sent once per hello (never in
+        # state): the UI shows it on a tagged flow and never has to hard-code it.
+        self.bridge.push("snapshot", flows=self.store.summaries(),
+                         findings_doc=findingslib.EXPLAIN)
         for direction, flow in self.paused.values():
             self.bridge.push("flow.paused", **self._paused_payload(direction, flow))
         self._push_state()
@@ -1092,6 +1231,12 @@ class Interceptor:
                              flows=self.store.search(msg.get("q", "")))
         elif kind == "export":
             self._export(msg.get("id"), msg.get("format", "curl"))
+        elif kind == "diff":
+            self._diff(msg.get("a"), msg.get("b"), msg.get("which", "response"))
+        elif kind == "flow.mark":
+            self._annotate(msg.get("id"), marked=bool(msg.get("marked")))
+        elif kind == "flow.comment":
+            self._annotate(msg.get("id"), comment=str(msg.get("text") or ""))
         elif kind == "har.save":
             await self._save_har()
         elif kind == "faults.set":
@@ -1104,7 +1249,16 @@ class Interceptor:
             # this behind showed "12 auto-forwarded" above an empty capture.
             self.auto_forwarded = 0
             self.stop_reply.clear()
+            self.findings_seen.clear()
+            # A held flow is still waiting on a decision, so it cannot go with the
+            # table: wiping it left a queue entry pointing at a row the table could
+            # not show. Put the held ones back, and re-send their holds after
+            # `cleared` -- the UI forgets everything on that message.
+            for _direction, flow in self.paused.values():
+                self._remember(flow)
             self.bridge.push("cleared")
+            for direction, flow in self.paused.values():
+                self.bridge.push("flow.paused", **self._paused_payload(direction, flow))
             self._push_state()
         elif kind == "opt.set":
             if "intercept_responses" in msg:
@@ -1113,6 +1267,11 @@ class Interceptor:
                 ctx.options.update(hide_noise=bool(msg["hide_noise"]))
                 if self.mode == "intercept":
                     self._set_mode("intercept")  # noise is baked into the filter
+            if "anticache" in msg:
+                # mitmproxy's own AntiCache: strips If-None-Match / If-Modified-Since
+                # so a client other than the launched Chrome cannot 304 its way out
+                # of being captured.
+                ctx.options.update(anticache=bool(msg["anticache"]))
             self._push_state()
         elif kind == "sessions.list":
             self._push_sessions()
@@ -1121,11 +1280,12 @@ class Interceptor:
         elif kind == "session.load":
             await self._load_session(msg.get("name", ""))
         elif kind == "replay":
-            self.repeat(msg.get("id"), msg.get("raw") or "")
+            self.repeat(msg.get("id"), msg.get("raw") or "", msg.get("label") or "")
         elif kind == "rules.set":
-            self._set_rules(list(msg.get("body") or []), list(msg.get("headers") or []))
+            self._set_rules(list(msg.get("body") or []), list(msg.get("headers") or []),
+                            msg.get("local"))
         elif kind == "hosts.set":
-            self._set_hosts(list(msg.get("hosts") or []))
+            self._set_hosts(list(msg.get("hosts") or []), msg.get("passthrough"))
         elif kind == "ws.inject":
             self.inject_frame(msg.get("id"), bool(msg.get("to_client")),
                               msg.get("text", ""), bool(msg.get("is_text", True)))
@@ -1143,14 +1303,19 @@ class Interceptor:
         if not name or "/" in name or "\\" in name or name.startswith("."):
             return None
         path = (SESSIONS / name).resolve()
-        if not path.is_relative_to(SESSIONS.resolve()) or path.suffix != ".mitm":
+        # .har too: FlowReader sniffs a HAR by its leading `{` and reads it, so a
+        # devtools capture -- or one this tool exported into the same folder --
+        # reopens here. Our own HAR exports land in sessions/, so they show up in
+        # the picker alongside .mitm dumps.
+        if not path.is_relative_to(SESSIONS.resolve()) or path.suffix not in (".mitm", ".har"):
             return None
         return path
 
     def _push_sessions(self) -> None:
         items = []
         if SESSIONS.is_dir():
-            for path in sorted(SESSIONS.glob("*.mitm"), reverse=True):
+            both = [*SESSIONS.glob("*.mitm"), *SESSIONS.glob("*.har")]
+            for path in sorted(both, key=lambda p: p.stat().st_mtime, reverse=True):
                 stat = path.stat()
                 items.append({"name": path.name, "bytes": stat.st_size,
                               "mtime": stat.st_mtime})
@@ -1197,6 +1362,7 @@ class Interceptor:
         self.store.clear()
         self.ws_seen.clear()
         self.noise_hidden = 0
+        self.findings_seen.clear()
         self.bridge.push("cleared")
 
         count = 0
@@ -1234,6 +1400,58 @@ class Interceptor:
             return
         self.bridge.push("export", id=fid, format=fmt, text=text)
 
+    def _annotate(self, fid: str | None, marked: bool | None = None,
+                  comment: str | None = None) -> None:
+        """Mark or comment a flow. Writes mitmproxy's own `marked`/`comment`
+        fields, so the flow filter (`~marked`, `~comment`) and a saved `.mitm`
+        session both carry them for free, then re-stores so the change reaches
+        disk and the table."""
+        flow = self.store.get(fid)
+        if not isinstance(flow, http.HTTPFlow):
+            self._report("that flow is no longer in the store")
+            return
+        if marked is not None:
+            # A non-empty string is "marked" to mitmproxy; the UI only cares that
+            # it is truthy, so a single flag character is enough.
+            flow.marked = ":flag:" if marked else ""
+        if comment is not None:
+            flow.comment = comment[:2000]
+        self._remember(flow)
+        self._push_flow(flow)
+
+    @staticmethod
+    def _diff_text(flow: http.HTTPFlow, which: str) -> list[str] | None:
+        """One message as lines for diffing: start line, headers, blank, body --
+        the prettified body when there is one, so a one-line JSON reply diffs field
+        by field rather than as a single changed line. None when there is nothing
+        to show."""
+        d = detail(flow, which)
+        if d is None or d.get("encoding") in ("streamed", "too-large"):
+            return None
+        head = [d.get("method", "") + " " + d.get("url", "") + " " + d.get("http_version", "")
+                if which == "request"
+                else f"{d.get('status', '')} {d.get('reason', '')}"]
+        head += [f"{k}: {v}" for k, v in d["headers"]]
+        body = d.get("pretty") or d.get("body") or ""
+        return head + [""] + body.splitlines()
+
+    def _diff(self, a: str | None, b: str | None, which: str) -> None:
+        """A unified diff between two flows, pushed as a reply. The Comparer the
+        repeater's send list was asking for -- status/size deltas say *that* two
+        responses differ; this says *how*."""
+        fa, fb = self.store.get(a), self.store.get(b)
+        if not isinstance(fa, http.HTTPFlow) or not isinstance(fb, http.HTTPFlow):
+            self.bridge.push("error", message="one of those flows is no longer in the store")
+            return
+        la, lb = self._diff_text(fa, which), self._diff_text(fb, which)
+        if la is None or lb is None:
+            self.bridge.push("error",
+                             message=f"that {which} cannot be shown as text (streamed or too large)")
+            return
+        text = "\n".join(difflib.unified_diff(
+            la, lb, fromfile=f"{a[:8]} {which}", tofile=f"{b[:8]} {which}", lineterm=""))
+        self.bridge.push("diff", a=a, b=b, which=which, text=text or "(identical)")
+
     async def _save_har(self) -> None:
         """Every captured flow as a HAR file in sessions/.
 
@@ -1262,20 +1480,27 @@ class Interceptor:
             # than none, because you would be testing against rules you cannot see.
             self.bridge.push("error", message=str(e))
             return
-        self.faults = parsed
-        logging.log(ALERT, f"{len(parsed)} fault rule(s) active"
-                           + (f": {'; '.join(f.describe() for f in parsed)}" if parsed else ""))
+        # Persist through the option, so a rule set in the UI survives a restart in
+        # config.yaml exactly as a command-line one does; configure() re-parses it
+        # into self.faults. Round-trip through to_spec() to drop any stray fields.
+        ctx.options.update(faults=[json.dumps(f.to_spec()) for f in parsed])
+        logging.log(ALERT, f"{len(self.faults)} fault rule(s) active"
+                           + (f": {'; '.join(f.describe() for f in self.faults)}" if self.faults else ""))
         self._push_state()
 
     # ------------------------------------------------------------ repeater
 
     @command.command("interceptor.repeat")
-    def repeat(self, fid: str, raw: str = "") -> None:
+    def repeat(self, fid: str, raw: str = "", label: str = "") -> None:
         """Repeater: resend a captured request, optionally edited first.
 
         Always replays a *copy* -- `replay.client` mutates the flow it is given
         (clears response and error, sets is_replay), so replaying the original
         would blank the row you were comparing against.
+
+        `label` tags the copy with the payload that produced it (intruder-lite),
+        so a run of substitutions reads as a list naming each value rather than a
+        pile of identical-looking rows.
         """
         # These are `@command.command`s: mitmproxy asserts the return value against
         # the annotation (command.py), so a `-> None` command must return nothing
@@ -1286,6 +1511,11 @@ class Interceptor:
             return
         clone = flow.copy()
         clone.metadata["replay_of"] = fid
+        # A copy inherits metadata, but "edited" on a replay must mean edited in the
+        # repeater, not something the original carried.
+        clone.metadata.pop("edited", None)
+        if label:
+            clone.metadata["label"] = label[:200]
         if raw:
             try:
                 self._apply_edits(clone, "request", raw)
@@ -1299,7 +1529,8 @@ class Interceptor:
 
     # ------------------------------------------------------------ rewrite rules
 
-    def _set_rules(self, body: list[str], headers: list[str]) -> None:
+    def _set_rules(self, body: list[str], headers: list[str],
+                   local: list[str] | None = None) -> None:
         """Rule-based auto-rewrite with no human in the loop. Both the spec syntax
         and the rewriting are mitmproxy's own `modify_body` / `modify_headers`,
         which are already in default_addons -- we only validate and set them.
@@ -1317,8 +1548,22 @@ class Interceptor:
                 except ValueError as e:
                     self.bridge.push("error", message=f"bad {label} rule {spec!r}: {e}")
                     return
+        # Local-file rules serve a file off disk for a matching URL -- the same
+        # trust the rewrite rules already carry (the proxy hands the client under
+        # test whatever this names). parse_map_local_spec requires the file to
+        # exist, so a typo is caught here rather than serving a 404 silently.
+        if local is not None:
+            from mitmproxy.addons.maplocal import parse_map_local_spec
+            for spec in local:
+                try:
+                    parse_map_local_spec(spec)
+                except ValueError as e:
+                    self.bridge.push("error", message=f"bad local-file rule {spec!r}: {e}")
+                    return
         try:
             ctx.options.update(modify_body=body, modify_headers=headers)
+            if local is not None:
+                ctx.options.update(map_local=local)
         except Exception as e:
             self.bridge.push("error", message=f"rules rejected: {e}")
             return
@@ -1329,7 +1574,7 @@ class Interceptor:
 
     # ------------------------------------------------------------ host list
 
-    def _set_hosts(self, hosts: list[str]) -> None:
+    def _set_hosts(self, hosts: list[str], passthrough: list[str] | None = None) -> None:
         """Capture only these hosts. One list, three effects:
 
         * mitmproxy's `allow_hosts` stops terminating TLS for anything else, which
@@ -1360,9 +1605,23 @@ class Interceptor:
                             f"hostname such as  app.example.com  or a regular "
                             f"expression such as  .*\\.example\\.com  -- one per line.")
                 return
+        # Validate the pass-through list too, before touching either option, so a
+        # typo in one never leaves the other half-applied.
+        pt = None
+        if passthrough is not None:
+            pt = [h.strip() for h in passthrough if h.strip()]
+            for pattern in pt:
+                try:
+                    re.compile(pattern)
+                except re.error as e:
+                    self.bridge.push("error",
+                                     message=f"bad pass-through host {pattern!r}: {e}")
+                    return
         previous = list(ctx.options.allow_hosts)
         try:
             ctx.options.update(allow_hosts=cleaned)
+            if pt is not None:
+                ctx.options.update(passthrough_hosts=pt)
         except Exception as e:
             ctx.options.update(allow_hosts=previous)
             self.bridge.push("error", message=f"host list rejected: {e}")

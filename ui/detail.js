@@ -1,7 +1,9 @@
 // The right-hand pane: headers and body, the held-flow editor, WebSocket frames,
 // and the repeater.
 
-import { $, btn, el, fmtBytes, note, pretty, statusClass, statusText } from "./util.js";
+import {
+  $, btn, decodeJwt, el, fmtBytes, note, pretty, statusClass, statusText,
+} from "./util.js";
 import {
   closeRepeatTab, details, drafts, frames, framesLoaded, getFlow,
   held, openRepeatTab, sendHistory, ui,
@@ -59,7 +61,8 @@ export function renderDetail() {
 // selection in a body within a quarter of a second while traffic flowed.
 function messageKey(f) {
   const o = f.replay_of ? getFlow(f.replay_of) : null;
-  return `msg:${f.id}:${ui.which}:${f.faulted || ""}:`
+  const diff = ui.diff && ui.diff.b === f.id ? `D${ui.diff.which}${ui.diff.text.length}` : "";
+  return `msg:${f.id}:${ui.which}:${f.faulted || ""}:${diff}:`
     + [f.status, f.resp_bytes, f.ms, o?.status, o?.resp_bytes, o?.ms].join(",");
 }
 
@@ -76,12 +79,17 @@ function renderMessage(box, f) {
     ? `${d.method} ${d.url}  ${d.http_version}`
     : `${d.status} ${d.reason}`;
   box.append(el("p", "headline", line));
+  if (f.comment) box.append(el("p", "comment-note", f.comment));
+  if (f.edited?.includes(ui.which)) {
+    box.append(el("p", "note", "You edited this by hand before it was forwarded."));
+  }
   if (f.faulted) {
     box.append(el("p", "note",
       `Interceptor produced this on purpose — ${f.faulted}. It did not come from the `
       + "server. Clear the rule in Tools → Rules to stop it."));
   }
   if (f.replay_of) renderReplayDelta(box, f);
+  if (f.findings?.length) renderFindings(box, f);
 
   const kv = document.createElement("table");
   kv.className = "kv";
@@ -91,6 +99,13 @@ function renderMessage(box, f) {
     kv.append(tr);
   }
   box.append(el("p", "section", "headers"), kv);
+  renderJwts(box, d);
+  if (d.tls) renderTls(box, d.tls);
+
+  // A diff takes the place of the body view for the flow and tab it was asked for.
+  if (ui.diff && ui.diff.b === f.id && ui.diff.which === ui.which) {
+    return renderDiff(box);
+  }
 
   if (d.encoding === "streamed") {
     box.append(el("p", "note",
@@ -262,18 +277,19 @@ function renderEditor(box, h) {
   }
 
   const actions = el("div", "actions");
-  actions.append(
-    btn("Forward", () => forwardId(h.id), "ok"),
-    btn("Drop", () => forwardId(h.id, true), "danger"),
-  );
+  const fwd = btn("Forward", () => forwardId(h.id), "ok");
+  fwd.title = `Forward this flow (${MOD}+Enter)`;
+  const drop = btn("Drop", () => forwardId(h.id, true), "danger");
+  drop.title = `Drop this flow (${MOD}+Shift+D)`;
+  actions.append(fwd, drop);
   // The per-request version of the global "Stop replies" toggle. That toggle
   // stops *every* matching flow twice, which is why it defaults off and stays
   // off; this holds exactly one reply, the one in front of you, and disarms
   // itself as soon as it has been used.
   if (h.direction === "request") {
     const b = btn("Forward + stop reply", () => forwardId(h.id, false, true), "ok");
-    b.title = "Send this request on, then stop its reply on the way back so you can "
-            + "edit what the app receives. Applies to this request only.";
+    b.title = `Send this request on, then stop its reply on the way back so you can `
+            + `edit what the app receives (${MOD}+Shift+Enter). Applies to this request only.`;
     actions.append(b);
   }
   if (ta) {
@@ -293,6 +309,29 @@ function renderEditor(box, h) {
     ta.scrollTop = 0;
   }
 }
+
+// ⌘ on a Mac, Ctrl everywhere else. navigator.platform is deprecated but still the
+// simplest reliable signal, and this is only a label and a modifier check.
+const MOD = /Mac|iPhone|iPad/.test(navigator.platform || "") ? "⌘" : "Ctrl";
+
+// Forward / Drop / Forward+stop-reply from the keyboard, while a held flow is open.
+// The editor is a textarea, so these use the Cmd/Ctrl modifier -- plain Enter still
+// types a newline.
+document.addEventListener("keydown", (e) => {
+  if (!(e.metaKey || e.ctrlKey) || !ui.sel) return;
+  const h = held.get(ui.sel);
+  if (!h) return;
+  if (e.key === "Enter" && e.shiftKey) {
+    e.preventDefault();
+    forwardId(h.id, false, true);        // stop_reply is ignored server-side on a reply
+  } else if (e.key === "Enter") {
+    e.preventDefault();
+    forwardId(h.id);
+  } else if (e.shiftKey && (e.key === "D" || e.key === "d")) {
+    e.preventDefault();
+    forwardId(h.id, true);
+  }
+});
 
 export function forwardId(id, drop, stopReply) {
   const h = held.get(id);
@@ -333,10 +372,25 @@ function renderRepeat(box, f) {
     ta,
   );
 
+  // Intruder-lite: wrap one spot in §…§, paste a list, and each line is sent in
+  // turn with that spot replaced. One position only — sniper, not cluster bomb.
+  const payKey = `payloads:${f.id}`;
+  const payTa = document.createElement("textarea");
+  payTa.className = "editor payloads-input";
+  payTa.spellcheck = false;
+  payTa.placeholder = "payloads — one per line; each is substituted into §…§";
+  payTa.value = drafts.get(payKey) ?? "";
+  payTa.oninput = () => drafts.set(payKey, payTa.value);
+  const markBtn = btn("§ mark selection", () => markSelection(ta, key), "");
+  markBtn.title = "Wrap the selected request text in §…§ so each payload is substituted there";
+  const payHead = el("div", "editor-head");
+  payHead.append(el("p", "section", "payloads"), markBtn);
+  box.append(payHead, payTa);
+
   const actions = el("div", "actions");
   const sendBtn = btn("Send", null, "primary");
   const countIn = numField(ui.repeatCount, "1", 62,
-    "How many times to send it. 1 is a single send.");
+    "How many times to send it. 1 is a single send. Ignored when payloads are set.");
   const delayIn = numField(ui.repeatDelay, "0", 76,
     "How long to wait after each reply before sending the next. Sends never overlap: "
     + "each one waits for its own reply first, so 0 means back-to-back, not all at once.");
@@ -346,7 +400,8 @@ function renderRepeat(box, f) {
     if (running && running.id === f.id) return stopRepeat();
     ui.repeatCount = Number(countIn.value) || 1;
     ui.repeatDelay = Number(delayIn.value) || 0;
-    runRepeat(f, ta.value, sendBtn, progress);
+    const payloads = payTa.value.split("\n").map((s) => s.trim()).filter(Boolean);
+    runRepeat(f, ta.value, sendBtn, progress, payloads);
   };
 
   actions.append(
@@ -389,6 +444,14 @@ function numField(value, placeholder, width, title) {
 export const MAX_REPEAT_SENDS = 1000;
 export const MAX_REPEAT_DELAY = 60_000;
 
+// §…§ marks the one payload position. Every marker takes the same payload — Burp's
+// sniper with a single position set. A function replacer, so a payload that
+// contains $& or $1 lands verbatim rather than being expanded by replace().
+export function expandPayloads(raw, payloads) {
+  if (!/§[^§]*§/.test(raw)) return [];
+  return payloads.map((p) => raw.replace(/§[^§]*§/g, () => p));
+}
+
 // Pure, so it can be checked without a DOM -- the clamping is the only part of
 // this feature with logic in it.
 export function clampRepeat(count, delay) {
@@ -423,20 +486,55 @@ function stopRepeat() {
   if (running) running.stop = true;
 }
 
-async function runRepeat(f, raw, sendBtn, progress) {
+// Wrap the editor's current selection in §…§. No selection → an empty marker at
+// the caret, which the user then types into.
+function markSelection(ta, key) {
+  const s = ta.selectionStart, e = ta.selectionEnd;
+  ta.value = `${ta.value.slice(0, s)}§${ta.value.slice(s, e)}§${ta.value.slice(e)}`;
+  drafts.set(key, ta.value);
+  ta.focus();
+  ta.setSelectionRange(s, e + 2);
+}
+
+async function runRepeat(f, raw, sendBtn, progress, payloads = []) {
   if (running) return note("A repeat run is already going — stop it first.");
-  const { count, delay, notes } = clampRepeat(ui.repeatCount, ui.repeatDelay);
-  if (notes.length) note(notes.join("; "));
 
-  // A single send keeps the old behaviour exactly: fire and forget, no Stop
-  // button appearing and vanishing for something that is already over.
-  if (count === 1) return send({ type: "replay", id: f.id, raw });
+  // Payloads and a §…§ marker only mean anything together: a marker with no
+  // payloads would put a literal § on the wire, and payloads with no marker would
+  // send the same request N times under different labels and read as broken.
+  const hasMarkers = /§[^§]*§/.test(raw);
+  if (payloads.length && !hasMarkers) {
+    return note("Add a §…§ marker where a payload should go (select text, “§ mark selection”).");
+  }
+  if (hasMarkers && !payloads.length) {
+    return note("This request has a §…§ marker but no payloads — add one per line, or remove the marker.");
+  }
 
-  running = { id: f.id, stop: false, sent: 0, total: count };
+  let jobs, delay, noun;
+  if (payloads.length) {
+    const c = clampRepeat(payloads.length, ui.repeatDelay);
+    if (c.notes.length) note(c.notes.join("; "));
+    delay = c.delay;
+    noun = "payloads sent";
+    jobs = expandPayloads(raw, payloads).slice(0, MAX_REPEAT_SENDS)
+      .map((r, i) => ({ raw: r, label: payloads[i] }));
+  } else {
+    const c = clampRepeat(ui.repeatCount, ui.repeatDelay);
+    if (c.notes.length) note(c.notes.join("; "));
+    // A single send keeps the old behaviour exactly: fire and forget, no Stop
+    // button appearing and vanishing for something that is already over.
+    if (c.count === 1) return send({ type: "replay", id: f.id, raw });
+    delay = c.delay;
+    noun = "sent";
+    jobs = Array.from({ length: c.count }, () => ({ raw, label: "" }));
+  }
+
+  const total = jobs.length;
+  running = { id: f.id, stop: false, sent: 0, total };
   markRunning(sendBtn, progress);
   let failure = "";
   try {
-    for (let i = 0; i < count; i++) {
+    for (let i = 0; i < total; i++) {
       if (running.stop) break;
       if (!isOpen()) {
         failure = "the bridge disconnected";
@@ -445,9 +543,9 @@ async function runRepeat(f, raw, sendBtn, progress) {
       // Count the sends already on record, so the wait below can tell *this*
       // reply from one that was already there.
       const before = sendHistory(f.id).length;
-      send({ type: "replay", id: f.id, raw });
+      send({ type: "replay", id: f.id, raw: jobs[i].raw, label: jobs[i].label });
       running.sent = i + 1;
-      progress.textContent = `${running.sent} / ${count} · waiting for reply`;
+      progress.textContent = `${running.sent} / ${total} · waiting for reply`;
 
       // Sequential, deliberately: this is a repeat with a delay, not a fixed-rate
       // burst. Firing on a timer without waiting lets sends overlap whenever the
@@ -458,14 +556,14 @@ async function runRepeat(f, raw, sendBtn, progress) {
         break;
       }
       if (running.stop) break;
-      progress.textContent = `${running.sent} / ${count} done`;
+      progress.textContent = `${running.sent} / ${total} done`;
       // Skipped after the last one: a trailing wait leaves the button saying Stop
       // for a run that has already finished.
-      if (delay && i < count - 1) await sleep(delay);
+      if (delay && i < total - 1) await sleep(delay);
     }
-    const stopped = running.stop || running.sent < count || failure;
+    const stopped = running.stop || running.sent < total || failure;
     const why = failure ? ` — ${failure}` : running.stop ? " — stopped" : "";
-    note(`${running.sent} of ${count} sent${why}`, !stopped);
+    note(`${running.sent} of ${total} ${noun}${why}`, !stopped);
   } finally {
     running = null;
     sendBtn.textContent = "Send";
@@ -549,9 +647,82 @@ function refreshRepeatHistory(box, f) {
       el("span", `send-status ${statusClass(s)}`, statusText(s)),
       el("span", "dim", fmtBytes(s.resp_bytes || 0)),
       el("span", "dim", s.ms == null ? "—" : `${s.ms}ms`),
+      el("span", "send-label", s.label || ""),
     );
     list.append(rowEl);
   }
+}
+
+// Any JWT in a header, decoded in place: a bearer token or a session cookie is
+// almost always where one hides, and "what's in this token, and has it expired"
+// is a question you should not have to leave the pane to answer.
+const JWT_RE = /eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/g;
+
+function renderJwts(box, d) {
+  const seen = new Set();
+  for (const [k, v] of d.headers) {
+    for (const tok of String(v).match(JWT_RE) || []) {
+      if (seen.has(tok)) continue;
+      seen.add(tok);
+      const j = decodeJwt(tok);
+      if (!j) continue;
+      box.append(el("p", "section", `JWT in ${k}`));
+      const meta = el("p", "jwt-meta");
+      meta.append(el("span", "", `alg ${j.alg || "?"}`));
+      if (j.exp != null) {
+        const when = new Date(j.exp * 1000).toLocaleString();
+        meta.append(el("span", "jwt-sep", "  ·  "),
+          el("span", j.expired ? "jwt-bad" : "",
+            `exp ${when}${j.expired ? " · expired" : ""}`));
+      }
+      box.append(meta);
+      const pre = document.createElement("pre");
+      pre.textContent = JSON.stringify(j.payload, null, 2);
+      box.append(pre);
+    }
+  }
+}
+
+// The connection's TLS facts and the leaf certificate, on the response tab. An
+// expired certificate is called out in red -- it is the one field here you act on.
+function renderTls(box, t) {
+  box.append(el("p", "section", "TLS"));
+  const kv = document.createElement("table");
+  kv.className = "kv";
+  const row = (k, v, cls) => {
+    if (v == null || v === "") return;
+    const tr = document.createElement("tr");
+    tr.append(el("td", "", k), el("td", cls || "", String(v)));
+    kv.append(tr);
+  };
+  row("version", t.version);
+  row("cipher", t.cipher);
+  row("alpn", t.alpn);
+  row("sni", t.sni);
+  if (t.cert) {
+    row("cert CN", t.cert.cn);
+    if (t.cert.altnames?.length) row("alt names", t.cert.altnames.join(", "));
+    row("issuer", t.cert.issuer);
+    row("not before", t.cert.not_before);
+    const expired = t.cert.not_after && Date.parse(t.cert.not_after) < Date.now();
+    row("not after", t.cert.not_after + (expired ? " · expired" : ""), expired ? "jwt-bad" : "");
+    row("sha-256", t.cert.sha256);
+  }
+  box.append(kv);
+}
+
+// Passive smells, flow-level, so shown on either tab. The explanation text comes
+// from the engine (ui.findingsDoc), never hard-coded here.
+function renderFindings(box, f) {
+  box.append(el("p", "section", `findings · ${f.findings.length}`));
+  const list = el("div", "findings-list");
+  for (const code of f.findings) {
+    const row = el("div", "finding");
+    row.append(el("span", "finding-code", code),
+               el("span", "finding-why", ui.findingsDoc[code] || ""));
+    list.append(row);
+  }
+  box.append(list);
 }
 
 function renderReplayDelta(box, f) {
@@ -562,6 +733,30 @@ function renderReplayDelta(box, f) {
     `replay · status ${bit(orig.status, f.status)}` +
     ` · body ${bit(fmtBytes(orig.resp_bytes || 0), fmtBytes(f.resp_bytes || 0))}` +
     ` · ${bit(orig.ms == null ? null : orig.ms + "ms", f.ms == null ? null : f.ms + "ms")}`));
+  // Status/size/time say *that* they differ; this says *how*.
+  const b = btn(`Diff ${ui.which} vs original`,
+    () => send({ type: "diff", a: f.replay_of, b: f.id, which: ui.which }));
+  b.title = "A line-by-line diff of this replay against the request it was copied from";
+  box.append(b);
+}
+
+// A unified diff in place of the body, one span per line so additions and
+// deletions can be coloured. The text is server-built; this only paints it.
+function renderDiff(box) {
+  const d = ui.diff;
+  const head = el("div", "editor-head");
+  head.append(el("p", "section",
+    `diff · ${d.which} · ${d.a.slice(0, 8)} → ${d.b.slice(0, 8)}`));
+  head.append(btn("Hide diff", () => { ui.diff = null; box.dataset.key = ""; refresh(); }));
+  box.append(head);
+  const pre = el("pre", "diff");
+  for (const line of d.text.split("\n")) {
+    const cls = line.startsWith("+") && !line.startsWith("+++") ? "add"
+      : line.startsWith("-") && !line.startsWith("---") ? "del"
+      : line.startsWith("@@") ? "hunk" : "";
+    pre.append(el("span", `diff-line ${cls}`, line + "\n"));
+  }
+  box.append(pre);
 }
 
 // -------------------------------------------------------------------- frames

@@ -43,6 +43,84 @@ export function pretty(text) {
   }
 }
 
+// ------------------------------------------------------------------ decoding
+//
+// Pure, DOM-free, so they run under node in the check suite. atob, TextDecoder
+// and decodeURIComponent are all available in the browser and in node.
+
+function b64urlToBytes(s) {
+  const b64 = s.replace(/-/g, "+").replace(/_/g, "/");
+  const pad = b64.length % 4 ? "=".repeat(4 - (b64.length % 4)) : "";
+  const bin = atob(b64 + pad);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
+// Decode as UTF-8, throwing on invalid bytes (fatal) -- that is how we tell "this
+// base64 was text" from "this base64 was a gzip blob".
+function bytesToText(bytes) {
+  return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+}
+
+// A string with no control characters other than tab/newline/CR is something
+// worth showing; one with stray control bytes is a binary blob rendered as junk.
+function isTextStr(s) {
+  return !/[\u0000-\u0008\u000e-\u001f]/.test(s);
+}
+
+// Decode a JWT without verifying it -- this is a decoder, not a validator. Returns
+// {header, payload, alg, exp, expired} or null when it is not three base64url
+// JSON-bearing segments.
+export function decodeJwt(token) {
+  const parts = String(token || "").split(".");
+  if (parts.length !== 3) return null;
+  try {
+    const header = JSON.parse(bytesToText(b64urlToBytes(parts[0])));
+    const payload = JSON.parse(bytesToText(b64urlToBytes(parts[1])));
+    const alg = String(header.alg ?? "");
+    const exp = typeof payload.exp === "number" ? payload.exp : null;
+    return { header, payload, alg, exp, expired: exp != null && exp * 1000 < Date.now() };
+  } catch {
+    return null;
+  }
+}
+
+// Every way the given text plausibly decodes: base64/base64url, URL percent-
+// encoding, hex, JWT. Only decodings that succeed, are text, and actually differ
+// from the input are returned, so pasting plain text yields nothing.
+export function decodings(input) {
+  const text = (input || "").trim();
+  const out = [];
+  if (!text) return out;
+  // base64 — reject length%4==1 (never valid) and very short strings (too many
+  // false positives), and require the base64 alphabet.
+  if (/^[A-Za-z0-9_+/-]+={0,2}$/.test(text) && text.length >= 8 && text.length % 4 !== 1) {
+    try {
+      const s = bytesToText(b64urlToBytes(text.replace(/=+$/, "")));
+      if (s !== text && isTextStr(s)) out.push({ kind: "base64", text: s });
+    } catch { /* not base64 after all */ }
+  }
+  if (/%[0-9a-fA-F]{2}/.test(text)) {
+    try {
+      const s = decodeURIComponent(text);
+      if (s !== text) out.push({ kind: "url", text: s });
+    } catch { /* malformed percent-encoding */ }
+  }
+  if (/^[0-9a-fA-F]+$/.test(text) && text.length % 2 === 0 && text.length >= 4) {
+    try {
+      const s = bytesToText(new Uint8Array(text.match(/../g).map((h) => parseInt(h, 16))));
+      if (isTextStr(s)) out.push({ kind: "hex", text: s });
+    } catch { /* not decodable text */ }
+  }
+  const jwt = decodeJwt(text);
+  if (jwt) {
+    out.push({ kind: "jwt",
+      text: JSON.stringify({ header: jwt.header, payload: jwt.payload }, null, 2) });
+  }
+  return out;
+}
+
 export function statusText(f) {
   if (f.killed) return "killed";
   if (f.intercepted) return "stopped";
