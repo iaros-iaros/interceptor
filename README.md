@@ -18,7 +18,8 @@ interceptor          # proxy on :8080, UI opens on :9000
 
 - **Captures everything** the proxy sees — HTTP/1.1, HTTP/2, WebSocket frames — with
   HTTP and WebSocket split into their own tabs, and a **Hosts** list to narrow the
-  capture to the app under test when a page's CDNs are drowning it.
+  capture to the app under test when a page's CDNs are drowning it — plus a
+  **don't-decrypt list** that tunnels a certificate-pinned host untouched.
 - **Pauses** any flow matching a scope filter, and holds it until you decide — with
   **Forward + stop reply** to catch a single response without stopping every flow twice.
 - **Full edit** of a held request or response: request line, status line, every header,
@@ -30,15 +31,26 @@ interceptor          # proxy on :8080, UI opens on :9000
   live connection.
 - **Repeater**: resend any captured HTTP request, edited if you like — once, or N times
   with a delay between them — with a tab per request you are iterating on and every send
-  listed so you can compare them.
+  listed so you can compare them. A **payload sweep** substitutes a list into one marked
+  spot and labels each send, Burp-Intruder style (sniper, one position).
 - **Rewrite rules**: automatic body and header rewrites that fire without pausing
-  anything — for the changes you want on every request.
+  anything — including **serving a local file** for a matching URL — for the changes you
+  want on every request.
 - **Fault rules**: make matching requests slow, fail, or die on purpose, then use the app
   and watch how it copes. Nothing stops; affected rows are tagged.
+- **Passive findings**: missing security headers, insecure cookies, wildcard or reflected
+  CORS, `alg:none` JWTs, secrets in URLs, version banners and more — flagged on the row as
+  you browse. Read-only; there is no active scan.
+- **Comparer**: a line-by-line diff of any two flows, or of a replay against its original.
+- **Decoder**: base64, URL-encoding, hex and JWTs — decoded inline under a header, or in a
+  panel as you type.
+- **Annotations**: mark and comment any flow; both are searchable and kept in a session.
+- **TLS details** on every HTTPS response: negotiated version, cipher, ALPN and the
+  server's certificate (expiry flagged).
 - **Search inside bodies**: find a token, a stack trace or a stray header anywhere in the
   capture, not just in what the table happens to show.
 - **Gets things out**: copy any request as a runnable `curl` command, or export the whole
-  capture as HAR for devtools and everyone else's tooling.
+  capture as HAR — and open a `.har` (yours or from devtools) straight back into the table.
 - **Sessions**: save the current capture to a file and reopen it later. Explicit only.
   The working store is a 0600 temp database, wiped on exit — see Storage.
 - **Isolated Chrome** launcher: one click gives a throwaway profile wired to the proxy,
