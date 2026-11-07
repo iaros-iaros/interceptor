@@ -75,6 +75,14 @@ class Bridge:
         self.on_message = on_message
         self.on_last_client_gone = on_last_client_gone
         self.clients: set[ServerConnection] = set()
+        # Everything the page renders came off the wire from sites under test, and
+        # any page the user visits can reach this origin. textContent-only
+        # rendering is the first line of defence; this is the second: no inline
+        # script, nothing from a foreign origin, and no page may frame the UI.
+        # The socket is named explicitly -- 'self' covers ws:// only in newer
+        # browsers, and a blocked socket is a silent "offline" badge.
+        self.csp = (f"default-src 'self'; connect-src 'self' {self.origin.replace('http://', 'ws://')}; "
+                    "frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
         self._out: list[tuple[ServerConnection | None, dict]] = []  # (to, msg); None = all
         self._server = None
         self._flusher: asyncio.Task | None = None
@@ -140,6 +148,7 @@ class Bridge:
                 # This origin is reachable from any page the user visits, so do not
                 # let the browser guess a type we did not declare.
                 "X-Content-Type-Options": "nosniff",
+                "Content-Security-Policy": self.csp,
             }),
             body,
         )

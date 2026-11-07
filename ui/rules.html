@@ -28,9 +28,8 @@
   </footer>
 
 </main>
-<script type="module">
-  import { RULES_DOC_HTML } from "./rules-doc.js";
-  document.querySelector("#doc-body").innerHTML = RULES_DOC_HTML;
-</script>
+<!-- A file, not inline: the bridge serves every page with a CSP that forbids
+     inline script. -->
+<script type="module" src="rules-page.js"></script>
 </body>
 </html>

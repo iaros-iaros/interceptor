@@ -726,6 +726,11 @@ commands that rewrite traffic. It is protected by two independent gates:
    **fragment** (`#token=…`), which is never sent in `Referer` headers and never written
    to server logs.
 
+Behind those, every page is served with a **Content-Security-Policy** that allows no
+inline script, nothing from a foreign origin, and no framing — so even a rendering bug
+that let captured text through as markup could not run anything or phone anywhere. The
+check suite proves the markup has nothing inline for it to block.
+
 Also:
 
 - **Binding off loopback is refused.** The proxy port has no authentication at all, so
@@ -858,7 +863,7 @@ ui/
   style.css        # every colour a CSS custom property, defined for both themes
   theme.js         # light/dark, shared by app and docs
   rules-doc.js     # rule reference — one source for the modal and the page
-  rules.html       # renders rules-doc.js standalone
+  rules.html       # renders rules-doc.js standalone, via rules-page.js
   icon.png         # app icon and favicon
 sessions/          # created on first save or HAR export; gitignored, dir 0700, files 0600
 spike/

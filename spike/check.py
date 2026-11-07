@@ -664,6 +664,16 @@ def http_code(path: str) -> int:
         return 0
 
 
+def http_headers(path: str) -> dict[str, str]:
+    req = urllib.request.Request(UI + path)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(req, timeout=10) as r:
+            return {k.lower(): v for k, v in r.headers.items()}
+    except (urllib.error.HTTPError, OSError):
+        return {}
+
+
 def curl_full(path: str, body: str | None = None, timeout: int = 25):
     """Returns (rc, response_body, status_code, elapsed)."""
     cmd = ["curl", "-s", "--max-time", str(timeout), "--noproxy", "", "-x", PROXY,
@@ -804,6 +814,7 @@ async def integration() -> None:
             "/rules-doc.js": http_code("/rules-doc.js"),
             "/icon.png": http_code("/icon.png"),
             "/rules.html": http_code("/rules.html"),
+            "/rules-page.js": http_code("/rules-page.js"),
             "/style.css": http_code("/style.css"),
             "/nope": http_code("/nope"),
             "/ws (no token)": http_code("/ws"),
@@ -811,9 +822,19 @@ async def integration() -> None:
         check("static serving + token gate",
               all(codes[k] == 200 for k in ("/", "/app.js", "/theme.js",
                                             "/rules-doc.js", "/icon.png",
-                                            "/rules.html", "/style.css"))
+                                            "/rules.html", "/rules-page.js",
+                                            "/style.css"))
               and codes["/nope"] == 404 and codes["/ws (no token)"] == 403,
               ", ".join(f"{k}={v}" for k, v in codes.items()))
+
+        # Everything the page renders came off the wire from sites under test, and
+        # any page the user visits can reach this origin. The CSP is the second
+        # line behind textContent-only rendering; the markup unit proves there is
+        # nothing inline for it to break.
+        csp = http_headers("/").get("content-security-policy", "")
+        check("the UI is served with a CSP pinned to its own origin",
+              "default-src 'self'" in csp and f"ws://127.0.0.1:{UI_PORT}" in csp
+              and "frame-ancestors 'none'" in csp, csp or "no header")
 
         # Gate 1: Origin. websockets rejects a mismatched Origin for us.
         rejected = False
@@ -1368,6 +1389,25 @@ def units_host_pattern() -> None:
         notes.append("an IP is not escaped")
     check("the row menu's host pattern is anchored and escaped", not notes,
           "; ".join(notes) or f"{p0}  {p1}")
+
+
+def units_csp_safe_markup() -> None:
+    """A CSP that forbids inline script and style only works if the markup has
+    none. Caught here rather than as a blank page: a browser refuses silently."""
+    import re
+
+    bad = []
+    for name in ("index.html", "rules.html"):
+        html = (ROOT / "ui" / name).read_text()
+        if re.search(r"<script(?![^>]*\bsrc=)", html):
+            bad.append(f"{name}: inline <script>")
+        if re.search(r"\sstyle=|\son\w+=", html):
+            bad.append(f"{name}: inline style or event handler")
+    doc = (ROOT / "ui" / "rules-doc.js").read_text()
+    if re.search(r"<script|\sstyle=|\son\w+=", doc):
+        bad.append("rules-doc.js: inline script, style or handler in the doc HTML")
+    check("the UI markup has nothing a strict CSP would block", not bad,
+          "; ".join(bad) or "no inline script, style or handlers in index.html, rules.html, rules-doc.js")
 
 
 def units_ws_classification() -> None:
@@ -2662,6 +2702,7 @@ async def main() -> int:
     units_rule_builder()
     units_row_filter()
     units_host_pattern()
+    units_csp_safe_markup()
     units_row_sync()
     units_pretty_body()
     units_ws_classification()
