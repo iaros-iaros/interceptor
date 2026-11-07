@@ -503,6 +503,13 @@ Anything the form cannot express — a status code, a content type, a header con
 appears as an **advanced** row holding the raw string, editable as text. Nothing you
 write by hand is ever rewritten into a form.
 
+**Serve a local file.** A third block maps a URL to a file on disk: *when URL matches
+`/app\.js` serve `/tmp/patched.js`*. A matching request is answered from that file instead
+of the server — mitmproxy's map-local, for swapping a script or a response while you work
+on it. The path is read on the machine running Interceptor, the same trust the rewrite
+rules already carry, and a path that does not exist is refused when you press Apply rather
+than served as a silent 404.
+
 **What rules cannot do.** They are mitmproxy's `modify_body` and `modify_headers`, so
 they reach the body text and the headers — nothing else. No changing the method, the URL
 or the response status, and no dropping a flow; that needs Intercept. The replacement is
@@ -737,6 +744,8 @@ Everything else is a `--set` flag after `interceptor`:
 | `intercept_responses` | `false` | Also stop replies. Same as the *Stop replies* toggle. |
 | `expose` | `false` | Permit binding off loopback. Without it, that is refused outright — see Security. |
 | `ssl_insecure` | `false` | Accept self-signed/expired certs on upstream targets. Commented out in `run.sh`. |
+| `map_local` | *(empty)* | Map-local rules, the **Serve a local file** block: `|url-regex|path` serves that file for a matching URL. Set from the UI or `config.yaml`. |
+| `anticache` | `false` | Strip `If-None-Match`/`If-Modified-Since` so a client cannot 304 out of being captured. Same as the **No cache** toggle. |
 
 ### Behind a proxy or VPN client
 

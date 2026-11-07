@@ -278,6 +278,13 @@ wants: set rules, drive the app, read the results.
  "headers": ["/~u /api/x-agent/1"]}
 ```
 
+`rules.set` also takes an optional **`local`**: a list of map-local specs
+`<sep><url-regex><sep><file-path>` (separator any character absent from both). A matching
+request is answered from that file instead of the server. The file must exist or the whole
+list is refused with an `error`. Omit `local` to leave the map-local rules unchanged; send
+`[]` to clear them. `opt.set` takes **`anticache`** (bool) to strip conditional-request
+headers. `state` reports `rules_local` and `anticache`.
+
 Spec syntax is `<sep><flow-filter><sep><pattern><sep><replacement>`, where `<sep>` is
 any character absent from the pattern (`/` above). Body patterns are **regexes**; header
 patterns are **literal header names**. Both lists are replaced wholesale — send both
@@ -360,7 +367,7 @@ client under test waits forever.
 | Command | Payload | Effect |
 |---|---|---|
 | `hosts.set` | `hosts`: list of regexes; optional `passthrough`: list of regexes | Capture only `hosts` (`[]` = everything). `passthrough` is the TLS pass-through list: a matching connection is tunnelled, never decrypted or captured. Both match `host:port`, so an end anchor needs the port: `^api\.example\.com:443$`. Omit `passthrough` to leave it unchanged; send `[]` to clear it. |
-| `opt.set` | `intercept_responses`: bool, `hide_noise`: bool | Either or both. |
+| `opt.set` | `intercept_responses`: bool, `hide_noise`: bool, `anticache`: bool | Any of them. `anticache` strips `If-None-Match`/`If-Modified-Since`. |
 | `session.save` | — | Dump the capture to `sessions/<timestamp>.mitm`. Replies `saved`. |
 | `session.load` | `name` | Replace the capture with a saved `.mitm` or `.har` file from `sessions/`. Replies `loaded`. |
 | `sessions.list` | — | Replies `sessions`. |

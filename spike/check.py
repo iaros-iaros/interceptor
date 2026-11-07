@@ -1324,6 +1324,18 @@ async def integration() -> None:
             await recv_until(conn, lambda m: m.get("type") == "state"
                              and not m.get("passthrough_hosts"))
 
+            # --- map-local: a URL is served from a file on disk
+            served = Path(certdir.name) / "served.txt"
+            served.write_text("served-by-map-local")
+            await say(conn, type="rules.set", body=[], headers=[],
+                      local=[f"|/served-local|{served}"])
+            await recv_until(conn, lambda m: m.get("type") == "state" and m.get("rules_local"))
+            served_body = (await asyncio.to_thread(curl_full, "/served-local"))[1]
+            check("a map-local rule serves a file for a matching URL",
+                  served_body == "served-by-map-local", f"got {served_body!r}")
+            await say(conn, type="rules.set", body=[], headers=[], local=[])
+            await recv_until(conn, lambda m: m.get("type") == "state" and not m.get("rules_local"))
+
             # --- UI vanishes with a flow still held
             await arm(conn, "~u /hold")
             fut = asyncio.create_task(asyncio.to_thread(curl, "/hold-orphan", 20))
@@ -2477,6 +2489,51 @@ def units_findings() -> None:
           "; ".join(notes) or f"{len(cases)} rules isolated, dedup by host and host:cookie")
 
 
+async def units_map_local() -> None:
+    """Map-local rules (serve a file for a URL) and the anticache toggle, both
+    plumbed through to mitmproxy's own options."""
+    import tempfile
+    import interceptor as I
+    from mitmproxy import ctx as mctx
+    from mitmproxy.addons import anticache, maplocal, modifybody, modifyheaders
+    from mitmproxy.test import taddons
+
+    addon = I.Interceptor()
+    notes = []
+    with tempfile.TemporaryDirectory() as tmp, taddons.context(
+            addon, modifybody.ModifyBody(), modifyheaders.ModifyHeaders(),
+            maplocal.MapLocal(), anticache.AntiCache()) as tctx:
+        tctx.configure(addon, hide_noise=False)
+        addon.bridge = _Collect()
+        addon._push_state = lambda: None
+        p = Path(tmp) / "served.txt"
+        p.write_text("served-by-map-local")
+        spec = f"|/served|{p}"
+
+        addon._set_rules([], [], local=[spec])
+        if list(mctx.options.map_local) != [spec]:
+            notes.append(f"map_local not set: {list(mctx.options.map_local)}")
+
+        # A missing file is refused, and the working rule is left in place.
+        before = list(mctx.options.map_local)
+        addon.bridge.sent.clear()
+        addon._set_rules([], [], local=[f"|/x|{Path(tmp) / 'nope.txt'}"])
+        if not any(m["type"] == "error" for m in addon.bridge.sent):
+            notes.append("a missing local file was not refused")
+        if list(mctx.options.map_local) != before:
+            notes.append("a bad local rule changed the option anyway")
+
+        # anticache flips its option.
+        await addon._on_message({"type": "opt.set", "anticache": True})
+        if not mctx.options.anticache:
+            notes.append("anticache did not turn on")
+        await addon._on_message({"type": "opt.set", "anticache": False})
+        if mctx.options.anticache:
+            notes.append("anticache did not turn off")
+    check("map-local rules validate and set, and anticache toggles", not notes,
+          "; ".join(notes) or "map_local set, missing file refused, anticache on/off")
+
+
 def units_search() -> None:
     """Body search has to see what the row never showed: headers and bodies."""
     import interceptor as I
@@ -3372,6 +3429,7 @@ async def main() -> int:
     await units_faults()
     await units_fault_loaded()
     units_findings()
+    await units_map_local()
     units_search()
     units_decoder()
     units_tls_detail()

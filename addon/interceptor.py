@@ -1148,6 +1148,8 @@ class Interceptor:
             sessions_dir=str(SESSIONS),
             rules_body=list(ctx.options.modify_body),
             rules_headers=list(ctx.options.modify_headers),
+            rules_local=list(getattr(ctx.options, "map_local", [])),
+            anticache=bool(getattr(ctx.options, "anticache", False)),
             faults=[f.to_spec() for f in self.faults],
             findings=len(self.findings_seen),
             allow_hosts=list(ctx.options.allow_hosts),
@@ -1249,6 +1251,11 @@ class Interceptor:
                 ctx.options.update(hide_noise=bool(msg["hide_noise"]))
                 if self.mode == "intercept":
                     self._set_mode("intercept")  # noise is baked into the filter
+            if "anticache" in msg:
+                # mitmproxy's own AntiCache: strips If-None-Match / If-Modified-Since
+                # so a client other than the launched Chrome cannot 304 its way out
+                # of being captured.
+                ctx.options.update(anticache=bool(msg["anticache"]))
             self._push_state()
         elif kind == "sessions.list":
             self._push_sessions()
@@ -1259,7 +1266,8 @@ class Interceptor:
         elif kind == "replay":
             self.repeat(msg.get("id"), msg.get("raw") or "", msg.get("label") or "")
         elif kind == "rules.set":
-            self._set_rules(list(msg.get("body") or []), list(msg.get("headers") or []))
+            self._set_rules(list(msg.get("body") or []), list(msg.get("headers") or []),
+                            msg.get("local"))
         elif kind == "hosts.set":
             self._set_hosts(list(msg.get("hosts") or []), msg.get("passthrough"))
         elif kind == "ws.inject":
@@ -1502,7 +1510,8 @@ class Interceptor:
 
     # ------------------------------------------------------------ rewrite rules
 
-    def _set_rules(self, body: list[str], headers: list[str]) -> None:
+    def _set_rules(self, body: list[str], headers: list[str],
+                   local: list[str] | None = None) -> None:
         """Rule-based auto-rewrite with no human in the loop. Both the spec syntax
         and the rewriting are mitmproxy's own `modify_body` / `modify_headers`,
         which are already in default_addons -- we only validate and set them.
@@ -1520,8 +1529,22 @@ class Interceptor:
                 except ValueError as e:
                     self.bridge.push("error", message=f"bad {label} rule {spec!r}: {e}")
                     return
+        # Local-file rules serve a file off disk for a matching URL -- the same
+        # trust the rewrite rules already carry (the proxy hands the client under
+        # test whatever this names). parse_map_local_spec requires the file to
+        # exist, so a typo is caught here rather than serving a 404 silently.
+        if local is not None:
+            from mitmproxy.addons.maplocal import parse_map_local_spec
+            for spec in local:
+                try:
+                    parse_map_local_spec(spec)
+                except ValueError as e:
+                    self.bridge.push("error", message=f"bad local-file rule {spec!r}: {e}")
+                    return
         try:
             ctx.options.update(modify_body=body, modify_headers=headers)
+            if local is not None:
+                ctx.options.update(map_local=local)
         except Exception as e:
             self.bridge.push("error", message=f"rules rejected: {e}")
             return

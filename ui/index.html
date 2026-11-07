@@ -45,6 +45,8 @@
                 title="Off: only the request stops, and the reply comes back untouched. On: the reply stops too, on its way to the browser, so you can edit what the app receives. A matching flow then stops twice — once each way.">Stop replies</button>
         <button id="noise" class="toggle"
                 title="Hide the browser's own background chatter from the table. Hidden flows are counted, never dropped.">Hide noise</button>
+        <button id="nocache" class="toggle"
+                title="Strip If-None-Match / If-Modified-Since from requests, so a client other than the launched Chrome cannot 304 its way out of being captured.">No cache</button>
       </div>
 
       <div class="group" role="group" aria-label="Tools">
@@ -174,6 +176,16 @@
         </div>
         <div id="header-rules" class="rule-list"></div>
         <button id="add-header-rule">+ Add a header rule</button>
+      </div>
+
+      <div class="rule-block">
+        <div class="rule-block-head">
+          <b>Serve a local file</b>
+          <span class="hint">Return a file from disk for any URL that matches — map-local.
+            The path is read on the machine running Interceptor.</span>
+        </div>
+        <div id="local-rules" class="rule-list"></div>
+        <button id="add-local-rule">+ Add a local-file rule</button>
       </div>
 
       <!-- Same axis as the rules above — change matching traffic automatically,

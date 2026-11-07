@@ -62,6 +62,8 @@ export const ui = {
   // silently dropped just because it is more complex than the form.
   bodyRules: [],
   headerRules: [],
+  // Map-local rules: {where, url, find (url regex), repl (file path), raw}.
+  localRules: [],
   // {url, delay_ms, status, body, drop}
   faultRules: [],
 };

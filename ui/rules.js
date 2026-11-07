@@ -78,6 +78,9 @@ export function ruleFromSpec(spec) {
 export function loadRulesFromState() {
   ui.bodyRules = (ui.state.rules_body || []).map(ruleFromSpec);
   ui.headerRules = (ui.state.rules_headers || []).map(ruleFromSpec);
+  // A map-local spec is `|url-regex|path`, which ruleFromSpec reads as find=regex,
+  // repl=path -- the same shape the form composes back.
+  ui.localRules = (ui.state.rules_local || []).map(ruleFromSpec);
   ui.faultRules = (ui.state.faults || []).map((f) => ({ ...f }));
   renderRules();
 }
@@ -85,8 +88,33 @@ export function loadRulesFromState() {
 export function renderRules() {
   renderRuleList($("#body-rules"), ui.bodyRules, "body");
   renderRuleList($("#header-rules"), ui.headerRules, "header");
+  renderLocalList();
   renderFaultList();
   renderRawPreview();
+}
+
+function renderLocalList() {
+  const box = $("#local-rules");
+  box.textContent = "";
+  if (!ui.localRules.length) {
+    box.append(el("p", "hint", "No local-file rules yet."));
+    return;
+  }
+  ui.localRules.forEach((r, i) => box.append(localRow(r, i)));
+}
+
+function localRow(r, i) {
+  const row = el("div", "rule-row");
+  row.append(
+    el("span", "rule-label", "when URL matches"),
+    ruleInput(r, "find", "/path/regex", "grow"),
+    el("span", "rule-label", "serve"),
+    ruleInput(r, "repl", "/absolute/path/to/file", "grow"),
+  );
+  const rm = btn("✕", () => { ui.localRules.splice(i, 1); renderLocalList(); renderRawPreview(); }, "icon");
+  rm.title = "Remove this rule";
+  row.append(rm);
+  return row;
 }
 
 function renderRuleList(box, rules, kind) {
@@ -216,14 +244,17 @@ export function addFaultRule(preset) {
 export function applyRules() {
   const specs = (rules) => rules.map(composeRule).filter(Boolean);
   const body = specs(ui.bodyRules), headers = specs(ui.headerRules);
-  const skipped = (ui.bodyRules.length + ui.headerRules.length) - (body.length + headers.length);
-  send({ type: "rules.set", body, headers });
+  const local = specs(ui.localRules);
+  const skipped = (ui.bodyRules.length + ui.headerRules.length + ui.localRules.length)
+    - (body.length + headers.length + local.length);
+  send({ type: "rules.set", body, headers, local });
   // Faults go as structured rules, not packed strings: that format exists only
   // because mitmproxy's own parser demands it, and this is our own code.
   send({ type: "faults.set", faults: ui.faultRules });
   // Say what went, and say what did not: an incomplete row silently doing nothing
   // is how the old textarea version lost people.
   const bits = [`applied ${body.length} body + ${headers.length} header rule(s)`];
+  if (local.length) bits.push(`${local.length} local-file rule(s)`);
   if (ui.faultRules.length) bits.push(`${ui.faultRules.length} fault rule(s)`);
   if (skipped) bits.push(`${skipped} incomplete row(s) skipped (nothing in "find")`);
   $("#rules-status").textContent = bits.join(" — ");
@@ -234,7 +265,8 @@ export function renderRawPreview() {
   const pre = $("#rules-raw");
   if (pre.hidden) return;
   const lines = [];
-  for (const [label, rules] of [["body", ui.bodyRules], ["headers", ui.headerRules]]) {
+  for (const [label, rules] of [["body", ui.bodyRules], ["headers", ui.headerRules],
+                                ["local", ui.localRules]]) {
     for (const r of rules) {
       const spec = composeRule(r);
       if (spec) lines.push(label.padEnd(9) + spec);

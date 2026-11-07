@@ -32,6 +32,7 @@ function render() {
   }
   $("#resp").classList.toggle("on", !!state.intercept_responses);
   $("#noise").classList.toggle("on", !!state.hide_noise);
+  $("#nocache").classList.toggle("on", !!state.anticache);
   // The filter only decides what Intercept stops, so in Capture it is a control
   // that cannot do anything. Dimming it and captioning it "applies in Intercept
   // mode" was still a box asking to be typed into. Hide it instead; a stored
@@ -126,7 +127,8 @@ function renderStats() {
   if (state.evicted) bits.push(`${state.evicted} evicted`);
   if (state.noise_hidden) bits.push(`${state.noise_hidden} noise hidden`);
   if (state.auto_forwarded) bits.push(`${state.auto_forwarded} auto-forwarded`);
-  const n = (state.rules_body || []).length + (state.rules_headers || []).length;
+  const n = (state.rules_body || []).length + (state.rules_headers || []).length
+    + (state.rules_local || []).length;
   if (n) bits.push(`${n} rule${n === 1 ? "" : "s"} active`);
   const faults = (state.faults || []).length;
   if (faults) bits.push(`${faults} fault${faults === 1 ? "" : "s"} active`);
@@ -277,6 +279,11 @@ $("#add-header-rule").onclick = () => {
   renderRules();
   $("#header-rules").querySelector(".rule-row:last-child .rule-input")?.focus();
 };
+$("#add-local-rule").onclick = () => {
+  ui.localRules.push({ where: "both", url: "", find: "", repl: "", raw: null });
+  renderRules();
+  $("#local-rules").querySelector(".rule-row:last-child .rule-input")?.focus();
+};
 $("#add-fault-rule").onclick = () => addFaultRule();
 $("#rules-raw-toggle").onclick = () => {
   const pre = $("#rules-raw");
@@ -361,6 +368,7 @@ $("#rules-apply").onclick = applyRules;
 $("#resp").onclick = () =>
   send({ type: "opt.set", intercept_responses: !ui.state.intercept_responses });
 $("#noise").onclick = () => send({ type: "opt.set", hide_noise: !ui.state.hide_noise });
+$("#nocache").onclick = () => send({ type: "opt.set", anticache: !ui.state.anticache });
 $("#save-session").onclick = () => send({ type: "session.save" });
 $("#open-session").onclick = () => {
   if (openPanel("#sessions")) send({ type: "sessions.list" });
