@@ -34,6 +34,12 @@
         <input id="scope" spellcheck="false" autocomplete="off"
                placeholder="leave empty to stop everything — or narrow it, e.g.  ~u /api/ &amp; ~m POST">
         <button id="scope-help" class="icon" title="What can I type here?" aria-label="Filter syntax help">?</button>
+        <div id="scope-chips" class="chips" aria-label="Scope shortcuts">
+          <button data-scope='!~u "\\.(png|jpe?g|gif|svg|ico|css|js|map|woff2?|ttf)(\\?|$)"'
+                  title="Stop everything except static assets">skip static assets</button>
+          <button data-scope="~u /api/" title="Stop only URLs containing /api/">API only</button>
+          <button data-scope="~m POST" title="Stop only POST requests">POSTs</button>
+        </div>
       </div>
       <!-- Stands in for the scope group's flex:1 while it is hidden, so the
            groups to the right do not jump on every mode change. -->

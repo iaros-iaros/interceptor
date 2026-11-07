@@ -202,6 +202,11 @@ Three things to know about it:
   filter that was already working stays in force. Note that filter syntax is *not* rules
   syntax: `~u /api/`, never `|~u /api/` — the leading separator belongs to rewrite rules.
 
+Three **chips** beside the field fill in a common filter with one click: *skip static
+assets* (stop everything except images, CSS, JS and fonts), *API only* (`~u /api/`), and
+*POSTs* (`~m POST`). They set the box and apply it, so the filter is still visible and
+editable afterwards.
+
 The `?` beside the field opens the filter reference.
 
 ```
@@ -463,6 +468,10 @@ On forward:
 - A flow you forward with an edit is tagged **`edited`** in the table (on the method) and
   noted in the detail pane, so a hand-tampered request is never later mistaken for one the
   server or the app produced. A plain forward is not tagged.
+
+**Keyboard, while a flow is held:** `⌘/Ctrl+Enter` forwards, `⌘/Ctrl+Shift+Enter` forwards
+and stops the reply, `⌘/Ctrl+Shift+D` drops. Plain Enter still types a newline in the
+editor, so the modifier is required.
 
 **Stop replies is off by default.** Left off, only the request stops and the reply
 comes back untouched. Turned on, the reply stops as well on its way to the browser, so a

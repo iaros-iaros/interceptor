@@ -244,6 +244,13 @@ $("#scope").addEventListener("keydown", (e) => {
 // change fires on blur when the value differs, so clicking away applies it too --
 // pressing Enter was the only way to submit, and nothing said so.
 $("#scope").addEventListener("change", applyScope);
+// Chips fill the scope box and apply it, so a common filter is one click.
+for (const chip of document.querySelectorAll("#scope-chips button")) {
+  chip.onclick = () => {
+    $("#scope").value = chip.dataset.scope;
+    applyScope();
+  };
+}
 $("#theme").onclick = () => {
   toggleTheme();
   $("#theme").title = `Switch to ${currentTheme() === "light" ? "dark" : "light"}`;

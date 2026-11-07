@@ -1845,6 +1845,48 @@ def ctx_opt(tctx, name):
     return getattr(tctx.options, name)
 
 
+def units_scope_chips() -> None:
+    """The scope chips must each compose-parse the way the addon wraps a scope, and
+    the skip-static-assets chip must match what its name claims."""
+    import re as _re
+    import interceptor as I
+    from mitmproxy import flowfilter
+    from mitmproxy.test import tflow
+
+    html = (ROOT / "ui" / "index.html").read_text()
+    raw = _re.findall(r"data-scope=(['\"])(.*?)\1", html)
+    scopes = [s.replace("&amp;", "&").replace("&quot;", '"').replace("&#39;", "'")
+              for _q, s in raw]
+    notes = []
+    if not scopes:
+        notes.append("no scope chips found")
+    for s in scopes:
+        try:
+            flowfilter.parse(f"~http & ({s} )")   # the shape _compose() builds
+        except ValueError as e:
+            notes.append(f"{s!r} does not compose-parse: {e}")
+
+    static = next((s for s in scopes if "png" in s), None)
+    if not static:
+        notes.append("no skip-static-assets chip")
+    else:
+        filt = flowfilter.parse(static)
+
+        def stops(path):
+            f = tflow.tflow()
+            f.request.scheme, f.request.host, f.request.path = "https", "ex.com", path
+            return bool(filt(f))
+
+        for path in ("/a.png?x=1", "/x.js", "/f.woff2"):
+            if stops(path):
+                notes.append(f"static chip still stops {path}")
+        for path in ("/api/users", "/data.json"):
+            if not stops(path):
+                notes.append(f"static chip skips the non-asset {path}")
+    check("the scope chips compose-parse and the static-asset one matches its name",
+          not notes, "; ".join(notes) or f"{len(scopes)} chips parse; static assets skipped, others stopped")
+
+
 def units_scope_atoms() -> None:
     """An argument-less filter has to work as a scope.
 
@@ -3423,6 +3465,7 @@ async def main() -> int:
     units_passthrough()
     await units_host_predicate()
     units_scope_atoms()
+    units_scope_chips()
     units_repeat_burst()
     units_payloads()
     await units_replay_label()

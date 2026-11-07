@@ -277,18 +277,19 @@ function renderEditor(box, h) {
   }
 
   const actions = el("div", "actions");
-  actions.append(
-    btn("Forward", () => forwardId(h.id), "ok"),
-    btn("Drop", () => forwardId(h.id, true), "danger"),
-  );
+  const fwd = btn("Forward", () => forwardId(h.id), "ok");
+  fwd.title = `Forward this flow (${MOD}+Enter)`;
+  const drop = btn("Drop", () => forwardId(h.id, true), "danger");
+  drop.title = `Drop this flow (${MOD}+Shift+D)`;
+  actions.append(fwd, drop);
   // The per-request version of the global "Stop replies" toggle. That toggle
   // stops *every* matching flow twice, which is why it defaults off and stays
   // off; this holds exactly one reply, the one in front of you, and disarms
   // itself as soon as it has been used.
   if (h.direction === "request") {
     const b = btn("Forward + stop reply", () => forwardId(h.id, false, true), "ok");
-    b.title = "Send this request on, then stop its reply on the way back so you can "
-            + "edit what the app receives. Applies to this request only.";
+    b.title = `Send this request on, then stop its reply on the way back so you can `
+            + `edit what the app receives (${MOD}+Shift+Enter). Applies to this request only.`;
     actions.append(b);
   }
   if (ta) {
@@ -308,6 +309,29 @@ function renderEditor(box, h) {
     ta.scrollTop = 0;
   }
 }
+
+// ⌘ on a Mac, Ctrl everywhere else. navigator.platform is deprecated but still the
+// simplest reliable signal, and this is only a label and a modifier check.
+const MOD = /Mac|iPhone|iPad/.test(navigator.platform || "") ? "⌘" : "Ctrl";
+
+// Forward / Drop / Forward+stop-reply from the keyboard, while a held flow is open.
+// The editor is a textarea, so these use the Cmd/Ctrl modifier -- plain Enter still
+// types a newline.
+document.addEventListener("keydown", (e) => {
+  if (!(e.metaKey || e.ctrlKey) || !ui.sel) return;
+  const h = held.get(ui.sel);
+  if (!h) return;
+  if (e.key === "Enter" && e.shiftKey) {
+    e.preventDefault();
+    forwardId(h.id, false, true);        // stop_reply is ignored server-side on a reply
+  } else if (e.key === "Enter") {
+    e.preventDefault();
+    forwardId(h.id);
+  } else if (e.shiftKey && (e.key === "D" || e.key === "d")) {
+    e.preventDefault();
+    forwardId(h.id, true);
+  }
+});
 
 export function forwardId(id, drop, stopReply) {
   const h = held.get(id);
