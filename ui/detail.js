@@ -1,7 +1,9 @@
 // The right-hand pane: headers and body, the held-flow editor, WebSocket frames,
 // and the repeater.
 
-import { $, btn, el, fmtBytes, note, pretty, statusClass, statusText } from "./util.js";
+import {
+  $, btn, decodeJwt, el, fmtBytes, note, pretty, statusClass, statusText,
+} from "./util.js";
 import {
   closeRepeatTab, details, drafts, frames, framesLoaded, getFlow,
   held, openRepeatTab, sendHistory, ui,
@@ -93,6 +95,7 @@ function renderMessage(box, f) {
     kv.append(tr);
   }
   box.append(el("p", "section", "headers"), kv);
+  renderJwts(box, d);
 
   // A diff takes the place of the body view for the flow and tab it was asked for.
   if (ui.diff && ui.diff.b === f.id && ui.diff.which === ui.which) {
@@ -618,6 +621,36 @@ function refreshRepeatHistory(box, f) {
       el("span", "send-label", s.label || ""),
     );
     list.append(rowEl);
+  }
+}
+
+// Any JWT in a header, decoded in place: a bearer token or a session cookie is
+// almost always where one hides, and "what's in this token, and has it expired"
+// is a question you should not have to leave the pane to answer.
+const JWT_RE = /eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/g;
+
+function renderJwts(box, d) {
+  const seen = new Set();
+  for (const [k, v] of d.headers) {
+    for (const tok of String(v).match(JWT_RE) || []) {
+      if (seen.has(tok)) continue;
+      seen.add(tok);
+      const j = decodeJwt(tok);
+      if (!j) continue;
+      box.append(el("p", "section", `JWT in ${k}`));
+      const meta = el("p", "jwt-meta");
+      meta.append(el("span", "", `alg ${j.alg || "?"}`));
+      if (j.exp != null) {
+        const when = new Date(j.exp * 1000).toLocaleString();
+        meta.append(el("span", "jwt-sep", "  ·  "),
+          el("span", j.expired ? "jwt-bad" : "",
+            `exp ${when}${j.expired ? " · expired" : ""}`));
+      }
+      box.append(meta);
+      const pre = document.createElement("pre");
+      pre.textContent = JSON.stringify(j.payload, null, 2);
+      box.append(pre);
+    }
   }
 }
 

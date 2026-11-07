@@ -2485,6 +2485,55 @@ def units_search() -> None:
           "; ".join(notes) or "body, header, URL, frame, miss and a literal % all correct")
 
 
+def units_decoder() -> None:
+    """The decoder's pure functions: JWT parsing and the multi-format sniff, run
+    under node against the shipped util.js."""
+    import base64 as _b64
+    import json as _json
+
+    # A JWT with alg:none and an exp in the past.
+    header = _b64.urlsafe_b64encode(b'{"alg":"none","typ":"JWT"}').decode().rstrip("=")
+    payload = _b64.urlsafe_b64encode(b'{"sub":"u1","exp":1000000000}').decode().rstrip("=")
+    jwt = f"{header}.{payload}."
+
+    harness = r"""
+      import { decodeJwt, decodings } from "./ui/util.js";
+      const jwt = process.env.JWT;
+      const j = decodeJwt(jwt);
+      const out = {
+        jwt: j && { alg: j.alg, expired: j.expired, sub: j.payload.sub },
+        twoPart: decodeJwt("a.b"),
+        b64: decodings("aGVsbG8gd29ybGQ="),
+        url: decodings("a%20b%2Fc"),
+        hex: decodings("68656c6c6f"),
+        plain: decodings("hello"),
+      };
+      console.log(JSON.stringify(out));
+    """
+    out = subprocess.run(["node", "--input-type=module", "-e", harness], cwd=ROOT,
+                         capture_output=True, text=True, timeout=60,
+                         env={**os.environ, "JWT": jwt})
+    if out.returncode != 0:
+        return check("the decoder reads JWTs and sniffs base64/url/hex", False,
+                     f"node failed: {out.stderr.strip()[:200]}")
+    r = _json.loads(out.stdout)
+    notes = []
+    if not r["jwt"] or r["jwt"]["alg"] != "none" or not r["jwt"]["expired"] or r["jwt"]["sub"] != "u1":
+        notes.append(f"jwt: {r['jwt']}")
+    if r["twoPart"] is not None:
+        notes.append("a two-part string decoded as a JWT")
+    if not any(d["kind"] == "base64" and d["text"] == "hello world" for d in r["b64"]):
+        notes.append(f"base64: {r['b64']}")
+    if not any(d["kind"] == "url" and d["text"] == "a b/c" for d in r["url"]):
+        notes.append(f"url: {r['url']}")
+    if not any(d["kind"] == "hex" and d["text"] == "hello" for d in r["hex"]):
+        notes.append(f"hex: {r['hex']}")
+    if any(d["kind"] == "base64" for d in r["plain"]):
+        notes.append(f"plain text decoded as base64: {r['plain']}")
+    check("the decoder reads JWTs and sniffs base64/url/hex", not notes,
+          "; ".join(notes) or "jwt alg+exp, base64, url, hex decoded; plain text left alone")
+
+
 def units_contentview() -> None:
     """detail() must carry a prettified rendering *beside* the exact bytes, never
     instead of them: `raw` is what the editor writes back onto the wire."""
@@ -3074,6 +3123,7 @@ async def main() -> int:
     await units_fault_loaded()
     units_findings()
     units_search()
+    units_decoder()
     units_contentview()
     units_export()
     units_stop_reply()

@@ -52,6 +52,7 @@
         <button id="rules-toggle" title="Rewrite matching traffic automatically, with nothing stopping">Rules</button>
         <button id="hosts-toggle"
                 title="Capture only the hosts you name — everything else is left alone and never appears here. Applies to HTTPS, plain HTTP and WebSockets alike. It is also the main speed control: an unnamed host costs no TLS handshakes, and most of a page's connections are CDNs, fonts and telemetry nobody is testing. Empty means capture every host, which is the default.">Hosts</button>
+        <button id="decoder-toggle" title="Decode base64, URL-encoding, hex and JWTs">Decoder</button>
         <button id="launch" class="go" title="Open a throwaway Chrome already wired to this proxy">Launch Chrome</button>
       </div>
 
@@ -122,6 +123,20 @@
         core. A host you do not name skips all of that. The speed half applies to
         <b>new connections only</b>; the capture half applies immediately.
       </p>
+    </div>
+  </section>
+
+  <section id="decoder" class="panel" hidden>
+    <div class="panel-head">
+      <b>Decoder</b>
+      <span class="dim">base64, URL-encoding, hex and JWTs — decoded as you type</span>
+      <span class="grow"></span>
+      <button id="decoder-close">Close</button>
+    </div>
+    <div class="panel-body">
+      <textarea id="decoder-input" rows="3" spellcheck="false" autocomplete="off"
+                placeholder="paste a token, a base64/hex/URL-encoded value, or a JWT"></textarea>
+      <div id="decoder-out"></div>
     </div>
   </section>
 

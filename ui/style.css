@@ -584,6 +584,10 @@ td.c-n { color: var(--fg-dim); }
 .finding-code { color: var(--warn); min-width: 170px; }
 .finding-why { color: var(--fg-dim); }
 
+.jwt-meta { color: var(--fg-dim); margin: 2px 0 8px; }
+.jwt-bad { color: var(--bad); }
+#decoder-out pre { margin: 2px 0 10px; }
+
 pre.diff { white-space: pre-wrap; word-break: break-word; }
 .diff-line.add { color: var(--ok); background: var(--ok-bg); display: block; }
 .diff-line.del { color: var(--bad); background: var(--bad-bg); display: block; }

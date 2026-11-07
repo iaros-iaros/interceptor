@@ -323,6 +323,15 @@ you an editor, and it says so — *edits apply to the copy, not the original*. U
 probe the server (change a field, resend, compare `replay · status 200 → 403`); use
 Intercept or a rule to change what the app itself receives.
 
+### Decoder
+
+Two shapes. Any **JWT in a header** — a bearer token, a session cookie — is decoded in
+place under the headers: its algorithm, its expiry (flagged red once past), and its claims,
+without leaving the pane. And a **Decoder panel** (Tools → Decoder) takes anything you
+paste and shows every way it plausibly decodes — base64 or base64url, URL percent-encoding,
+hex, or a JWT — updating as you type. It decodes only; it never verifies a signature, and
+plain text yields nothing rather than a wall of false guesses.
+
 ### Reading a body
 
 Bodies are rendered through mitmproxy's own content views, so what you get is structured

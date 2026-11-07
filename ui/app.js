@@ -11,7 +11,7 @@
 import { onRender } from "./bus.js";
 import { currentTheme, toggleTheme } from "./theme.js";
 import { RULES_DOC_HTML } from "./rules-doc.js";
-import { $, btn, el, fmtBytes, when } from "./util.js";
+import { $, btn, decodings, el, fmtBytes, when } from "./util.js";
 import { getFlow, ui } from "./state.js";
 import { connect, select, send } from "./transport.js";
 import { passEverything, renderTable, runSearch, setRowFilter, setSearchBodies } from "./table.js";
@@ -292,6 +292,7 @@ function openPanel(id) {
   let opened = false;
   for (const [panel, toggle] of [["#hosts-panel", "#hosts-toggle"],
                                  ["#rules", "#rules-toggle"],
+                                 ["#decoder", "#decoder-toggle"],
                                  ["#sessions", "#open-session"]]) {
     const want = panel === id && $(panel).hidden;
     $(panel).hidden = !want;
@@ -320,6 +321,29 @@ $("#hosts-clear").onclick = () => {
   $("#hosts-list").value = "";
   send({ type: "hosts.set", hosts: [] });
 };
+
+$("#decoder-toggle").onclick = () => {
+  if (openPanel("#decoder")) $("#decoder-input").focus();
+};
+$("#decoder-close").onclick = () => openPanel(null);
+$("#decoder-input").addEventListener("input", renderDecoder);
+
+function renderDecoder() {
+  const out = $("#decoder-out");
+  out.textContent = "";
+  const results = decodings($("#decoder-input").value);
+  if (!results.length) {
+    out.append(el("p", "hint",
+      "Nothing to decode yet — paste a base64, URL-encoded or hex value, or a JWT."));
+    return;
+  }
+  for (const d of results) {
+    out.append(el("p", "section", d.kind));
+    const pre = document.createElement("pre");
+    pre.textContent = d.text;
+    out.append(pre);
+  }
+}
 
 $("#rules-toggle").onclick = () => {
   if (openPanel("#rules")) loadRulesFromState();
