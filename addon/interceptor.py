@@ -1104,7 +1104,15 @@ class Interceptor:
             # this behind showed "12 auto-forwarded" above an empty capture.
             self.auto_forwarded = 0
             self.stop_reply.clear()
+            # A held flow is still waiting on a decision, so it cannot go with the
+            # table: wiping it left a queue entry pointing at a row the table could
+            # not show. Put the held ones back, and re-send their holds after
+            # `cleared` -- the UI forgets everything on that message.
+            for _direction, flow in self.paused.values():
+                self._remember(flow)
             self.bridge.push("cleared")
+            for direction, flow in self.paused.values():
+                self.bridge.push("flow.paused", **self._paused_payload(direction, flow))
             self._push_state()
         elif kind == "opt.set":
             if "intercept_responses" in msg:

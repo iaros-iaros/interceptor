@@ -166,7 +166,7 @@ not close the connection.
 | Command | Payload | Effect |
 |---|---|---|
 | `hello` | — | Server replies `snapshot` (to you) + `state`. Send it first, and again any time you want a fresh snapshot. |
-| `clear` | — | Wipe the store. Replies `cleared` + `state`. Also resets the noise and auto-forward counters. |
+| `clear` | — | Wipe the store. Replies `cleared` + `state`. Also resets the noise and auto-forward counters. Flows still held are kept, and their `flow.paused` is re-sent after `cleared`. |
 
 ### Mode and scope
 

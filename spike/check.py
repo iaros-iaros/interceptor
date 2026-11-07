@@ -2212,6 +2212,35 @@ class _Collect:
         self.sent.append({"type": type_, **payload})
 
 
+async def units_clear_keeps_held() -> None:
+    """Clear empties the table. A flow still held is still waiting on a decision,
+    so it cannot go with the table: wiping it from the store left a queue entry
+    pointing at a row the table could not show."""
+    import interceptor as I
+    from mitmproxy.addons import modifybody, modifyheaders
+    from mitmproxy.test import taddons, tflow
+
+    addon = I.Interceptor()
+    with taddons.context(addon, modifybody.ModifyBody(), modifyheaders.ModifyHeaders()) as tctx:
+        tctx.configure(addon, hide_noise=False)
+        addon.bridge = _Collect()
+        held = tflow.tflow()            # no response: in flight
+        held.intercept()
+        addon.paused[held.id] = ("request", held)
+        addon._remember(held)
+        done = tflow.tflow(resp=True)
+        addon._remember(done)
+        await addon._on_message({"type": "clear"})
+        kinds = [m["type"] for m in addon.bridge.sent]
+        ok = (held.id in addon.store and done.id not in addon.store
+              and held.id in addon.paused
+              and "flow.paused" in kinds and kinds.index("cleared") < kinds.index("flow.paused"))
+        addon.store.close()
+    check("Clear keeps the flows still held and re-sends their holds", ok,
+          f"held kept: {held.id in addon.store}, finished gone: {done.id not in addon.store}, "
+          f"pushes: {kinds}")
+
+
 async def units_fault_loaded() -> None:
     """Opening a session replays every flow through the request hook, but those
     flows are history: a fault armed now must not rewrite what was captured then.
@@ -2594,6 +2623,7 @@ async def main() -> int:
     units_contentview()
     units_export()
     units_stop_reply()
+    await units_clear_keeps_held()
     await units_reply_routing()
     await units_har_stream()
     await integration()

@@ -135,9 +135,14 @@ function handle(m) {
     case "har":
       note(`HAR written to ${m.dir}/${m.name}`, true);
       break;
-    case "cleared":
+    case "cleared": {
+      // The server re-sends every hold right after this, so a half-typed edit on
+      // a held flow must survive the Clear; everything else goes.
+      const keep = [...drafts].filter(([k]) => held.has(k.split(":")[0]));
       forgetAll();
+      for (const [k, v] of keep) drafts.set(k, v);
       break;
+    }
     case "sessions":
       ui.sessions = m.items || [];
       $("#sessions-dir").textContent = m.dir || "";
