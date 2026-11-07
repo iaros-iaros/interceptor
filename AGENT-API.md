@@ -447,9 +447,10 @@ hundred flows, and every one waits on your loop.
 
 ## Known limitations
 
-**`search` does not index WebSocket frames.** The search index is built from URL,
-headers and HTTP bodies. A frame payload is not in it. Find the flow another way — the
-summary's `ws` and `ws_frames` fields — and call `frames.get`.
+**`search` indexes a socket's text frames only once it has closed.** A flow is written
+to the index when it finalises, and an open socket has not. Until then find the flow by
+its summary's `ws` and `ws_frames` fields and call `frames.get`. Binary frames are never
+indexed.
 
 **Streamed bodies are invisible.** Anything over 5 MB streams, which means it is never
 buffered: no `raw`, no rewrite rules, nothing in the search index. `summary.streamed`

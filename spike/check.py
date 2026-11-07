@@ -2107,9 +2107,15 @@ def units_search() -> None:
             f.response.headers[name] = value
             store.put(f, len(body), I.summary(f), 10 * 1024 * 1024)
             made.append(f)
+        # A closed socket, frames "hello text" and "it's me": the question
+        # "which socket carried this token" was unanswerable before.
+        wf = tflow.twebsocketflow()
+        store.put(wf, 10, I.summary(wf), 10 * 1024 * 1024)
 
         found = lambda q: sorted(s["path"] for s in store.search(q))  # noqa: E731
         notes = []
+        if found("it's me") != ["/ws"]:
+            notes.append(f"frame match: {found(chr(105) + 't' + chr(39) + 's me')}")
         if found("sekrit-abc123") != ["/api/users"]:
             notes.append(f"body match: {found('sekrit-abc123')}")
         if found("sid=zzz") != ["/api/orders"]:
@@ -2123,7 +2129,7 @@ def units_search() -> None:
             notes.append("a bare % matched everything -- wildcards are not escaped")
         store.close()
     check("body search finds text in bodies, headers and URLs", not notes,
-          "; ".join(notes) or "body, header, URL, miss and a literal % all correct")
+          "; ".join(notes) or "body, header, URL, frame, miss and a literal % all correct")
 
 
 def units_contentview() -> None:

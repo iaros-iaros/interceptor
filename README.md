@@ -258,6 +258,8 @@ same kind of hunt.
   far older than the 500 rows the table renders. Toggle it off to go back to hiding rows.
 - **Streamed bodies are never buffered**, so they are not searchable — the same limit that
   makes them uneditable.
+- **WebSocket text frames are searchable once the socket has closed.** A flow goes into
+  the index when it finalises, and an open socket has not yet; binary frames never do.
 - Text is matched literally, `%` and `_` included. This box is a substring search, not a
   regex; the row filter is the one that takes a regex.
 
