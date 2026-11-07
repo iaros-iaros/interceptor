@@ -799,7 +799,12 @@ async def ui_smoke(url: str) -> None:
     exe = exe if Path(exe).exists() else shutil.which(exe)
     errors: list[str] = []
 
-    with tempfile.TemporaryDirectory(prefix="interceptor-smoke-") as prof:
+    # ignore_cleanup_errors: headless Chrome keeps child processes (gpu, zygote)
+    # flushing the profile dir for a moment after the main process is killed, so on
+    # Linux rmtree can race them and raise "Directory not empty" -- after every
+    # check has already run. The dir is a throwaway under /tmp either way.
+    with tempfile.TemporaryDirectory(prefix="interceptor-smoke-",
+                                     ignore_cleanup_errors=True) as prof:
         proc = subprocess.Popen(
             [exe, "--headless=new", "--disable-gpu", "--no-sandbox", "--no-first-run",
              # The page is fetched directly, never through a proxy -- not the one
