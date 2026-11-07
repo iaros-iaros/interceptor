@@ -250,6 +250,36 @@ def parse_raw(text: str) -> tuple[str, list[tuple[str, str]], str]:
     return lines[0].strip(), headers, body
 
 
+def tls_info(flow: http.HTTPFlow) -> dict | None:
+    """The connection's TLS facts and leaf certificate, from the *server* side --
+    the side a tester is assessing. None for a plain-http flow. Never raises: a
+    certificate that will not parse drops the cert block, not the whole response."""
+    sc = getattr(flow, "server_conn", None)
+    if sc is None or not getattr(sc, "tls_version", None):
+        return None
+    out = {
+        "version": sc.tls_version,
+        "cipher": sc.cipher,
+        "alpn": sc.alpn.decode(errors="replace") if sc.alpn else None,
+        "sni": sc.sni,
+    }
+    certs = getattr(sc, "certificate_list", None)
+    if certs:
+        c = certs[0]
+        try:
+            out["cert"] = {
+                "cn": c.cn,
+                "altnames": [str(getattr(n, "value", n)) for n in c.altnames][:8],
+                "issuer": ", ".join(f"{k}={v}" for k, v in c.issuer),
+                "not_before": c.notbefore.isoformat(),
+                "not_after": c.notafter.isoformat(),
+                "sha256": c.fingerprint().hex(),
+            }
+        except Exception as e:  # a malformed cert is a missing block, not a failure
+            logging.debug(f"interceptor: certificate parse failed: {e}")
+    return out
+
+
 def detail(flow: http.HTTPFlow, which: str) -> dict | None:
     msg = flow.request if which == "request" else flow.response
     if msg is None:
@@ -289,6 +319,10 @@ def detail(flow: http.HTTPFlow, which: str) -> dict | None:
         out |= {"method": msg.method, "url": msg.url, "http_version": msg.http_version}
     else:
         out |= {"status": msg.status_code, "reason": msg.reason}
+        # TLS is a fact of the connection, shown on the response side only.
+        tls = tls_info(flow)
+        if tls:
+            out["tls"] = tls
     return out
 
 

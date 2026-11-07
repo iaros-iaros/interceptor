@@ -348,6 +348,11 @@ body · 412B · shown as protobuf
 
 — and stays silent for plain text, where there is nothing to add.
 
+The **Response** tab also shows a **TLS** section: the negotiated version, cipher, ALPN
+and SNI, and the server's leaf certificate — common name, subject alternative names,
+issuer, validity window (an expired `not after` is flagged red) and SHA-256 fingerprint.
+It is read from the connection to the real server, which is the side you are assessing.
+
 **This is display only, and that distinction matters.** The editor, the Repeater and the
 raw view all still hold the exact bytes off the wire. A protobuf rendering cannot be
 turned back into bytes, so it is never what gets forwarded, and every guarantee in

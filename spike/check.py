@@ -2534,6 +2534,51 @@ def units_decoder() -> None:
           "; ".join(notes) or "jwt alg+exp, base64, url, hex decoded; plain text left alone")
 
 
+def units_tls_detail() -> None:
+    """The Response tab carries the connection's TLS facts and the leaf certificate,
+    read from the server side -- the side a tester is assessing."""
+    import tempfile
+    import interceptor as I
+    from mitmproxy import certs
+    from mitmproxy.test import taddons, tflow
+    from spike import selfsigned
+
+    addon = I.Interceptor()
+    notes = []
+    with taddons.context(addon):
+        f = tflow.tflow(resp=True)   # tserver_conn sets tls_version TLSv1.2, sni "address"
+        d = I.detail(f, "response")
+        tls = d.get("tls")
+        if not tls or tls.get("version") != "TLSv1.2" or tls.get("sni") != "address":
+            notes.append(f"version/sni missing: {tls}")
+        if tls and "cert" in tls:
+            notes.append("a cert appeared with an empty certificate_list")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            selfsigned(Path(tmp))
+            cert = certs.Cert.from_pem((Path(tmp) / "cert.pem").read_bytes())
+            f.server_conn.certificate_list = [cert]
+            c = I.detail(f, "response")["tls"].get("cert")
+            if not c:
+                notes.append("certificate_list set but no cert in detail")
+            else:
+                if c.get("cn") != "127.0.0.1":
+                    notes.append(f"cn: {c.get('cn')}")
+                if "127.0.0.1" not in c.get("altnames", []):
+                    notes.append(f"altnames: {c.get('altnames')}")
+                if not c.get("not_after") or "T" not in c.get("not_after", ""):
+                    notes.append(f"not_after not ISO: {c.get('not_after')}")
+                if len(c.get("sha256", "")) != 64:
+                    notes.append(f"sha256 not 64 hex: {c.get('sha256')!r}")
+
+        # No TLS on the connection → no tls block at all (a plain-http flow).
+        f.server_conn.tls_version = None
+        if "tls" in I.detail(f, "response"):
+            notes.append("a non-TLS connection still reported tls")
+    check("the response tab carries TLS version, cipher and the certificate", not notes,
+          "; ".join(notes) or "version, sni, cert cn/altnames/expiry/sha256, and no-TLS all correct")
+
+
 def units_contentview() -> None:
     """detail() must carry a prettified rendering *beside* the exact bytes, never
     instead of them: `raw` is what the editor writes back onto the wire."""
@@ -3225,6 +3270,7 @@ async def main() -> int:
     units_findings()
     units_search()
     units_decoder()
+    units_tls_detail()
     units_contentview()
     units_export()
     units_stop_reply()

@@ -100,6 +100,7 @@ function renderMessage(box, f) {
   }
   box.append(el("p", "section", "headers"), kv);
   renderJwts(box, d);
+  if (d.tls) renderTls(box, d.tls);
 
   // A diff takes the place of the body view for the flow and tab it was asked for.
   if (ui.diff && ui.diff.b === f.id && ui.diff.which === ui.which) {
@@ -656,6 +657,34 @@ function renderJwts(box, d) {
       box.append(pre);
     }
   }
+}
+
+// The connection's TLS facts and the leaf certificate, on the response tab. An
+// expired certificate is called out in red -- it is the one field here you act on.
+function renderTls(box, t) {
+  box.append(el("p", "section", "TLS"));
+  const kv = document.createElement("table");
+  kv.className = "kv";
+  const row = (k, v, cls) => {
+    if (v == null || v === "") return;
+    const tr = document.createElement("tr");
+    tr.append(el("td", "", k), el("td", cls || "", String(v)));
+    kv.append(tr);
+  };
+  row("version", t.version);
+  row("cipher", t.cipher);
+  row("alpn", t.alpn);
+  row("sni", t.sni);
+  if (t.cert) {
+    row("cert CN", t.cert.cn);
+    if (t.cert.altnames?.length) row("alt names", t.cert.altnames.join(", "));
+    row("issuer", t.cert.issuer);
+    row("not before", t.cert.not_before);
+    const expired = t.cert.not_after && Date.parse(t.cert.not_after) < Date.now();
+    row("not after", t.cert.not_after + (expired ? " · expired" : ""), expired ? "jwt-bad" : "");
+    row("sha-256", t.cert.sha256);
+  }
+  box.append(kv);
 }
 
 // Passive smells, flow-level, so shown on either tab. The explanation text comes

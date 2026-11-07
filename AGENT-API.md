@@ -439,6 +439,12 @@ body is something mitmproxy can render structurally — protobuf, gRPC, msgpack,
 GraphQL and a dozen more. **`pretty` is display only and is not round-trippable — never
 send it back as `raw`.**
 
+A **response** detail also carries `tls` when the connection was encrypted: `version`,
+`cipher`, `alpn`, `sni`, and — when the server presented one — a `cert` object with `cn`,
+`altnames`, `issuer`, `not_before`, `not_after` (ISO 8601) and the `sha256` fingerprint.
+It is read from the server side, which is the side under assessment; a plain-http flow has
+no `tls`.
+
 `encoding` is one of `text`, `base64` (bytes that contradict a declared encoding),
 `streamed`, or `too-large`. Only `text` is editable.
 
