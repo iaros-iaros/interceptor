@@ -366,6 +366,8 @@ client under test waits forever.
 | `sessions.list` | — | Replies `sessions`. |
 | `har.save` | — | Write the whole capture as HAR into `sessions/`. Replies `har`. |
 | `browser.launch` | — | Launch throwaway-profile Chrome wired to the proxy. Rarely what a headless agent wants. |
+| `flow.mark` | `id`, `marked`: bool | Flag or unflag a flow. Matchable as `~marked`, kept in a saved session. |
+| `flow.comment` | `id`, `text` | Attach a note (≤2000 chars). Matchable as `~comment <regex>`, kept in a saved session. |
 
 `hosts.set` is not a security control — an unlisted host still reaches the client, it is
 simply not captured. It is a performance and noise control, and a big one: TLS is not
@@ -414,7 +416,11 @@ because nothing was connected, or an edit was too large and closed the socket.
 **Summary** fields, on every row: `id`, `method`, `scheme`, `host`, `port`, `path`,
 `http_version`, `status`, `ctype`, `req_bytes`, `resp_bytes`, `start`, `ms`, `ws`,
 `ws_frames`, `ws_open`, `streamed`, `intercepted`, `killed`, `replay_of`, `is_replay`,
-`faulted`, `label`, `findings`.
+`faulted`, `label`, `findings`, `marked`, `comment`.
+
+`marked` (bool) and `comment` (string) are mitmproxy's own flow fields, set by
+`flow.mark` / `flow.comment`. Because they are the engine's own, `~marked` and
+`~comment <regex>` are valid scopes, and a saved `.mitm` session preserves them.
 
 `findings` is a list of passive-finding codes seen on that flow for the first time (see
 the `snapshot` reply's `findings_doc` for the code → explanation map). `state` carries a

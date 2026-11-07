@@ -173,6 +173,10 @@ def summary(flow: http.HTTPFlow) -> dict:
         "label": flow.metadata.get("label"),
         # Passive security smells seen on this flow -- see findings.py.
         "findings": flow.metadata.get("findings"),
+        # Annotations. mitmproxy's own fields, so `~marked`/`~comment` scope them
+        # and a saved session keeps them.
+        "marked": bool(flow.marked),
+        "comment": flow.comment,
     }
 
 
@@ -1126,6 +1130,10 @@ class Interceptor:
             self._export(msg.get("id"), msg.get("format", "curl"))
         elif kind == "diff":
             self._diff(msg.get("a"), msg.get("b"), msg.get("which", "response"))
+        elif kind == "flow.mark":
+            self._annotate(msg.get("id"), marked=bool(msg.get("marked")))
+        elif kind == "flow.comment":
+            self._annotate(msg.get("id"), comment=str(msg.get("text") or ""))
         elif kind == "har.save":
             await self._save_har()
         elif kind == "faults.set":
@@ -1277,6 +1285,25 @@ class Interceptor:
             self.bridge.push("error", message=f"export failed: {e}")
             return
         self.bridge.push("export", id=fid, format=fmt, text=text)
+
+    def _annotate(self, fid: str | None, marked: bool | None = None,
+                  comment: str | None = None) -> None:
+        """Mark or comment a flow. Writes mitmproxy's own `marked`/`comment`
+        fields, so the flow filter (`~marked`, `~comment`) and a saved `.mitm`
+        session both carry them for free, then re-stores so the change reaches
+        disk and the table."""
+        flow = self.store.get(fid)
+        if not isinstance(flow, http.HTTPFlow):
+            self._report("that flow is no longer in the store")
+            return
+        if marked is not None:
+            # A non-empty string is "marked" to mitmproxy; the UI only cares that
+            # it is truthy, so a single flag character is enough.
+            flow.marked = ":flag:" if marked else ""
+        if comment is not None:
+            flow.comment = comment[:2000]
+        self._remember(flow)
+        self._push_flow(flow)
 
     @staticmethod
     def _diff_text(flow: http.HTTPFlow, which: str) -> list[str] | None:

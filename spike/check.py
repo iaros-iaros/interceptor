@@ -2611,6 +2611,49 @@ def units_export() -> None:
           "; ".join(notes) or f"{len(cmd)}B command with method, url, header and body")
 
 
+async def units_annotations() -> None:
+    """Mark and comment use mitmproxy's own flow fields, so `~marked`/`~comment`
+    work as scopes and a saved session keeps them; and they survive the round trip
+    to disk."""
+    import interceptor as I
+    from mitmproxy import flowfilter
+    from mitmproxy.test import taddons, tflow
+
+    addon = I.Interceptor()
+    notes = []
+    with taddons.context(addon):
+        addon.bridge = _Collect()
+        addon._push_state = lambda: None
+        f = tflow.tflow(resp=True)
+        addon.store.put(f, 1, I.summary(f), 10 * 1024 * 1024)
+
+        await addon._on_message({"type": "flow.mark", "id": f.id, "marked": True})
+        if not I.summary(f)["marked"] or not flowfilter.parse("~marked")(f):
+            notes.append("mark did not take / ~marked did not match")
+
+        await addon._on_message({"type": "flow.comment", "id": f.id, "text": "suspicious value"})
+        if I.summary(f)["comment"] != "suspicious value" or not flowfilter.parse("~comment susp")(f):
+            notes.append(f"comment did not take: {I.summary(f)['comment']!r}")
+
+        # Drop the RAM copies so the next read rehydrates from disk, proving the
+        # annotation was serialised, not just held in memory.
+        addon.store.flush()
+        addon.store._cache.clear()
+        addon.store._live.clear()
+        back = addon.store.get(f.id)
+        if back is None or not back.marked or back.comment != "suspicious value":
+            notes.append(f"annotation lost on the disk round trip: {back and (back.marked, back.comment)}")
+
+        await addon._on_message({"type": "flow.mark", "id": f.id, "marked": False})
+        # Read through the store, not the local object: the cache was dropped above,
+        # so _annotate acted on the rehydrated copy.
+        if I.summary(addon.store.get(f.id))["marked"]:
+            notes.append("unmark did not clear it")
+        addon.store.close()
+    check("mark and comment stick, scope and survive a disk round trip", not notes,
+          "; ".join(notes) or "~marked, ~comment, disk round trip and unmark all correct")
+
+
 async def units_diff() -> None:
     """Comparer: a unified diff between two flows' responses, pushed as a reply."""
     import interceptor as I
@@ -3128,6 +3171,7 @@ async def main() -> int:
     units_export()
     units_stop_reply()
     await units_diff()
+    await units_annotations()
     await units_clear_keeps_held()
     await units_reply_routing()
     await units_har_stream()

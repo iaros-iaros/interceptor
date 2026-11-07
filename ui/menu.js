@@ -62,6 +62,15 @@ export function openMenu(x, y, f) {
   }
   item("Copy URL", () => copy(urlOf(f), "URL"));
   sep();
+  item(f.marked ? "Unmark" : "Mark", () => send({ type: "flow.mark", id: f.id, marked: !f.marked }),
+       "Flag this flow — matchable in the stop filter as ~marked");
+  item(f.comment ? "Edit comment…" : "Comment…", () => {
+    // prompt is the laziest editor that works for a one-line note, and a comment
+    // is exactly that; it is searchable and kept in a saved session.
+    const text = window.prompt("Comment on this flow:", f.comment || "");
+    if (text !== null) send({ type: "flow.comment", id: f.id, text });
+  }, "Attach a note — searchable, and matchable as ~comment");
+  sep();
   // Comparer: mark one flow, then diff a second against it. A dedicated mark
   // rather than "the selected flow" because right-clicking a row selects it, so
   // "selected" would always be this row by the time the menu opens.

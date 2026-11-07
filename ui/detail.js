@@ -79,6 +79,7 @@ function renderMessage(box, f) {
     ? `${d.method} ${d.url}  ${d.http_version}`
     : `${d.status} ${d.reason}`;
   box.append(el("p", "headline", line));
+  if (f.comment) box.append(el("p", "comment-note", f.comment));
   if (f.faulted) {
     box.append(el("p", "note",
       `Interceptor produced this on purpose — ${f.faulted}. It did not come from the `

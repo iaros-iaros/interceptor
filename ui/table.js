@@ -185,6 +185,7 @@ function rowFor(f) {
   tr.classList.toggle("sel", f.id === ui.sel);
   tr.classList.toggle("held", !!f.intercepted);
   tr.classList.toggle("faulted", !!f.faulted);
+  tr.classList.toggle("marked", !!f.marked);
   const sig = rowSig(f);
   if (tr.dataset.sig !== sig) {
     tr.dataset.sig = sig;
@@ -220,6 +221,12 @@ function fillRow(tr, f) {
   }
   if (f.http_version && f.http_version.includes("2")) {
     tr.children[4].append(el("span", "tag tag-h2", "h2"));
+  }
+  if (f.comment) {
+    const short = f.comment.length > 24 ? f.comment.slice(0, 24) + "…" : f.comment;
+    const tag = el("span", "tag tag-comment", short);
+    tag.title = f.comment;
+    tr.children[3].append(tag);
   }
   // Passive smells, on the status cell: a count with the detail in the tooltip,
   // so the table stays readable and the row still says there is something to read.

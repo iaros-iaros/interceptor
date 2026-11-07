@@ -294,6 +294,9 @@ the toolbar has not grown a button for any of it:
 | **Copy as raw request** | The request as raw text |
 | **Copy URL** | Just the URL |
 | **Filter rows to this host** | Sets the row filter to this host — view only, nothing stops |
+| **Mark / Unmark** | Flags the flow — matchable as `~marked`, kept in a saved session |
+| **Comment… / Edit comment…** | Attaches a searchable note — matchable as `~comment` |
+| **Mark for compare / Compare with marked flow** | Diffs two flows (see Comparer) |
 | **Capture only this host** | Replaces the Hosts list with this one host, anchored with its port |
 | **Export everything as HAR…** | Writes the whole capture to `sessions/<timestamp>.har` |
 
