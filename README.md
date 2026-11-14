@@ -1105,3 +1105,7 @@ through a proxy. Known; kill it.
 
 **HTTP/3 is not intercepted.** QUIC is disabled in the launched browser rather than
 decrypted; a client that insists on HTTP/3 will bypass the proxy.
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
