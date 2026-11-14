@@ -21,7 +21,7 @@ cd "$(cd "$(dirname "$SELF")" && pwd -P)"
 
 if [ ! -x .venv/bin/mitmdump ]; then
   echo "No .venv here. Set it up once:" >&2
-  echo "  uv venv --python 3.13 .venv && uv pip install --python .venv/bin/python -r requirements.txt" >&2
+  echo "  uv venv --python 3.13 .venv && uv pip install --python .venv/bin/python --require-hashes -r requirements.lock" >&2
   exit 1
 fi
 

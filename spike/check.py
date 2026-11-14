@@ -3095,6 +3095,62 @@ class _Collect:
         self.sent.append({"type": type_, **payload})
 
 
+async def units_findings_get() -> None:
+    """A flow's summary names the codes new on it, not what each is about -- which
+    cookie, which parameter. `findings.get` answers with every finding of the
+    capture once, its subject, and the flow it was first seen on, so a script can
+    write a report without re-deriving the rules from headers."""
+    import bridge as B
+    import interceptor as I
+    from mitmproxy.test import taddons, tflow
+
+    def answered(host, set_cookie):
+        f = tflow.tflow(resp=True)
+        f.request.scheme = "https"
+        f.request.host = host
+        f.request.headers.clear()
+        f.response.headers.clear()
+        # Quiet every header rule, so the cookie is the only thing at fault.
+        f.response.headers["strict-transport-security"] = "max-age=1"
+        f.response.headers["x-content-type-options"] = "nosniff"
+        f.response.headers["content-type"] = "application/json"
+        f.response.headers["set-cookie"] = set_cookie
+        return f
+
+    async def listed(addon):
+        addon.bridge.sent.clear()
+        await addon._on_message({"type": "findings.get"})
+        return [m.get("items") for m in addon.bridge.sent if m["type"] == "findings"]
+
+    addon = I.Interceptor()
+    notes = []
+    with taddons.context(addon) as tctx:
+        tctx.configure(addon, hide_noise=False)
+        addon.bridge = _Collect()
+        addon._push_state = lambda: None
+        first = answered("a.test", "sid=x; Secure; SameSite=Lax")
+        again = answered("a.test", "sid=y; Secure; SameSite=Lax")   # the same finding
+        other = answered("a.test", "cart=1; Secure; HttpOnly")
+        for f in (first, again, other):
+            addon.response(f)
+        want = [{"code": "cookie-no-httponly", "key": "a.test:sid", "id": first.id},
+                {"code": "cookie-no-samesite", "key": "a.test:cart", "id": other.id}]
+        got = await listed(addon)
+        if got != [want]:
+            notes.append(f"listed {got}")
+        # The findings describe the capture, so they go with it.
+        await addon._on_message({"type": "clear"})
+        got = await listed(addon)
+        if got != [[]]:
+            notes.append(f"after clear: {got}")
+        addon.store.close()
+    # An answer to one client's question, like `results` and `frames`.
+    if "findings" not in B.REPLIES:
+        notes.append("the answer is broadcast to every client")
+    check("findings.get lists each finding once, with its subject and first flow",
+          not notes, "; ".join(notes) or "two findings on three flows, none after clear")
+
+
 async def units_clear_keeps_held() -> None:
     """Clear empties the table. A flow still held is still waiting on a decision,
     so it cannot go with the table: wiping it from the store left a queue entry
@@ -3574,6 +3630,7 @@ async def main() -> int:
     await units_faults()
     await units_fault_loaded()
     units_findings()
+    await units_findings_get()
     await units_map_local()
     units_search()
     units_decoder()
