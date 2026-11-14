@@ -38,7 +38,7 @@ FLUSH_INTERVAL = 0.05
 # its `export` landed in the human's clipboard. Everything else -- flows, holds,
 # frames, state, cleared, loaded -- is the shared picture and goes to everyone.
 REPLIES = frozenset({"snapshot", "body", "frames", "results", "export",
-                     "sessions", "saved", "har", "diff", "error"})
+                     "sessions", "saved", "har", "diff", "findings", "error"})
 
 # The connection whose command is being handled. A ContextVar because each
 # connection's handler is its own asyncio task: a command that awaits (a session

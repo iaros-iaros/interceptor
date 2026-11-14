@@ -347,8 +347,9 @@ class Interceptor:
         self.stop_reply: set[str] = set()
         self.faults: list[faultlib.Fault] = []
         # (code, key) pairs already surfaced, so a finding is tagged on first sight
-        # and not on all 300 flows of a page load -- see findings.py.
-        self.findings_seen: set[tuple[str, str]] = set()
+        # and not on all 300 flows of a page load -- see findings.py. Each keeps the
+        # id of the flow it was first seen on, which is what `findings.get` lists.
+        self.findings_seen: dict[tuple[str, str], str] = {}
         self.mode = "capture"
         self.scope = ""
         self.url_file: Path | None = None
@@ -781,7 +782,7 @@ class Interceptor:
         for code, key in findingslib.passive(flow):
             tag = (code, key)
             if tag not in self.findings_seen:
-                self.findings_seen.add(tag)
+                self.findings_seen[tag] = flow.id
                 new.append(code)
         if new:
             flow.metadata["findings"] = new
@@ -1229,6 +1230,14 @@ class Interceptor:
             # bodies live in the store and were until now unqueryable.
             self.bridge.push("results", q=msg.get("q", ""),
                              flows=self.store.search(msg.get("q", "")))
+        elif kind == "findings.get":
+            # A summary names the codes new on its flow, not what each is about. The
+            # subject is the dedup key findings.py already computes (the host, or
+            # host:cookie, host:parameter), so a script can report "which cookie"
+            # without re-deriving the rules from headers. Oldest first.
+            self.bridge.push("findings", items=[
+                {"code": code, "key": key, "id": fid}
+                for (code, key), fid in self.findings_seen.items()])
         elif kind == "export":
             self._export(msg.get("id"), msg.get("format", "curl"))
         elif kind == "diff":

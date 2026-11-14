@@ -642,7 +642,8 @@ header, the specific cookie for a cookie flag — so the same smell on all 300 f
 page load is surfaced on the first and not repeated on the rest. A genuinely new one (a
 different host, a different cookie) still shows. The finding travels in the flow's
 metadata, so **`~meta missing-hsts`** is a valid scope and a saved session keeps its
-findings.
+findings. A script gets the whole list, each finding with the thing at fault, from
+`findings.get` — see [AGENT-API.md](AGENT-API.md).
 
 ### Sessions
 
@@ -914,7 +915,7 @@ Also:
 
 ```bash
 .venv/bin/python spike/spike.py --chrome --net    # browser + network reality   4/4
-.venv/bin/python spike/check.py                   # units + end-to-end      103/103
+.venv/bin/python spike/check.py                   # units + end-to-end      104/104
 ```
 
 Both are safe to run while a real instance is up — separate ports (`18xxx`/`19000`), their
@@ -956,7 +957,9 @@ rather than ~750ms — i.e. that the delay is awaited rather than blocking the l
 **body search** across bodies, headers and URLs, including a literal `%` not matching
 everything; **content views** producing a rendering *beside* the exact bytes with `body`
 and `raw` untouched; **copy as curl** producing a command carrying method, URL, header and
-body; and the **one-shot reply hold** arming, holding exactly one reply, and disarming.
+body; the **one-shot reply hold** arming, holding exactly one reply, and disarming; and
+**`findings.get`** listing each finding once with its subject and the flow it was first
+seen on, and emptying with the capture.
 
 And the fixes from a review, one check each: a **fault rule never rewriting a flow loaded
 from a session**; a **closed WebSocket** going to disk, leaving RAM and summarised as closed;

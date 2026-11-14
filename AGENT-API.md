@@ -256,6 +256,7 @@ other than the line endings.
 | `search` | `q` | `results` — flows whose URL, headers or bodies contain `q` |
 | `export` | `id`, `format`: `curl` \| `httpie` \| `raw_request` \| `raw` | `export` with `text` |
 | `diff` | `a`, `b` (flow ids), `which`: `"request"` \| `"response"` | `diff` with a unified-diff `text` |
+| `findings.get` | — | `findings` with `items` — every passive finding of the capture, once, with its subject |
 
 `snapshot` and `flow` pushes carry **summaries only**. Bodies never arrive unasked —
 call `body.get` for the flow you care about. Held flows are the exception: `flow.paused`
@@ -269,6 +270,24 @@ start line, headers and the prettified body — so a one-line JSON reply diffs f
 field. It is the Comparer: `status`/`resp_bytes` deltas in the summaries say *that* two
 responses differ; this says *how*. A flow that is streamed or too large to render as text
 is refused with an `error`.
+
+`findings.get` lists what the passive checks have raised in this capture: one item per
+distinct finding, oldest first, each `{"code", "key", "id"}`. A summary's `findings`
+field carries the codes only, so this is how you learn *which* cookie or parameter is at
+fault. `key` is that subject, and its shape follows the code:
+
+| Codes | `key` |
+|---|---|
+| `missing-*`, `cors-*`, `basic-auth`, `plain-http-auth` | the host |
+| `cookie-*` | `host:cookie-name` |
+| `secret-in-url` | `host:parameter-name` |
+| `server-version` | `host:header-name` |
+| `directory-listing` | `host:path` |
+| `jwt-alg-none` | the first 16 characters of the token (its header, never a signature) |
+
+`id` is the flow the finding was first seen on; that flow may have been evicted since.
+`clear` and `session.load` reset the list with the capture. A key names things, it never
+carries a value — no cookie value, no parameter value.
 
 ### Rewrite rules — no pausing
 
@@ -402,11 +421,12 @@ token-gated, so serving a capture there would publish it to any page the user ha
 | `results` | Reply to `search` | `q`, `flows` |
 | `export` | Reply to `export` | `id`, `format`, `text` |
 | `diff` | Reply to `diff` | `a`, `b`, `which`, `text` |
+| `findings` | Reply to `findings.get` | `items` |
 | `har` / `saved` / `loaded` / `sessions` / `cleared` | their commands | `name`, `bytes`, `flows`, `items`, `dir` |
 | `error` | Anything rejected | `message`, sometimes `id` |
 
 **Who receives what.** Replies — `snapshot`, `body`, `frames`, `results`, `export`,
-`sessions`, `saved`, `har` and `error` — go only to the client whose command caused
+`sessions`, `saved`, `har`, `diff`, `findings` and `error` — go only to the client whose command caused
 them, so an agent's `hello` or `export` never reaches the human's tab. Everything else
 is the shared picture and goes to every connected client: `flow`, `flow.paused`,
 `ws.message`, `state`, `cleared` and `loaded`. Two consequences: `state` moves when
@@ -441,7 +461,8 @@ made in the repeater, never for one it inherited from the original.
 `findings` is a list of passive-finding codes seen on that flow for the first time (see
 the `snapshot` reply's `findings_doc` for the code → explanation map). `state` carries a
 `findings` **count** of distinct findings across the capture. A code is also matchable as
-a scope with `~meta <code>`, e.g. `~meta cors-wildcard-credentials`.
+a scope with `~meta <code>`, e.g. `~meta cors-wildcard-credentials`. For what each finding
+is about, ask `findings.get`.
 
 **Detail** fields: `headers` (list of `[name, value]` pairs, duplicates preserved),
 `body`, `encoding`, `size`, `body_crlf`, `raw`, plus `method`/`url`/`http_version` on a
@@ -532,7 +553,7 @@ read the file.
 ## Verifying
 
 Every command and payload above was exercised against a headless instance on a throwaway
-port — HTTP capture, rewrite rules, fault injection, search, body fetch, curl export,
+port — HTTP capture, rewrite rules, fault injection, search, body fetch, `findings.get`, curl export,
 repeater, intercept edit/drop/`stop_reply`, rejected-edit handling, sessions, HAR, and
 the WebSocket path including `frames.get`, injection in both directions, and frame
 edit/drop.
