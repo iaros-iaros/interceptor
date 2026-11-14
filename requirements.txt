@@ -1,6 +1,11 @@
 # Python 3.13 — mitmproxy has no wheels for 3.14 yet (system default here is 3.14).
 #   uv venv --python 3.13 .venv
-#   uv pip install --python .venv/bin/python -r requirements.txt
+#   uv pip install --python .venv/bin/python --require-hashes -r requirements.lock
+#
+# Install from requirements.lock, not from this file: these two pins pull some forty
+# packages that would otherwise float. The lock pins every one with its hashes, for
+# macOS and Linux alike. After changing a pin here, recompile it with the command in
+# the lock's first lines.
 #
 # Pinned: the addon API changed materially at mitmproxy 7 (WebSocket flow model)
 # and again across 10/11. Do not float this.

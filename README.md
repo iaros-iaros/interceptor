@@ -69,8 +69,13 @@ mobile devices, and any other client you point at it.
 ## Install
 
 ```bash
-uv venv --python 3.13 .venv && uv pip install --python .venv/bin/python -r requirements.txt
+uv venv --python 3.13 .venv && uv pip install --python .venv/bin/python --require-hashes -r requirements.lock
 ```
+
+`requirements.lock` pins every package with its hashes, for macOS and Linux, so two
+installs are the same install; `pip install --require-hashes -r requirements.lock` reads
+it too. It is compiled from the two pins in `requirements.txt` — after changing one,
+rerun the command in the lock's first lines.
 
 Optionally put it on your `PATH` — `run.sh` walks its own symlink chain, so this works
 from anywhere:
