@@ -17,6 +17,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -44,6 +45,11 @@ TARGET = ("127.0.0.1", _port("IC_TEST_TARGET_PORT", 18081))
 WS_TARGET = ("127.0.0.1", _port("IC_TEST_WS_PORT", 18082))
 TLS_TARGET = ("127.0.0.1", _port("IC_TEST_TLS_PORT", 18083))
 URL_FILE = ".ui-url.test"
+# How long the instance under test waits for a replay's answer. Two seconds rather
+# than the default thirty, so the checks on a replay nobody answers do not take
+# that long; not one, because every other replay here has to beat it on a loaded
+# CI runner.
+REPLAY_TIMEOUT = 2
 
 UI = f"http://127.0.0.1:{UI_PORT}"
 PROXY = f"http://127.0.0.1:{PROXY_PORT}"
@@ -653,6 +659,42 @@ def units_bridge_guard() -> None:
 # ------------------------------------------------------------------- helpers
 
 
+def silent_port() -> socket.socket:
+    """A port that takes the connection and never answers. The kernel completes
+    the handshake for a listening socket nobody accepts from, which is exactly
+    what a replay sees from a server that has stopped talking."""
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(8)
+    return srv
+
+
+def slow_body(delay: float) -> socket.socket:
+    """A server that answers one request: its headers at once, its four-byte
+    body `delay` seconds later."""
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+
+    def serve() -> None:
+        try:
+            conn, _ = srv.accept()
+        except OSError:  # closed before anything connected
+            return
+        with conn:
+            conn.recv(65536)
+            conn.sendall(b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\n"
+                         b"content-length: 4\r\nconnection: close\r\n\r\n")
+            time.sleep(delay)
+            try:
+                conn.sendall(b"late")
+            except OSError:  # the proxy hung up first: the check reports that
+                pass
+
+    threading.Thread(target=serve, daemon=True).start()
+    return srv
+
+
 def http_code(path: str) -> int:
     req = urllib.request.Request(UI + path)
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -945,7 +987,8 @@ async def integration() -> None:
     proc = subprocess.Popen(
         # No --chain: chaining is opt-in, so an instance booted plainly always goes
         # direct, whatever proxy client this machine happens to be running.
-        ["./run.sh"], cwd=ROOT, stdout=subprocess.DEVNULL,
+        ["./run.sh", "--set", f"replay_timeout={REPLAY_TIMEOUT}"], cwd=ROOT,
+        stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL, start_new_session=True,
         env={**os.environ, "IC_LISTEN_PORT": str(PROXY_PORT),
              "IC_UI_PORT": str(UI_PORT), "IC_URL_FILE": URL_FILE,
@@ -1254,6 +1297,56 @@ async def integration() -> None:
                 check("repeating does not blank the original flow's response", intact,
                       "replay.client mutates its argument, so a copy is replayed"
                       if intact else "original lost its response — a copy was NOT used")
+
+                # A replay nobody answers. mitmproxy replays one flow at a time and
+                # waits for each for as long as it takes, so one port that took the
+                # connection and said nothing used to hold the repeater until restart:
+                # every later send queued behind it, unsent.
+                def aimed(port: int) -> str:
+                    return f"GET http://127.0.0.1:{port}/ HTTP/1.1\nhost: 127.0.0.1:{port}\n\n"
+
+                def copy_of(label: str, pred):
+                    return lambda m: (m.get("type") == "flow" and m.get("label") == label
+                                      and m.get("replay_of") == orig["id"] and pred(m))
+
+                silent = silent_port()
+                sent = time.monotonic()
+                await say(conn, type="replay", id=orig["id"], label="unanswered",
+                          raw=aimed(silent.getsockname()[1]))
+                gave = await recv_until(conn, copy_of("unanswered", lambda m: m.get("killed")),
+                                        timeout=REPLAY_TIMEOUT + 8)
+                waited = time.monotonic() - sent
+                check("a replay nobody answers is given up on",
+                      gave is not None and waited >= REPLAY_TIMEOUT - 0.2,
+                      f"its copy turned killed after {waited:.1f}s (replay_timeout={REPLAY_TIMEOUT})"
+                      if gave else f"still waiting after {waited:.1f}s; replay_timeout={REPLAY_TIMEOUT}")
+                await say(conn, type="replay", id=orig["id"], label="after")
+                after = await recv_until(
+                    conn, copy_of("after", lambda m: m.get("status") is not None), timeout=10)
+                check("the repeater sends the next request after giving one up",
+                      after is not None and after.get("status") == 200,
+                      f"the send after it answered {after.get('status')}" if after
+                      else "the send after it never left: the repeater is still held")
+                silent.close()
+
+                # The deadline is on the answer starting, not on it finishing: a
+                # response whose headers came in time is an answer, however long its
+                # body takes. Cutting that would break every large download.
+                slow = slow_body(REPLAY_TIMEOUT + 1)
+                sent = time.monotonic()
+                await say(conn, type="replay", id=orig["id"], label="slow-body",
+                          raw=aimed(slow.getsockname()[1]))
+                late = await recv_until(
+                    conn, copy_of("slow-body", lambda m: m.get("status") is not None
+                                  or m.get("killed")), timeout=REPLAY_TIMEOUT + 10)
+                waited = time.monotonic() - sent
+                check("an answer that has started is not given up on",
+                      late is not None and late.get("status") == 200 and not late.get("killed")
+                      and late.get("resp_bytes") == 4 and waited > REPLAY_TIMEOUT,
+                      f"status {late.get('status')}, killed={late.get('killed')}, "
+                      f"{late.get('resp_bytes')} body bytes after {waited:.1f}s" if late
+                      else f"no answer and no error after {waited:.1f}s")
+                slow.close()
 
             # ------------------------------------------- P3 WebSocket edit+inject
             # The handshake is an HTTP request on the same flow, so it gets held
@@ -2412,6 +2505,35 @@ async def units_replay_label() -> None:
     check("a replay carries its label on the copy only", ok,
           f"copy label={I.summary(clone)['label']!r}, original label={I.summary(f)['label']!r}"
           if clone else "replay.client never called")
+
+
+async def units_replay_deadline() -> None:
+    """The deadline closes whatever connection the replay is waiting on, and the
+    layer reports that as the flow's error. With no connection in flight there is
+    nothing to close and nothing to report back, so the watchdog has to end the
+    flow itself: a deadline that can leave the queue held is not one."""
+    import interceptor as I
+    from mitmproxy.test import taddons, tflow
+
+    addon = I.Interceptor()
+    with taddons.context(addon) as tctx:
+        addon.bridge = _Collect()
+        f = tflow.tflow()
+        addon.store.put(f, 1, I.summary(f), 10 * 1024 * 1024)
+        replay = I.DeadlineReplay(f, tctx.options)
+        try:
+            # Never started, so it holds no connection: the state in question.
+            await asyncio.wait_for(replay._watch(0.05), 5)
+            ended = replay.done.is_set()
+        except (TimeoutError, asyncio.TimeoutError):
+            ended = False
+        msg = f.error.msg if f.error else None
+        pushed = [m for m in addon.bridge.sent if m["type"] == "flow" and m.get("killed")]
+        addon.store.close()
+    check("a replay with no connection to close is still given up on",
+          ended and msg == "no answer within 0.05s (replay_timeout)" and not f.live
+          and len(pushed) == 1,
+          f"ended={ended}, error={msg!r}, live={f.live}, killed rows pushed={len(pushed)}")
 
 
 def units_faults_option() -> None:
@@ -3626,6 +3748,7 @@ async def main() -> int:
     units_repeat_burst()
     units_payloads()
     await units_replay_label()
+    await units_replay_deadline()
     units_faults_option()
     await units_faults()
     await units_fault_loaded()

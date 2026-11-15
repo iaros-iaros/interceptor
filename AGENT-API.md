@@ -359,6 +359,18 @@ sweep (intruder-lite) labels its sends; a scripted client does the same by sendi
 
 Rejected for WebSocket flows: mitmproxy's client replay refuses them.
 
+**A replay ends in one of two ways, and `killed` is the other one.** Replays leave one
+at a time. One that gets no answer is given up on after `replay_timeout` seconds
+(default 30; start with `--set replay_timeout=N`, or `0` to wait for as long as it
+takes): its summary arrives once more with `killed: true` and `status: null`, and the
+next replay goes out. The clock runs from the request leaving to the first response
+header, so a body that arrives slowly is never cut. A connection that is refused ends
+the same way, at once. So wait for `status` **or** `killed` — a client that waits for
+`status` alone waits forever on a dead port.
+
+A replay you retarget at a host the Hosts list does not cover is sent but not captured:
+no `flow` push will ever describe it, neither when it leaves nor when it ends.
+
 ### WebSocket frames
 
 A held frame arrives as `flow.paused` with `direction: "websocket"` and a `frame`

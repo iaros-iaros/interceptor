@@ -33,8 +33,10 @@ from datetime import datetime
 from pathlib import Path
 
 from mitmproxy import command, ctx, exceptions, flowfilter, http, tls
-from mitmproxy.addons import intercept
+from mitmproxy.addons import clientplayback, intercept
+from mitmproxy.flow import Error as FlowError
 from mitmproxy.log import ALERT
+from mitmproxy.proxy import layers
 from mitmproxy.proxy.mode_specs import ProxyMode
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -328,6 +330,83 @@ def detail(flow: http.HTTPFlow, which: str) -> dict | None:
     return out
 
 
+class DeadlineReplay(clientplayback.ReplayHandler):
+    """A replay that stops waiting for its answer.
+
+    mitmproxy replays a request with nobody on the other end of it. A live flow
+    ends when its client hangs up, or when the idle watchdog that handle_client()
+    arms runs out; a replay has no client and never runs handle_client(). So a
+    server that takes the connection and then says nothing held a replay for good,
+    and one that drops the SYN held it for as long as the OS keeps trying (75s on
+    macOS, about two minutes on Linux). `replay.client` sends one flow at a time,
+    so every later send -- the UI's, a payload sweep's, an agent's -- queued behind
+    it, unsent: one dead port and the Repeater was gone until restart.
+
+    The wait is bounded instead (`replay_timeout`), from the moment the request is
+    released to the server until the first response header. Not until the response
+    is whole: a body that takes its time is an answer, and cutting it off would
+    break every large download.
+
+    Past the deadline the connection is closed under the request -- what a browser
+    does when it stops waiting -- so mitmproxy ends the flow down its own path: the
+    error hook fires, the row turns `killed`, and the queue moves on. Nothing is
+    made up: a server that gave no status gets none.
+    """
+
+    watchdog: asyncio.Task | None = None
+    gave_up: float | None = None  # the deadline that ran out, in seconds
+
+    async def handle_hook(self, hook) -> None:
+        if isinstance(hook, (layers.http.HttpResponseHeadersHook,
+                             layers.http.HttpResponseHook, layers.http.HttpErrorHook)):
+            self._disarm()
+            if self.gave_up is not None and isinstance(hook, layers.http.HttpErrorHook):
+                # mitmproxy words the error by where the connection was when it
+                # closed: a connect that was cancelled, or a peer that hung up. Say
+                # what actually happened, before any addon reads it.
+                self.flow.error = FlowError(
+                    f"no answer within {self.gave_up:g}s (replay_timeout)")
+        await super().handle_hook(hook)
+        # Armed only once the request hook has returned, so the clock never runs
+        # while an addon is still working on the request: it times the server.
+        if isinstance(hook, layers.http.HttpRequestHook):
+            seconds = ctx.options.replay_timeout
+            if seconds > 0:
+                self.watchdog = asyncio.create_task(self._watch(seconds))
+
+    def _disarm(self) -> None:
+        # Never from inside the watchdog: when it has to end the flow itself (see
+        # _watch) the error hook runs on its own task, and would cancel it mid-way.
+        if self.watchdog is not None and self.watchdog is not asyncio.current_task():
+            self.watchdog.cancel()
+
+    async def _watch(self, seconds: float) -> None:
+        await asyncio.sleep(seconds)
+        if self.done.is_set():
+            return
+        self.gave_up = seconds
+        r = self.flow.request
+        logging.warning(f"interceptor: no answer from {r.host}:{r.port} within "
+                        f"{seconds:g}s; gave the replay up (replay_timeout)")
+        # The same teardown mitmproxy runs when a replay completes. A connection
+        # still being opened reports the cancel as a failed connect, one that is
+        # open as a close; either way the layer raises the flow's error hook.
+        waiting = [io.handler for io in self.transports.values() if io.handler]
+        for task in waiting:
+            task.cancel("no answer in time")
+        if not waiting:
+            # Nothing in flight to close, so nothing would ever report back. A
+            # deadline that can leave the queue held is not one: end the flow here.
+            self.flow.live = False
+            await self.handle_hook(layers.http.HttpErrorHook(self.flow))
+
+
+# `ClientPlayback.playback` looks ReplayHandler up by name each time it starts a
+# flow, so swapping the name is the one seam short of re-implementing its queue.
+# Every client replay gets the deadline, including `--client-replay` from a file.
+clientplayback.ReplayHandler = DeadlineReplay
+
+
 class Interceptor:
     def __init__(self) -> None:
         self.bridge: Bridge | None = None
@@ -389,6 +468,13 @@ class Interceptor:
                           "A matching connection is tunnelled, never decrypted -- for a "
                           "certificate-pinned app that breaks under interception. Nothing of it "
                           "is captured. Burp's 'TLS pass through'.")
+        loader.add_option("replay_timeout", int, 30,
+                          "Seconds the Repeater waits for a replay's answer to start before "
+                          "giving it up: the copy turns `killed` and the next send goes out. "
+                          "0 waits for as long as it takes, which lets one port that never "
+                          "answers hold every later send. Kept under the 60s the UI's own "
+                          "run waits for a reply, so a dead send ends as a killed row the run "
+                          "steps over rather than as a run that stopped.")
         loader.add_option("faults", Sequence[str], [],
                           "Fault rules, one JSON object per entry in the shape the UI sends "
                           "({url, delay_ms, status, body, drop}). An option so that "
