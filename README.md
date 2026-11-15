@@ -442,8 +442,14 @@ into load. A delay of `0` therefore means back-to-back, one at a time — not al
   and counter are still there; it is a real run, not a property of the view.
 - **One run at a time.** Two runs interleaving into the same send list would make that
   list unreadable, which is the thing it exists to prevent.
-- **A reply that never comes stops the run** after 60 seconds, saying which send stalled,
-  rather than hanging on Stop forever.
+- **A send nobody answers is given up on.** The proxy waits `replay_timeout` seconds (30
+  unless you set it) for an answer to start; past that the send's row turns `killed` and
+  the next one goes out. Sends leave one at a time, so without that limit a single port
+  that took the connection and then said nothing held every later send, from every tab,
+  until restart.
+- **An answer that has started is never cut**, however slowly its body arrives. If it has
+  still not finished after 60 seconds the run stops and says which send stalled, rather
+  than hanging on Stop forever.
 - **If the bridge drops mid-run it stops and says so**, rather than counting sends that
   never left the browser.
 - Count is capped at **1000** and the delay at **60,000ms**, both far above any hand-driven
@@ -785,6 +791,7 @@ Everything else is a `--set` flag after `interceptor`:
 | `passthrough_hosts` | *(empty)* | The **Don't decrypt** list, also in the Hosts panel: regexes matched against `host:port` (and SNI). A match is tunnelled, never decrypted, and nothing of it is captured — for a certificate-pinned app. Burp's *TLS pass through*. Survives in `config.yaml`. |
 | `ignore_hosts` | *(empty)* | The inverse, and the one thing the Hosts list cannot express: tunnel *these* hosts and capture everything else — mitmproxy's equivalent of Burp's TLS pass through, for a certificate-pinned host that breaks under interception. Command line only; nothing in the UI writes it, so a value set here survives every mode switch. |
 | `intercept_responses` | `false` | Also stop replies. Same as the *Stop replies* toggle. |
+| `replay_timeout` | `30` | Seconds the Repeater waits for an answer to **start** before giving a send up: its row turns `killed` and the next send goes out. A body that arrives slowly is not cut. `0` waits for as long as it takes, which lets one port that never answers hold every later send. |
 | `faults` | *(empty)* | Fault rules, one JSON object per entry (`{url, delay_ms, status, body, drop}`). Set from the UI or `config.yaml`; a bad one fails startup rather than arming nothing. |
 | `expose` | `false` | Permit binding off loopback. Without it, that is refused outright — see Security. |
 | `ssl_insecure` | `false` | Accept self-signed/expired certs on upstream targets. Commented out in `run.sh`. |
@@ -920,7 +927,7 @@ Also:
 
 ```bash
 .venv/bin/python spike/spike.py --chrome --net    # browser + network reality   4/4
-.venv/bin/python spike/check.py                   # units + end-to-end      104/104
+.venv/bin/python spike/check.py                   # units + end-to-end      108/108
 ```
 
 Both are safe to run while a real instance is up — separate ports (`18xxx`/`19000`), their
